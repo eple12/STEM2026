@@ -1,0 +1,10 @@
+numpy
+scipy
+
+pygame
+matplotlib
+
+neat-python
+
+pyyaml
+tqdm

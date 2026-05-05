@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import pickle
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import List, Sequence
 
@@ -12,8 +14,60 @@ import numpy as np
 import yaml
 
 
+# -----------------------------------------------------------------------------
+# Environment and reward parameter block
+# -----------------------------------------------------------------------------
+# These constants are grouped for easier tuning. Adjusting them controls
+# how strongly the agent is rewarded for speed, alignment, and braking.
+MIN_SPEED = 0.5
+MAX_STEER_RATE = 1.8
+MAX_ACCEL = 2.5
+
+# Reward weights
+DEFAULT_SPEED_REWARD_WEIGHT = 2.0
+DEFAULT_PROGRESS_WEIGHT = 0.16
+DEFAULT_LANE_PENALTY_WEIGHT = 0.45
+DEFAULT_HEADING_PENALTY_WEIGHT = 0.35
+DEFAULT_STEER_PENALTY_WEIGHT = 0.02
+STRAIGHT_ACCEL_REWARD_WEIGHT = 0.45
+STRAIGHT_BRAKE_PENALTY_WEIGHT = 1.20
+UNNEEDED_BRAKE_PENALTY_WEIGHT = 0.45
+CORNER_BRAKE_REWARD_WEIGHT = 1.80
+CORNER_THROTTLE_PENALTY_WEIGHT = 1.10
+CORNER_OVERSPEED_PENALTY_WEIGHT = 2.50
+LOW_SPEED_PENALTY_WEIGHT = 1.00
+
+
+# Episode budget and crash penalty
+DEFAULT_MAX_STEPS = 0
+CRASH_FITNESS_PENALTY = -60.0
+
+
 def wrap_to_pi(angle: float) -> float:
     return (angle + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def normalized_arclength(points: np.ndarray) -> np.ndarray:
+    if len(points) <= 1:
+        return np.zeros(len(points), dtype=np.float64)
+    seg_lengths = np.linalg.norm(np.diff(points, axis=0), axis=1)
+    arclength = np.concatenate(([0.0], np.cumsum(seg_lengths)))
+    total = max(float(arclength[-1]), 1e-9)
+    return arclength / total
+
+
+def circular_smooth(values: np.ndarray, window: int = 7) -> np.ndarray:
+    if window <= 1 or len(values) == 0:
+        return values.astype(np.float64, copy=True)
+    window = min(window, len(values))
+    if window % 2 == 0:
+        window -= 1
+    if window <= 1:
+        return values.astype(np.float64, copy=True)
+    pad = window // 2
+    padded = np.concatenate((values[-pad:], values, values[:pad]))
+    kernel = np.ones(window, dtype=np.float64) / window
+    return np.convolve(padded, kernel, mode="valid")
 
 
 @dataclass
@@ -40,20 +94,21 @@ class DifficultySettings:
     checkpoint_pass_reward_scale: float
     start_speed: float
     downsample_stride: int
-    brake_penalty_weight: float   # ★ 추가: 예측 브레이킹 페널티 가중치
 
     @staticmethod
     def from_name(name: str) -> "DifficultySettings":
-        # brake_penalty_weight: 크게 설정할수록 코너 전 감속을 강하게 학습
-        # 단, 너무 크면 직선에서도 과도하게 감속함 → 0.3~0.8 권장
+        # Difficulty presets: tune track width, offtrack sensitivity, step budget,
+        # lane and heading regularization, speed weighting, steer penalty,
+        # checkpoint reward scaling, starting speed, and downsampling.
         presets = {
-            "normal":    DifficultySettings(1.00, 1.00, 1.00, 0.70, 0.40, 0.10, 0.028, 1.0,  2.0, 1, 0.50),
-            "easy":      DifficultySettings(1.35, 1.25, 0.75, 0.45, 0.25, 0.12, 0.020, 1.35, 2.5, 2, 0.60),
-            "very-easy": DifficultySettings(1.75, 1.60, 0.60, 0.25, 0.15, 0.14, 0.015, 1.65, 3.0, 3, 0.70),
-            "overfit":   DifficultySettings(2.20, 2.00, 0.45, 0.12, 0.08, 0.18, 0.010, 2.0,  3.8, 4, 0.80),
-            "ideal":     DifficultySettings(1.35, 1.25, 0.75, 0.50, 3.5,  0.12, 2.0,   1.35, 2.5, 2, 0.60),
+            #                               w     o     s     l     h     s     s      c     s    d
+            "normal":    DifficultySettings(1.00, 1.00, 1.00, 0.70, 0.40, 0.10, 0.028, 1.0,  2.0, 1),
+            "easy":      DifficultySettings(1.35, 1.25, 0.75, 0.45, 0.25, 0.12, 0.020, 1.35, 2.5, 2),
+            "very-easy": DifficultySettings(1.75, 1.60, 0.60, 0.25, 0.15, 0.14, 0.015, 1.65, 3.0, 3),
+            "overfit":   DifficultySettings(2.20, 2.00, 0.45, 0.12, 0.08, 0.18, 0.010, 2.0,  3.8, 4),
+            "ideal":     DifficultySettings(1.35, 1.25, 0.75, DEFAULT_LANE_PENALTY_WEIGHT, DEFAULT_HEADING_PENALTY_WEIGHT, DEFAULT_SPEED_REWARD_WEIGHT, DEFAULT_STEER_PENALTY_WEIGHT, 1.35, 2.5, 2),
         }
-        return presets["ideal"]
+        return presets[name]
 
 
 class TrackLoader:
@@ -112,6 +167,7 @@ class CarEnv:
         checkpoint_every: int,
         checkpoint_base_reward: float,
         checkpoint_miss_penalty: float,
+        max_steps: int = DEFAULT_MAX_STEPS,
         dt: float = 0.1,
     ):
         self.track = track
@@ -124,20 +180,34 @@ class CarEnv:
             track.width_left[::stride], track.width_right[::stride]
         ) * settings.width_scale
 
-        self.max_steer_rate = 1.8
-        self.max_accel = 2.5
-        self.min_speed = 0.5
+        self.max_steer_rate = MAX_STEER_RATE
+        self.max_accel = MAX_ACCEL
+        self.min_speed = MIN_SPEED
         self.max_speed = max(10.0, float(np.max(track.raceline_speed)))
 
-        # 곡률 기반 동적 목표 속도
-        kappa = np.abs(track.raceline_kappa[::stride])
-        a_lat = 5.0
-        dynamic_speeds = np.sqrt(a_lat / (kappa + 1e-5))
-        self.target_speeds = np.clip(dynamic_speeds, self.min_speed, self.max_speed)
-        self.target_speeds = np.convolve(self.target_speeds, np.ones(5) / 5, mode="same")
+        race_phase = normalized_arclength(track.raceline_xy)
+        center_phase = normalized_arclength(self.center)
+        race_kappa = np.abs(track.raceline_kappa)
+        dynamic_speed_limit = np.sqrt(8.0 / (race_kappa + 1e-5))
+        race_speed_profile = np.minimum(track.raceline_speed, dynamic_speed_limit)
+        race_speed_profile = np.clip(
+            race_speed_profile, self.min_speed, self.max_speed
+        )
+        target_speeds = np.interp(center_phase, race_phase, race_speed_profile)
+        curvature_profile = np.interp(center_phase, race_phase, race_kappa)
+        self.target_speeds = np.clip(
+            circular_smooth(target_speeds, window=7),
+            self.min_speed,
+            self.max_speed,
+        )
+        self.curvature_profile = circular_smooth(curvature_profile, window=7)
 
-        self.max_steps = max(
-            160, int(max(400, len(self.center) // 3) * settings.step_scale)
+        # Episode budget: if max_steps is 0, compute a default budget from track length.
+        # This limits each individual run and prevents endless trajectories.
+        self.max_steps = (
+            max_steps
+            if max_steps is not None and max_steps > 0
+            else max(160, int(max(400, len(self.center) // 3) * settings.step_scale))
         )
         interval = max(1, checkpoint_every // stride)
         n = len(self.center)
@@ -160,6 +230,7 @@ class CarEnv:
         self.checkpoint_radius_sq = max(gate_len, seg_med) * 9.0
         self.checkpoint_radius_sq = max(36.0, self.checkpoint_radius_sq)
         self._build_checkpoint_geom()
+        self.crashed = False  # ★ 추가: 충돌 플래그
         self.reset()
 
     def _build_checkpoint_geom(self) -> None:
@@ -191,6 +262,7 @@ class CarEnv:
         self.cleared_checkpoint = [False] * len(self.checkpoint_indices)
         self.lap_started = False
         self.done = False
+        self.crashed = False  # ★ 추가: 충돌 플래그 초기화
         self.path = [(self.x, self.y)]
 
     def _nearest_centerline_index(self, x: float, y: float) -> int:
@@ -209,10 +281,33 @@ class CarEnv:
         return float(np.dot(rel, normal))
 
     def _heading_error(self, idx: int, heading: float) -> float:
-        p0 = self.raceline[idx % len(self.raceline)]
-        p1 = self.raceline[(idx + 2) % len(self.raceline)]
+        p0 = self.center[idx % len(self.center)]
+        p1 = self.center[(idx + 2) % len(self.center)]
         target_heading = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
         return wrap_to_pi(target_heading - heading)
+
+    def _lookahead_context(self, idx: int) -> tuple[int, float, float, float, float]:
+        n = len(self.center)
+        lo1 = max(3, n // 40)
+        lo2 = max(6, n // 20)
+        lo3 = max(12, n // 10)
+        idx_mid = (idx + lo2) % n
+        scan_step = max(1, (lo3 - lo1) // 8)
+        scan_indices = [(idx + offset) % n for offset in range(lo1, lo3 + 1, scan_step)]
+
+        target_speed_now = float(self.target_speeds[idx])
+        min_future_speed = float(np.min(self.target_speeds[scan_indices]))
+        mean_curvature = float(np.mean(self.curvature_profile[scan_indices]))
+        curvature_signal = float(np.clip(mean_curvature / 0.20, 0.0, 1.0))
+        target_drop = max(0.0, target_speed_now - min_future_speed) / max(
+            target_speed_now, 1.0
+        )
+        corner_signal = max(curvature_signal, float(np.clip(target_drop / 0.35, 0.0, 1.0)))
+        straight_signal = float(
+            np.clip((min_future_speed / self.max_speed - 0.55) / 0.30, 0.0, 1.0)
+        )
+        straight_signal *= 1.0 - 0.75 * corner_signal
+        return idx_mid, target_speed_now, min_future_speed, corner_signal, straight_signal
 
     def _crosses_checkpoint_segment(
         self, x0: float, y0: float, x1: float, y1: float, ord_idx: int
@@ -257,41 +352,23 @@ class CarEnv:
         speed_norm = self.speed / self.max_speed
         progress_norm = idx / max(1, len(self.center) - 1)
 
-        n = len(self.center)
-        lo1 = max(3, n // 40)
-        lo2 = max(6, n // 20)
-        lo3 = max(12, n // 10)
+        (
+            idx_mid,
+            target_speed_now,
+            min_future_speed,
+            corner_signal,
+            _straight_signal,
+        ) = self._lookahead_context(idx)
 
-        idx1 = (idx + lo1) % n
-        idx2 = (idx + lo2) % n
-        idx3 = (idx + lo3) % n
-
-        ts_now = self.target_speeds[idx]
-        ts1 = self.target_speeds[idx1]
-        ts2 = self.target_speeds[idx2]
-        ts3 = self.target_speeds[idx3]
-
-        # 전방 구간 최소 권장속도 (코너 존재 시 낮아짐)
-        min_future_speed = min(ts1, ts2, ts3)
-
-        speed_delta_now = (ts_now - self.speed) / self.max_speed
+        speed_delta_now = (target_speed_now - self.speed) / self.max_speed
         min_future_speed_norm = min_future_speed / self.max_speed
 
         # ★ 브레이킹 긴급도: 현재속도 - 전방 최소 권장속도
         # 양수 = 지금 브레이크를 밟아야 함, 값이 클수록 급브레이킹 필요
         brake_urgency = max(0.0, self.speed - min_future_speed) / self.max_speed
 
-        la_heading_err = self._heading_error(idx2, self.heading) / math.pi
-
-        # ★ 전방 평균 곡률: 코너의 심각도를 직접 인지하게 함
-        # kappa가 크면 = 앞에 급코너 있음
-        kappa_vals = [
-            abs(float(self.track.raceline_kappa[
-                (idx + lo1 * k // lo1) % len(self.track.raceline_kappa)
-            ])) for k in range(lo1, lo3, max(1, (lo3 - lo1) // 5))
-        ]
-        curvature_ahead = float(np.mean(kappa_vals)) * 100.0  # 스케일 조정 (값이 매우 작으므로)
-        curvature_ahead = min(curvature_ahead, 1.0)  # 클리핑
+        la_heading_err = self._heading_error(idx_mid, self.heading) / math.pi
+        curvature_ahead = corner_signal
 
         return np.array(
             [
@@ -314,7 +391,8 @@ class CarEnv:
 
         steer_norm = float(np.clip(steer_cmd, -1.0, 1.0))
         steer = steer_norm * self.max_steer_rate
-        accel = float(np.clip(throttle_cmd, -1.0, 1.0)) * self.max_accel
+        throttle_norm = float(np.clip(throttle_cmd, -1.0, 1.0))
+        accel = throttle_norm * self.max_accel
 
         self.heading += steer * self.dt
         self.speed = float(
@@ -331,97 +409,91 @@ class CarEnv:
         half_width = max(0.6, float(self.track_half_width[idx]))
         heading_err = abs(self._heading_error(idx, self.heading))
 
-        # ── 다중 전방 탐색 ─────────────────────────────────────────────────────
         n_center = len(self.center)
-        lo1 = max(3, n_center // 40)
-        lo2 = max(6, n_center // 20)
-        lo3 = max(12, n_center // 10)
+        (
+            _idx_mid,
+            target_speed_now,
+            min_future_speed,
+            corner_signal,
+            straight_signal,
+        ) = self._lookahead_context(idx)
 
-        idx1 = (idx + lo1) % n_center
-        idx2 = (idx + lo2) % n_center
-        idx3 = (idx + lo3) % n_center
+        prev_idx = self._nearest_centerline_index(x_prev, y_prev)
+        raw_progress = (idx - prev_idx + n_center) % n_center
+        if raw_progress > n_center // 2:
+            raw_progress -= n_center
 
-        target_speed_now = self.target_speeds[idx]
-        ts1 = self.target_speeds[idx1]
-        ts2 = self.target_speeds[idx2]
-        ts3 = self.target_speeds[idx3]
-
-        reward = 0.0
-        if self.lap_started:
-            o = self.next_checkpoint_ord
-            if not self.cleared_checkpoint[o]:
-                if self._crosses_checkpoint_segment(x_prev, y_prev, self.x, self.y, o):
-                    if o == 0 and not any(self.cleared_checkpoint[1:]):
-                        scale = self.settings.checkpoint_pass_reward_scale
-                        reward += self.checkpoint_base_reward * scale * 0.6
-                    else:
-                        self.cleared_checkpoint[o] = True
-                        if o == 0 and all(self.cleared_checkpoint[1:]):
-                            self.cleared_checkpoint = [False] * len(self.checkpoint_indices)
-                            self.next_checkpoint_ord = 0
-                            scale = self.settings.checkpoint_pass_reward_scale
-                            reward += self.checkpoint_base_reward * scale * 2.0
-                        else:
-                            self.next_checkpoint_ord = (o + 1) % len(self.checkpoint_indices)
-                            scale = self.settings.checkpoint_pass_reward_scale
-                            reward += self.checkpoint_base_reward * scale
-            for other in range(len(self.checkpoint_indices)):
-                if other == o or self.cleared_checkpoint[other]:
-                    continue
-                if self._crosses_checkpoint_segment(x_prev, y_prev, self.x, self.y, other):
-                    reward -= self.checkpoint_miss_penalty
-                    break
-        else:
-            if self._crosses_checkpoint_segment(x_prev, y_prev, self.x, self.y, 0):
-                self.lap_started = True
-                self.cleared_checkpoint[0] = True
-                self.next_checkpoint_ord = 1 % len(self.checkpoint_indices)
-                reward += (
-                    self.checkpoint_base_reward
-                    * self.settings.checkpoint_pass_reward_scale
-                    * 0.35
-                )
-
+        speed_norm = self.speed / self.max_speed
+        progress_reward = max(0.0, float(raw_progress)) * (
+            DEFAULT_PROGRESS_WEIGHT + 0.08 * speed_norm
+        )
+        reverse_penalty = max(0.0, float(-raw_progress)) * DEFAULT_PROGRESS_WEIGHT
         lane_penalty = (lat_err / half_width) ** 2
         heading_penalty = (heading_err / math.pi) ** 2
 
-        # ── 1. 속도 매칭 보상 ──────────────────────────────────────────────────
+        speed_error = abs(self.speed - target_speed_now) / max(target_speed_now, 1.0)
         speed_match_reward = (
-            1.0 - abs(self.speed - target_speed_now) / self.max_speed
-        ) * self.settings.speed_scale
-
-        # ── 2. 예측 브레이킹 페널티 ★ 핵심 수정 ──────────────────────────────
-        #
-        # 아이디어: 전방 코너 권장속도보다 현재 속도가 높을수록 페널티.
-        # 단계별(근/중/원) 탐지로 코너가 가까울수록 더 강하게 페널티.
-        # ratio² 사용 → 약간의 과속은 용인, 심한 과속은 크게 처벌.
-        #
-        def _brake_penalty(current_spd: float, target_spd: float) -> float:
-            excess = max(0.0, current_spd - target_spd)
-            # max_speed 대비 비율로 정규화 (속도 스케일과 무관하게 일정한 신호)
-            ratio = excess / self.max_speed
-            return ratio ** 2
-
-        bp1 = _brake_penalty(self.speed, ts1) * self.settings.brake_penalty_weight * 3.0
-        bp2 = _brake_penalty(self.speed, ts2) * self.settings.brake_penalty_weight * 2.0
-        bp3 = _brake_penalty(self.speed, ts3) * self.settings.brake_penalty_weight * 1.0
-        brake_penalty = bp1 + bp2 + bp3
-
-        # ── 3. 전방 헤딩 페널티 ──────────────────────────────────────────────
-        heading_err_la = abs(self._heading_error(idx2, self.heading))
-        lookahead_heading_penalty = (
-            (heading_err_la / math.pi) * self.settings.heading_penalty_weight * 0.5
+            max(-1.0, 1.0 - speed_error * speed_error) * self.settings.speed_scale
         )
 
-        # ── 4. 조향 페널티 ──────────────────────────────────────────────────
+        throttle_amount = max(0.0, throttle_norm)
+        brake_amount = max(0.0, -throttle_norm)
+        brake_urgency = max(0.0, self.speed - min_future_speed) / self.max_speed
+        low_speed_floor = target_speed_now * (0.55 + 0.20 * straight_signal)
+        low_speed_penalty = 0.0
+        if self.speed < low_speed_floor:
+            low_speed_penalty = (
+                ((low_speed_floor - self.speed) / max(low_speed_floor, 1.0)) ** 2
+                * LOW_SPEED_PENALTY_WEIGHT
+            )
+
+        straight_accel_reward = (
+            straight_signal
+            * STRAIGHT_ACCEL_REWARD_WEIGHT
+            * (0.65 * throttle_amount + 0.35 * speed_norm)
+        )
+        straight_brake_penalty = (
+            straight_signal * STRAIGHT_BRAKE_PENALTY_WEIGHT * brake_amount
+        )
+        unneeded_brake = brake_amount * max(
+            0.0, 1.0 - corner_signal - 3.0 * brake_urgency
+        )
+        unneeded_brake_penalty = UNNEEDED_BRAKE_PENALTY_WEIGHT * unneeded_brake
+
+        corner_brake_reward = (
+            CORNER_BRAKE_REWARD_WEIGHT
+            * brake_urgency
+            * brake_amount
+            * (0.5 + 0.5 * corner_signal)
+        )
+        corner_throttle_penalty = (
+            CORNER_THROTTLE_PENALTY_WEIGHT
+            * brake_urgency
+            * throttle_amount
+            * (0.5 + 0.5 * corner_signal)
+        )
+        corner_overspeed_penalty = (
+            CORNER_OVERSPEED_PENALTY_WEIGHT
+            * brake_urgency
+            * brake_urgency
+            * (0.5 + 0.5 * corner_signal)
+        )
+
         steer_penalty = self.settings.steer_penalty_weight * (steer_norm ** 2)
 
-        reward += (
-            speed_match_reward
+        reward = (
+            progress_reward
+            + speed_match_reward
+            + straight_accel_reward
+            + corner_brake_reward
             - self.settings.lane_penalty_weight * lane_penalty
             - self.settings.heading_penalty_weight * heading_penalty
-            - brake_penalty
-            - lookahead_heading_penalty
+            - reverse_penalty
+            - low_speed_penalty
+            - straight_brake_penalty
+            - unneeded_brake_penalty
+            - corner_throttle_penalty
+            - corner_overspeed_penalty
             - steer_penalty
         )
 
@@ -429,6 +501,7 @@ class CarEnv:
         if lat_err > half_width * (1.15 * self.settings.offtrack_scale):
             speed_factor = self.speed / self.max_speed
             reward -= 8.0 + 12.0 * speed_factor   # 최대 -20 (max_speed 시)
+            self.crashed = True  # ★ 추가: 충돌 플래그 설정
             self.done = True
         elif self.step_count >= self.max_steps:
             self.done = True
@@ -443,6 +516,8 @@ class CarEnv:
             out = net.activate(obs.tolist())
             steer, throttle = out[0], out[1]
             fitness += self.step(steer, throttle)
+        if self.crashed:
+            fitness += CRASH_FITNESS_PENALTY
         return fitness, np.asarray(self.path)
 
 
@@ -672,6 +747,46 @@ class SilentReporter(neat.reporting.BaseReporter):
             self.best = max(self.best, float(max(fitnesses)))
 
 
+class ModelCheckpointReporter(neat.reporting.BaseReporter):
+    def __init__(
+        self,
+        run_dir: Path,
+        *,
+        track_dir: Path,
+        config_path: Path,
+        difficulty: str,
+    ) -> None:
+        self.run_dir = run_dir
+        self.track_dir = track_dir
+        self.config_path = config_path
+        self.difficulty = difficulty
+        self.current_generation = -1
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+
+    def start_generation(self, generation: int) -> None:
+        self.current_generation = generation
+
+    def post_evaluate(self, config, population, species, best_genome) -> None:
+        generation = max(0, self.current_generation)
+        fitness = (
+            float(best_genome.fitness)
+            if best_genome.fitness is not None
+            else float("-inf")
+        )
+        payload = {
+            "generation": generation,
+            "fitness": fitness,
+            "genome": best_genome,
+            "config": config,
+            "track_dir": str(self.track_dir),
+            "config_path": str(self.config_path),
+            "difficulty": self.difficulty,
+        }
+        save_path = self.run_dir / f"generation_{generation:04d}_best.pkl"
+        with save_path.open("wb") as f:
+            pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+
+
 def eval_genomes(
     genomes: Sequence[tuple[int, neat.DefaultGenome]],
     config,
@@ -695,11 +810,13 @@ def run_training(
     checkpoint_every: int,
     checkpoint_pass_reward: float,
     checkpoint_miss_penalty: float,
+    max_steps: int = DEFAULT_MAX_STEPS,
     visualize: bool = True,
     animate_best: bool = False,
     animation_step_pause: float = 0.01,
     animation_window_m: float = 18.0,
     show_net: bool = False,
+    models_dir: Path | None = None,
 ) -> neat.DefaultGenome:
     track = TrackLoader.load(track_dir)
     settings = DifficultySettings.from_name(difficulty)
@@ -709,7 +826,22 @@ def run_training(
         checkpoint_every=checkpoint_every,
         checkpoint_base_reward=checkpoint_pass_reward,
         checkpoint_miss_penalty=checkpoint_miss_penalty,
+        max_steps=max_steps,
     )
+    print(
+        f"Episode budget: {env.max_steps} steps "
+        f"({env.max_steps * env.dt:.1f}s simulated time, dt={env.dt:.2f}s)"
+    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    models_root = models_dir if models_dir is not None else Path(__file__).resolve().parent / "models"
+    run_dir = models_root / timestamp
+    suffix = 2
+    while run_dir.exists():
+        run_dir = models_root / f"{timestamp}_{suffix:02d}"
+        suffix += 1
+    run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Saving generation best models to: {run_dir}")
+
     config = neat.Config(
         neat.DefaultGenome,
         neat.DefaultReproduction,
@@ -721,6 +853,14 @@ def run_training(
     pop.add_reporter(neat.StdOutReporter(True))
     stats = neat.StatisticsReporter()
     pop.add_reporter(stats)
+    pop.add_reporter(
+        ModelCheckpointReporter(
+            run_dir,
+            track_dir=track_dir,
+            config_path=config_path,
+            difficulty=difficulty,
+        )
+    )
     live_reporter: LiveVizReporter | None = None
     if visualize:
         live_reporter = LiveVizReporter(
@@ -762,7 +902,7 @@ def parse_args() -> argparse.Namespace:
         "--difficulty",
         type=str,
         default="easy",
-        choices=["normal", "easy", "very-easy", "overfit"],
+        choices=["normal", "easy", "very-easy", "overfit", "ideal"],
     )
     parser.add_argument("--no-gui", action="store_true")
     parser.add_argument("--show-net", action="store_true")
@@ -772,6 +912,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-every", type=int, default=45)
     parser.add_argument("--checkpoint-pass-reward", type=float, default=72.0)
     parser.add_argument("--checkpoint-miss-penalty", type=float, default=48.0)
+    parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=0,
+        help="Override the per-episode step budget; 0 uses the computed default.",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=script_dir / "models",
+        help="Directory where per-run generation-best model folders are saved.",
+    )
     return parser.parse_args()
 
 
@@ -785,11 +937,13 @@ def main() -> None:
         checkpoint_every=args.checkpoint_every,
         checkpoint_pass_reward=args.checkpoint_pass_reward,
         checkpoint_miss_penalty=args.checkpoint_miss_penalty,
+        max_steps=args.max_steps,
         visualize=not args.no_gui,
         animate_best=args.animate_best,
         animation_step_pause=args.animate_step_pause,
         animation_window_m=args.animate_window_m,
         show_net=args.show_net,
+        models_dir=args.models_dir.expanduser().resolve(),
     )
     if not args.no_gui:
         print("Close the visualization window to end.")

@@ -168,10 +168,14 @@ class CarEnv:
         checkpoint_base_reward: float,
         checkpoint_miss_penalty: float,
         max_steps: int = DEFAULT_MAX_STEPS,
+        follow_line: str = "centerline",
         dt: float = 0.1,
     ):
+        if follow_line not in {"centerline", "raceline"}:
+            raise ValueError("follow_line must be 'centerline' or 'raceline'")
         self.track = track
         self.settings = settings
+        self.follow_line = follow_line
         self.dt = dt
         stride = max(1, int(settings.downsample_stride))
         self.center = track.centerline_xy[::stride]
@@ -195,6 +199,15 @@ class CarEnv:
         )
         target_speeds = np.interp(center_phase, race_phase, race_speed_profile)
         curvature_profile = np.interp(center_phase, race_phase, race_kappa)
+        self.raceline_reference = np.column_stack(
+            (
+                np.interp(center_phase, race_phase, track.raceline_xy[:, 0]),
+                np.interp(center_phase, race_phase, track.raceline_xy[:, 1]),
+            )
+        )
+        self.reference_line = (
+            self.raceline_reference if follow_line == "raceline" else self.center
+        )
         self.target_speeds = np.clip(
             circular_smooth(target_speeds, window=7),
             self.min_speed,
@@ -267,13 +280,13 @@ class CarEnv:
 
     def _nearest_centerline_index(self, x: float, y: float) -> int:
         p = np.array([x, y], dtype=np.float64)
-        d2 = np.sum((self.center - p) ** 2, axis=1)
+        d2 = np.sum((self.reference_line - p) ** 2, axis=1)
         return int(np.argmin(d2))
 
     def _lane_error(self, idx: int, x: float, y: float) -> float:
-        c = self.center[idx]
-        next_idx = (idx + 1) % len(self.center)
-        tangent = self.center[next_idx] - c
+        c = self.reference_line[idx]
+        next_idx = (idx + 1) % len(self.reference_line)
+        tangent = self.reference_line[next_idx] - c
         tangent_norm = np.linalg.norm(tangent) + 1e-8
         tangent = tangent / tangent_norm
         normal = np.array([-tangent[1], tangent[0]])
@@ -281,8 +294,8 @@ class CarEnv:
         return float(np.dot(rel, normal))
 
     def _heading_error(self, idx: int, heading: float) -> float:
-        p0 = self.center[idx % len(self.center)]
-        p1 = self.center[(idx + 2) % len(self.center)]
+        p0 = self.reference_line[idx % len(self.reference_line)]
+        p1 = self.reference_line[(idx + 2) % len(self.reference_line)]
         target_heading = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
         return wrap_to_pi(target_heading - heading)
 
@@ -755,11 +768,13 @@ class ModelCheckpointReporter(neat.reporting.BaseReporter):
         track_dir: Path,
         config_path: Path,
         difficulty: str,
+        follow_line: str,
     ) -> None:
         self.run_dir = run_dir
         self.track_dir = track_dir
         self.config_path = config_path
         self.difficulty = difficulty
+        self.follow_line = follow_line
         self.current_generation = -1
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -781,6 +796,7 @@ class ModelCheckpointReporter(neat.reporting.BaseReporter):
             "track_dir": str(self.track_dir),
             "config_path": str(self.config_path),
             "difficulty": self.difficulty,
+            "follow_line": self.follow_line,
         }
         save_path = self.run_dir / f"generation_{generation:04d}_best.pkl"
         with save_path.open("wb") as f:
@@ -817,6 +833,7 @@ def run_training(
     animation_window_m: float = 18.0,
     show_net: bool = False,
     models_dir: Path | None = None,
+    follow_line: str = "centerline",
 ) -> neat.DefaultGenome:
     track = TrackLoader.load(track_dir)
     settings = DifficultySettings.from_name(difficulty)
@@ -827,11 +844,13 @@ def run_training(
         checkpoint_base_reward=checkpoint_pass_reward,
         checkpoint_miss_penalty=checkpoint_miss_penalty,
         max_steps=max_steps,
+        follow_line=follow_line,
     )
     print(
         f"Episode budget: {env.max_steps} steps "
         f"({env.max_steps * env.dt:.1f}s simulated time, dt={env.dt:.2f}s)"
     )
+    print(f"Following reference line: {follow_line}")
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     models_root = models_dir if models_dir is not None else Path(__file__).resolve().parent / "models"
     run_dir = models_root / timestamp
@@ -859,6 +878,7 @@ def run_training(
             track_dir=track_dir,
             config_path=config_path,
             difficulty=difficulty,
+            follow_line=follow_line,
         )
     )
     live_reporter: LiveVizReporter | None = None
@@ -913,6 +933,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint-pass-reward", type=float, default=72.0)
     parser.add_argument("--checkpoint-miss-penalty", type=float, default=48.0)
     parser.add_argument(
+        "--follow-line",
+        type=str,
+        default="centerline",
+        choices=["centerline", "raceline"],
+        help="Reference line used for lane, heading, and progress rewards.",
+    )
+    parser.add_argument(
         "--max-steps",
         type=int,
         default=0,
@@ -944,6 +971,7 @@ def main() -> None:
         animation_window_m=args.animate_window_m,
         show_net=args.show_net,
         models_dir=args.models_dir.expanduser().resolve(),
+        follow_line=args.follow_line,
     )
     if not args.no_gui:
         print("Close the visualization window to end.")

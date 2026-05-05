@@ -22,14 +22,16 @@
 
 NEAT 알고리즘이 학습하는 신경망의 구조는 다음과 같습니다.
 
-### 입력값 (7개 관측치 - Observations)
-1. **정규화된 횡방향 오차 (Normalized Lateral Error)**: 차량이 센터라인에서 얼마나 벗어났는지를 트랙 반폭(half-width)으로 나눈 값입니다.
-2. **정규화된 헤딩 오차 (Normalized Heading Error)**: 차량의 현재 진행 방향과 레이싱 라인의 목표 방향 사이의 각도 차이를 $\pi$로 나눈 값입니다.
+### 입력값 (9개 관측치 - Observations)
+1. **정규화된 횡방향 오차 (Normalized Lateral Error)**: 차량이 기준선(`--follow-line`)에서 얼마나 벗어났는지를 트랙 반폭(half-width)으로 나눈 값입니다.
+2. **정규화된 헤딩 오차 (Normalized Heading Error)**: 차량의 현재 진행 방향과 기준선의 목표 방향 사이의 각도 차이를 $\pi$로 나눈 값입니다.
 3. **정규화된 속도 (Normalized Speed)**: 현재 속도를 해당 트랙의 최대 허용 속도로 나눈 값입니다.
 4. **트랙 진행도 (Track Progress)**: 현재 위치가 전체 트랙의 어느 지점인지를 0~1 사이로 나타낸 값입니다.
 5. **현재 속도 편차 (Speed Delta)**: (현재 지점 권장 속도 - 현재 속도) / 최대 속도. 양수면 가속, 음수면 감속이 필요함을 의미합니다.
-6. **전방 속도 편차 (Lookahead Delta)**: (15m 전방 권장 속도 - 현재 속도) / 최대 속도. 코너 진입 전 **미리 감속**해야 할 정도를 나타냅니다.
+6. **전방 최소 권장 속도 (Future Min Speed)**: 전방 구간의 가장 낮은 권장 속도입니다. 코너가 가까울수록 낮아집니다.
 7. **전방 지점 헤딩 오차 (Lookahead Heading Error)**: 약 15m 전방 지점의 곡률 정보를 미리 파악하여 조향을 준비할 수 있게 합니다.
+8. **브레이킹 긴급도 (Brake Urgency)**: 현재 속도가 전방 최소 권장 속도보다 얼마나 높은지 나타냅니다.
+9. **전방 곡률 심각도 (Curvature Ahead)**: 앞쪽 코너가 얼마나 강한지 0~1 범위로 나타냅니다.
 
 ### 출력값 (2개 행동 - Actions)
 1. **조향 (Steering)**: -1.0(왼쪽 최대)에서 1.0(오른쪽 최대) 사이의 값입니다.
@@ -37,118 +39,118 @@ NEAT 알고리즘이 학습하는 신경망의 구조는 다음과 같습니다.
 
 ---
 
-## 사용자 정의 가능한 상수 (Customizable Constants)
+## CLI 명령어 전체 정리
 
-학습 환경과 난이도를 조정하기 위해 다음과 같은 변수들을 커스터마이징 할 수 있습니다.
-
-### 1. 실행 인자 (Command Line Arguments)
-`main.py` 실행 시 인자로 전달하여 즉시 변경 가능합니다.
-- `--generations`: 진화할 최대 세대 수 (기본값: 40)
-- `--difficulty`: 난이도 프리셋 (`normal`, `easy`, `very-easy`, `overfit` / 기본값: `easy`)
-- `--show-net`: 애니메이션 모드에서 실시간 신경망 활성도 그래프 표시 (기본값: False)
-- `--checkpoint-every`: 체크포인트 설치 간격 (기본값: 45)
-- `--checkpoint-pass-reward`: 체크포인트 통과 시 부여되는 보상 (기본값: 72.0)
-- `--checkpoint-miss-penalty`: 체크포인트 순서 위반 시 부여되는 패널티 (기본값: 48.0)
-
-### 2. 난이도 프리셋 상세 설정 (`DifficultySettings`)
-`main.py` 내부의 `DifficultySettings` 클래스에서 각 프리셋별 세부 수치를 조정할 수 있습니다.
-- `width_scale`: 트랙 폭 허용 범위 계수
-- `offtrack_scale`: 이탈 판정 기준 계수
-- `lane_penalty_weight`: 차선 이탈 패널티 가중치
-- `heading_penalty_weight`: 방향 오차 패널티 가중치
-- `speed_scale`: 속도 보상 가중치
-- `steer_penalty_weight`: 급격한 조향 패널티 가중치
-- `start_speed`: 차량의 초기 속도
-
-### 3. NEAT 알고리즘 설정 (`neat_config.ini`)
-신경망 구조와 진화 알고리즘의 핵심 파라미터입니다.
-- `pop_size`: 한 세대당 개체 수 (기본값: 150)
-- `activation_mutate_rate`: 활성화 함수 변이 확률
-- `weight_mutate_rate`: 가중치 변이 확률
-- `conn_add_prob` / `node_add_prob`: 연결/노드 추가 확률
-
----
-
-## 학습/시각화 구성
-
-- 보상 구조:
-  - **순차 체크포인트**(centerline 기준 간격 게이트) 통과 보상과, 순서 어김 교차 패널티
-  - **속도 매칭 보상**: 현재 속도가 해당 지점의 권장 속도(`target_speed_now`)에 가까울수록 보상 부여
-  - **전방 예측 패널티**:
-    - 현재 속도가 전방의 권장 속도(`target_speed_lookahead`)보다 너무 높으면 패널티 부여 (미리 브레이크 유도)
-    - 현재 방향이 전방의 목표 방향과 크게 다르면 패널티 부여 (미리 조향 유도)
-  - 차선 이탈, 헤딩 오차, 과도한 조향에 대한 패널티 및 트랙 이탈 시 종료
-- 시각화:
-  - 좌측: centerline/raceline + 현재까지 최고 개체의 주행 궤적
-  - 중앙: 세대별 최고/평균 fitness
-  - 우측: (`--show-net` 시) 실시간 신경망 활성도 (7개 입력, 2개 출력)
-
-## 실행 방법
+아래 명령어는 `new/neat_racetrack_viz` 폴더에서 실행하는 기준입니다.
 
 ```bash
 cd new/neat_racetrack_viz
 python -m pip install -r requirements.txt
+```
+
+기본 학습:
+
+```bash
+python main.py
+```
+
+Austin 트랙에서 40세대 학습하고 시각화까지 켜는 기본 추천 명령:
+
+```bash
 python main.py --track-dir ../f1tenth_racetracks-main/Austin --generations 40 --difficulty easy --animate-best --show-net
 ```
 
-빠른 확인(창 없이 1세대 테스트):
+raceline을 기준으로 따라가게 학습하는 명령:
+
+```bash
+python main.py --track-dir ../f1tenth_racetracks-main/Austin --follow-line raceline --generations 40 --difficulty easy --animate-best --show-net
+```
+
+빠른 확인용 1세대 테스트:
 
 ```bash
 python main.py --track-dir ../f1tenth_racetracks-main/Austin --generations 1 --difficulty overfit --no-gui
 ```
 
-다른 트랙 예시:
+다른 트랙 사용:
 
 ```bash
-python main.py --track-dir "../f1tenth_racetracks-main/Mexico City" --generations 50
+python main.py --track-dir "../f1tenth_racetracks-main/Mexico City" --follow-line raceline --generations 50
 ```
 
-## 난이도(학습 속도) 프리셋
+### 전체 옵션
 
-- `normal`: 가장 보수적인 기본 난이도
-- `easy`: 기본 추천. 학습이 더 빨리 붙도록 완화
-- `very-easy`: 더 빠른 수렴용
-- `overfit`: 매우 빠른 학습(일반화보다 수렴 우선)
+- `--track-dir PATH`: 사용할 트랙 폴더입니다. 폴더 안에 `*_centerline.csv`, `*_raceline.csv`, `*_map.yaml` 파일이 있어야 합니다. 기본값은 `f1tenth_racetracks-main/Austin`입니다.
+- `--config PATH`: `neat-python` 설정 파일 경로입니다. 기본값은 `neat_config.ini`입니다.
+- `--generations N`: 학습할 세대 수입니다. 기본값은 `40`입니다. 빠른 테스트는 `1`, 긴 학습은 `100` 이상처럼 늘릴 수 있습니다.
+- `--difficulty {normal,easy,very-easy,overfit,ideal}`: 학습 난이도 프리셋입니다. 기본값은 `easy`입니다.
+- `--follow-line {centerline,raceline}`: 횡방향 오차, 헤딩 오차, 진행도 보상의 기준선을 고릅니다. 기본값은 `centerline`입니다. 레이싱 라인을 따라가게 하고 싶으면 `--follow-line raceline`을 사용하세요.
+- `--no-gui`: matplotlib 창 없이 콘솔에서만 학습합니다. 원격 환경, 빠른 테스트, 긴 학습에서는 이 옵션이 안정적입니다.
+- `--show-net`: 시각화 창 오른쪽에 신경망 입력/출력 활성도 막대를 표시합니다.
+- `--animate-best`: 각 세대의 best genome 궤적을 시작 지점부터 애니메이션으로 보여줍니다.
+- `--animate-step-pause SEC`: best 궤적 애니메이션의 프레임 간 지연 시간입니다. 기본값은 `0.01`입니다. 작을수록 빠르게 재생됩니다.
+- `--animate-window-m M`: 애니메이션 확대 창의 반경입니다. 기본값은 `18.0`m입니다. 차량 주변을 더 좁게 보고 싶으면 `14`처럼 줄이면 됩니다.
+- `--checkpoint-every N`: 센터라인 원본 샘플 기준으로 체크포인트를 배치하는 간격입니다. 기본값은 `45`입니다.
+- `--checkpoint-pass-reward VALUE`: 다음 체크포인트를 순서대로 통과했을 때 주는 보상입니다. 기본값은 `72.0`입니다.
+- `--checkpoint-miss-penalty VALUE`: 현재 목표가 아닌 체크포인트를 먼저 지나갔을 때 주는 패널티입니다. 기본값은 `48.0`입니다.
+- `--max-steps N`: 한 genome의 평가 step 제한입니다. `0`이면 트랙 길이와 난이도에 따라 자동 계산합니다. `dt=0.1`초이므로 `300` step은 시뮬레이션 시간 약 30초입니다.
+- `--models-dir PATH`: 세대별 best 모델을 저장할 루트 폴더입니다. 기본값은 `neat_racetrack_viz/models`입니다. 실행할 때마다 현재시각 폴더가 생기고 그 안에 `generation_0000_best.pkl` 형식으로 저장됩니다.
 
-쉬운 모드일수록 아래가 자동 적용됩니다.
+### 자주 쓰는 조합
 
-- 이탈 허용폭 확대
-- 에피소드 길이 축소(세대당 계산량 감소)
-- 트랙 샘플 다운샘플링(평가 속도 향상)
-- 체크포인트 통과 보상 계수 증가(난이도 프리셋의 `checkpoint_pass_reward_scale`)
-
-예시:
+raceline 기준으로 창 없이 길게 학습:
 
 ```bash
-python main.py --difficulty overfit --generations 20
+python main.py --track-dir ../f1tenth_racetracks-main/Austin --follow-line raceline --generations 100 --difficulty easy --no-gui
 ```
 
-## 체크포인트 보상 설정
-
-체크포인트는 원본 센터라인을 간격 `--checkpoint-every`로 샘플한 뒤, **센터라인 인덱스가 증가하는 순서**(폐합 polyline 순방향)대로 게이트를 둡니다.  
-목표 gate만 지날 때 큰 보상이 나가고, **다른 gate를 먼저 지나면 패널티**입니다. 필요한 중간 gate를 모두 통과한 뒤 다시 시작 gate를 통과하면 라운드가 초기화됩니다.
+학습이 너무 오래 걸릴 때 빠른 수렴용:
 
 ```bash
-python main.py --checkpoint-every 50 --checkpoint-pass-reward 80 --checkpoint-miss-penalty 55
+python main.py --follow-line raceline --difficulty overfit --generations 20 --no-gui
 ```
 
-## Plot 창 응답 없음 완화
-
-평가 루프 중에도 주기적으로 GUI 이벤트를 처리하도록 수정했습니다.  
-그래도 원격 환경이나 매우 무거운 세대 설정에서는 `--no-gui`로 학습 후 결과만 확인하는 방식이 더 안정적입니다.
-
-## 세대별 best 궤적 애니메이션
-
-각 generation의 최고 개체 궤적을 시작 지점 확대 상태에서 실시간으로 재생할 수 있습니다.
+에피소드 시간제한을 늘려서 느린 초반 개체도 더 오래 보게 하기:
 
 ```bash
-python main.py --animate-best --animate-window-m 14 --animate-step-pause 0.008 --show-net
+python main.py --follow-line raceline --max-steps 600 --generations 40
 ```
 
-- `--animate-best`: 세대별 best trajectory 애니메이션 활성화
-- `--show-net`: 실시간 신경망 활성도 시각화 활성화
-- `--animate-window-m`: 확대 창 반경(미터)
-- `--animate-step-pause`: 프레임 간 지연(작을수록 빠름)
+체크포인트 보상을 더 강하게 주기:
+
+```bash
+python main.py --follow-line raceline --checkpoint-every 50 --checkpoint-pass-reward 90 --checkpoint-miss-penalty 60
+```
+
+모델 저장 위치를 바꾸기:
+
+```bash
+python main.py --follow-line raceline --models-dir ./models_raceline --generations 40
+```
+
+### 난이도 프리셋
+
+- `normal`: 가장 보수적인 기본 난이도입니다.
+- `easy`: 기본 추천입니다. 학습이 비교적 빨리 붙도록 완화되어 있습니다.
+- `very-easy`: 더 빠른 수렴을 위한 설정입니다.
+- `overfit`: 일반화보다 빠른 수렴을 우선하는 설정입니다.
+- `ideal`: 속도 보상을 강하게 둔 실험용 설정입니다.
+
+쉬운 모드일수록 이탈 허용폭, 에피소드 길이, 다운샘플링, 체크포인트 보상 계수가 함께 조정됩니다.
+
+### 저장되는 모델 파일
+
+학습을 한 번 실행하면 `models/YYYYMMDD_HHMMSS/` 폴더가 만들어집니다. 각 세대의 best 모델은 아래처럼 저장됩니다.
+
+```text
+models/
+  20260505_133815/
+    generation_0000_best.pkl
+    generation_0001_best.pkl
+    ...
+```
+
+각 `.pkl` 파일에는 `genome`, `config`, `generation`, `fitness`, `track_dir`, `config_path`, `difficulty`, `follow_line`이 들어 있습니다.
 
 ## 파일 설명
 

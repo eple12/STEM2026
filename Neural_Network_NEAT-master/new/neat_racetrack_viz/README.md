@@ -78,6 +78,14 @@ python main.py --track-dir ../f1tenth_racetracks-main/Austin --generations 1 --d
 python main.py --track-dir "../f1tenth_racetracks-main/Mexico City" --follow-line raceline --generations 50
 ```
 
+COPY & PASTE:
+```bash
+python main.py --max-steps 1000 --follow-line raceline --generations 100 --track-dir ../f1tenth_racetracks-main/Zandvoort --difficulty normal --checkpoint-every 10
+```
+```bash
+python replay_model.py --save-video replay.mp4 --video-fps 30 --no-show
+```
+
 ### 전체 옵션
 
 - `--track-dir PATH`: 사용할 트랙 폴더입니다. 폴더 안에 `*_centerline.csv`, `*_raceline.csv`, `*_map.yaml` 파일이 있어야 합니다. 기본값은 `f1tenth_racetracks-main/Austin`입니다.

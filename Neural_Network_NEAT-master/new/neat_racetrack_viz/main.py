@@ -21,6 +21,8 @@ import yaml
 # how strongly the agent is rewarded for speed, alignment, and braking.
 MIN_SPEED = 0.5
 MAX_STEER_RATE = 1.8
+MIN_STEER_RATE_FACTOR = 0.35
+STEER_SPEED_SENSITIVITY = 1.35
 MAX_ACCEL = 2.5
 
 # Reward weights
@@ -322,6 +324,13 @@ class CarEnv:
         straight_signal *= 1.0 - 0.75 * corner_signal
         return idx_mid, target_speed_now, min_future_speed, corner_signal, straight_signal
 
+    def _current_max_steer_rate(self) -> float:
+        speed_ratio = float(np.clip(self.speed / self.max_speed, 0.0, 1.0))
+        steer_factor = MIN_STEER_RATE_FACTOR + (
+            1.0 - MIN_STEER_RATE_FACTOR
+        ) * ((1.0 - speed_ratio) ** STEER_SPEED_SENSITIVITY)
+        return self.max_steer_rate * steer_factor
+
     def _crosses_checkpoint_segment(
         self, x0: float, y0: float, x1: float, y1: float, ord_idx: int
     ) -> bool:
@@ -403,7 +412,8 @@ class CarEnv:
             return 0.0
 
         steer_norm = float(np.clip(steer_cmd, -1.0, 1.0))
-        steer = steer_norm * self.max_steer_rate
+        max_steer_rate = self._current_max_steer_rate()
+        steer = steer_norm * max_steer_rate
         throttle_norm = float(np.clip(throttle_cmd, -1.0, 1.0))
         accel = throttle_norm * self.max_accel
 
@@ -769,12 +779,14 @@ class ModelCheckpointReporter(neat.reporting.BaseReporter):
         config_path: Path,
         difficulty: str,
         follow_line: str,
+        max_steps: int,
     ) -> None:
         self.run_dir = run_dir
         self.track_dir = track_dir
         self.config_path = config_path
         self.difficulty = difficulty
         self.follow_line = follow_line
+        self.max_steps = max_steps
         self.current_generation = -1
         self.run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -797,6 +809,7 @@ class ModelCheckpointReporter(neat.reporting.BaseReporter):
             "config_path": str(self.config_path),
             "difficulty": self.difficulty,
             "follow_line": self.follow_line,
+            "max_steps": self.max_steps,
         }
         save_path = self.run_dir / f"generation_{generation:04d}_best.pkl"
         with save_path.open("wb") as f:
@@ -879,6 +892,7 @@ def run_training(
             config_path=config_path,
             difficulty=difficulty,
             follow_line=follow_line,
+            max_steps=env.max_steps,
         )
     )
     live_reporter: LiveVizReporter | None = None

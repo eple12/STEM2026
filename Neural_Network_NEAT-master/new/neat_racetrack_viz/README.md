@@ -34,7 +34,7 @@ NEAT 알고리즘이 학습하는 신경망의 구조는 다음과 같습니다.
 9. **전방 곡률 심각도 (Curvature Ahead)**: 앞쪽 코너가 얼마나 강한지 0~1 범위로 나타냅니다.
 
 ### 출력값 (2개 행동 - Actions)
-1. **조향 (Steering)**: -1.0(왼쪽 최대)에서 1.0(오른쪽 최대) 사이의 값입니다.
+1. **조향 (Steering)**: -1.0(왼쪽 최대)에서 1.0(오른쪽 최대) 사이의 값입니다. 실제 적용 가능한 조향률은 속도에 따라 달라지며, 저속에서는 크게 꺾을 수 있고 고속에서는 작게 제한됩니다.
 2. **가감속 (Throttle/Brake)**: -1.0(최대 제동)에서 1.0(최대 가속) 사이의 값입니다.
 
 ---
@@ -96,6 +96,16 @@ python main.py --track-dir "../f1tenth_racetracks-main/Mexico City" --follow-lin
 - `--max-steps N`: 한 genome의 평가 step 제한입니다. `0`이면 트랙 길이와 난이도에 따라 자동 계산합니다. `dt=0.1`초이므로 `300` step은 시뮬레이션 시간 약 30초입니다.
 - `--models-dir PATH`: 세대별 best 모델을 저장할 루트 폴더입니다. 기본값은 `neat_racetrack_viz/models`입니다. 실행할 때마다 현재시각 폴더가 생기고 그 안에 `generation_0000_best.pkl` 형식으로 저장됩니다.
 
+### 속도별 조향 제한
+
+차량은 고정된 최대 조향률을 그대로 쓰지 않고, 현재 속도가 빠를수록 적용 가능한 조향률이 줄어듭니다. 덕분에 저속 코너에서는 크게 꺾을 수 있고, 고속 직선에서는 작은 조향만 허용되어 갑작스러운 회전과 이탈을 줄일 수 있습니다.
+
+관련 상수는 `main.py` 상단에 있습니다.
+
+- `MAX_STEER_RATE`: 저속에서 사용할 최대 조향률입니다.
+- `MIN_STEER_RATE_FACTOR`: 최고속 근처에서 남겨둘 최소 조향률 비율입니다. 기본값 `0.35`는 최고속에서 저속 최대 조향률의 35%까지만 허용한다는 뜻입니다.
+- `STEER_SPEED_SENSITIVITY`: 속도 증가에 따라 조향 제한이 얼마나 빨리 강해지는지 정합니다. 값이 클수록 저속에서는 조향을 더 많이 허용하고, 고속으로 갈수록 급하게 제한됩니다.
+
 ### 자주 쓰는 조합
 
 raceline 기준으로 창 없이 길게 학습:
@@ -128,6 +138,54 @@ python main.py --follow-line raceline --checkpoint-every 50 --checkpoint-pass-re
 python main.py --follow-line raceline --models-dir ./models_raceline --generations 40
 ```
 
+저장된 모델을 트랙 경로와 신경망 활성도 애니메이션으로 재생하기:
+
+```bash
+python replay_model.py
+```
+
+인자 없이 실행하면 `models/` 폴더 아래에서 가장 최근에 저장된 `generation_XXXX_best.pkl`을 자동으로 불러옵니다. 특정 모델을 직접 지정하려면:
+
+```bash
+python replay_model.py models/20260505_133815/generation_0000_best.pkl
+```
+
+전체 트랙을 고정 화면으로 보고 싶으면:
+
+```bash
+python replay_model.py models/20260505_133815/generation_0000_best.pkl --no-zoom
+```
+
+재생 속도를 늦추거나 빠르게 조정하려면:
+
+```bash
+python replay_model.py models/20260505_133815/generation_0000_best.pkl --pause 0.02 --window-m 14
+```
+
+창을 열지 않고 저장 파일이 잘 읽히는지만 확인하려면:
+
+```bash
+python replay_model.py --summary-only
+```
+
+현재 보이는 replay 화면을 영상 파일로 저장하려면:
+
+```bash
+python replay_model.py --save-video replay.gif --no-show
+```
+
+기본 환경에서는 matplotlib의 `pillow` writer로 `.gif` 저장이 바로 됩니다. `.mp4`, `.mov`, `.m4v`로 저장하려면 시스템에 `ffmpeg`가 설치되어 있어야 합니다.
+
+```bash
+python replay_model.py --save-video replay.mp4 --video-fps 30 --no-show
+```
+
+영상 파일이 너무 크거나 저장이 느리면 프레임을 건너뛰어 저장할 수 있습니다. 예를 들어 `--video-stride 2`는 두 step마다 한 프레임만 저장합니다.
+
+```bash
+python replay_model.py --save-video replay.gif --video-stride 2 --video-fps 20 --no-show
+```
+
 ### 난이도 프리셋
 
 - `normal`: 가장 보수적인 기본 난이도입니다.
@@ -151,9 +209,11 @@ models/
 ```
 
 각 `.pkl` 파일에는 `genome`, `config`, `generation`, `fitness`, `track_dir`, `config_path`, `difficulty`, `follow_line`이 들어 있습니다.
+새로 저장되는 파일에는 학습 당시의 실제 에피소드 제한인 `max_steps`도 함께 들어가며, `replay_model.py`는 이 값을 사용해서 학습 때와 같은 길이로 재생합니다. 예전 pkl처럼 `max_steps`가 없는 파일은 기본값으로 재계산되므로, 길게 학습한 예전 모델을 끝까지 보고 싶으면 `--max-steps`로 직접 지정하세요.
 
 ## 파일 설명
 
 - `main.py`: 트랙 로딩, 환경 시뮬레이션, NEAT 학습, 실시간 플롯
+- `replay_model.py`: 저장된 `.pkl` 모델을 불러와 트랙 주행 경로와 신경망 활성도를 애니메이션으로 재생
 - `neat_config.ini`: `neat-python` 설정값
 - `requirements.txt`: 의존성 목록

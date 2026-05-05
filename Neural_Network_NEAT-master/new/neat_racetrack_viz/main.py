@@ -40,21 +40,20 @@ class DifficultySettings:
     checkpoint_pass_reward_scale: float
     start_speed: float
     downsample_stride: int
+    brake_penalty_weight: float   # ★ 추가: 예측 브레이킹 페널티 가중치
 
     @staticmethod
     def from_name(name: str) -> "DifficultySettings":
+        # brake_penalty_weight: 크게 설정할수록 코너 전 감속을 강하게 학습
+        # 단, 너무 크면 직선에서도 과도하게 감속함 → 0.3~0.8 권장
         presets = {
-            "normal": DifficultySettings(1.00, 1.00, 1.00, 0.70, 0.40, 0.10, 0.028, 1.0, 2.0, 1),
-            "easy": DifficultySettings(1.35, 1.25, 0.75, 0.45, 0.25, 0.12, 0.020, 1.35, 2.5, 2),
-            "very-easy": DifficultySettings(1.75, 1.60, 0.60, 0.25, 0.15, 0.14, 0.015, 1.65, 3.0, 3),
-            "overfit": DifficultySettings(2.20, 2.00, 0.45, 0.12, 0.08, 0.18, 0.010, 2.0, 3.8, 4),
-            "ideal": DifficultySettings(1.35, 1.25, 0.75, 0.50, 3.5, 0.12, 2.0, 1.35, 2.5, 2)
+            "normal":    DifficultySettings(1.00, 1.00, 1.00, 0.70, 0.40, 0.10, 0.028, 1.0,  2.0, 1, 0.50),
+            "easy":      DifficultySettings(1.35, 1.25, 0.75, 0.45, 0.25, 0.12, 0.020, 1.35, 2.5, 2, 0.60),
+            "very-easy": DifficultySettings(1.75, 1.60, 0.60, 0.25, 0.15, 0.14, 0.015, 1.65, 3.0, 3, 0.70),
+            "overfit":   DifficultySettings(2.20, 2.00, 0.45, 0.12, 0.08, 0.18, 0.010, 2.0,  3.8, 4, 0.80),
+            "ideal":     DifficultySettings(1.35, 1.25, 0.75, 0.50, 3.5,  0.12, 2.0,   1.35, 2.5, 2, 0.60),
         }
-        # return presets[name]
-        
         return presets["ideal"]
-
-
 
 
 class TrackLoader:
@@ -82,7 +81,6 @@ class TrackLoader:
         raceline_path = track_dir / f"{name}_raceline.csv"
         map_yaml_path = track_dir / f"{name}_map.yaml"
         if not centerline_path.exists():
-            # Some track folders use no-space naming in file prefix.
             prefix = name.replace(" ", "")
             centerline_path = track_dir / f"{prefix}_centerline.csv"
             raceline_path = track_dir / f"{prefix}_raceline.csv"
@@ -122,34 +120,37 @@ class CarEnv:
         stride = max(1, int(settings.downsample_stride))
         self.center = track.centerline_xy[::stride]
         self.raceline = track.raceline_xy[::stride]
-        self.track_half_width = np.minimum(track.width_left[::stride], track.width_right[::stride]) * settings.width_scale
-        
+        self.track_half_width = np.minimum(
+            track.width_left[::stride], track.width_right[::stride]
+        ) * settings.width_scale
+
         self.max_steer_rate = 1.8
         self.max_accel = 2.5
         self.min_speed = 0.5
         self.max_speed = max(10.0, float(np.max(track.raceline_speed)))
-        
-        # Calculate dynamic target speed based on curvature (kappa)
-        # V = sqrt(a_lat / abs(kappa))
-        kappa = np.abs(track.raceline_kappa[::stride])
-        a_lat = 5.0 # Lateral acceleration limit
-        dynamic_speeds = np.sqrt(a_lat / (kappa + 1e-5))
-        
-        # Use the minimum of dynamic speed and capped by global max
-        self.target_speeds = np.clip(dynamic_speeds, self.min_speed, self.max_speed)
-        
-        # Smooth target speeds to prevent jittery braking signals
-        self.target_speeds = np.convolve(self.target_speeds, np.ones(5)/5, mode='same')
 
-        self.max_steps = max(160, int(max(400, len(self.center) // 3) * settings.step_scale))
+        # 곡률 기반 동적 목표 속도
+        kappa = np.abs(track.raceline_kappa[::stride])
+        a_lat = 5.0
+        dynamic_speeds = np.sqrt(a_lat / (kappa + 1e-5))
+        self.target_speeds = np.clip(dynamic_speeds, self.min_speed, self.max_speed)
+        self.target_speeds = np.convolve(self.target_speeds, np.ones(5) / 5, mode="same")
+
+        self.max_steps = max(
+            160, int(max(400, len(self.center) // 3) * settings.step_scale)
+        )
         interval = max(1, checkpoint_every // stride)
         n = len(self.center)
-        self.checkpoint_indices = [0] + [i for i in range(interval, n, interval) if i != 0]
+        self.checkpoint_indices = [0] + [
+            i for i in range(interval, n, interval) if i != 0
+        ]
         uniq: List[int] = []
         for i in self.checkpoint_indices:
             if i not in uniq:
                 uniq.append(i)
-        self.checkpoint_indices = sorted(uniq) if len(uniq) >= 2 else list(range(min(8, n)))
+        self.checkpoint_indices = (
+            sorted(uniq) if len(uniq) >= 2 else list(range(min(8, n)))
+        )
         self.checkpoint_every = checkpoint_every
         self.checkpoint_base_reward = checkpoint_base_reward
         self.checkpoint_miss_penalty = checkpoint_miss_penalty
@@ -213,13 +214,16 @@ class CarEnv:
         target_heading = math.atan2(p1[1] - p0[1], p1[0] - p0[0])
         return wrap_to_pi(target_heading - heading)
 
-    def _crosses_checkpoint_segment(self, x0: float, y0: float, x1: float, y1: float, ord_idx: int) -> bool:
-        px, py = float(self._checkpoint_points[ord_idx][0]), float(self._checkpoint_points[ord_idx][1])
-        nx, ny = float(self._checkpoint_normals[ord_idx][0]), float(self._checkpoint_normals[ord_idx][1])
+    def _crosses_checkpoint_segment(
+        self, x0: float, y0: float, x1: float, y1: float, ord_idx: int
+    ) -> bool:
+        px = float(self._checkpoint_points[ord_idx][0])
+        py = float(self._checkpoint_points[ord_idx][1])
+        nx = float(self._checkpoint_normals[ord_idx][0])
+        ny = float(self._checkpoint_normals[ord_idx][1])
         s0 = (x0 - px) * nx + (y0 - py) * ny
         s1 = (x1 - px) * nx + (y1 - py) * ny
         if s0 == 0.0 or s1 == 0.0:
-            ds = math.hypot(x1 - x0, y1 - y0) + 1e-12
             t = (-s0 / (s1 - s0 + 1e-18)) if s1 != s0 else 0.5
             t = float(np.clip(t, 0.0, 1.0))
             ix = x0 + t * (x1 - x0)
@@ -232,6 +236,18 @@ class CarEnv:
         iy = y0 + t * (y1 - y0)
         return math.hypot(ix - px, iy - py) ** 2 <= self.checkpoint_radius_sq
 
+    # ──────────────────────────────────────────────────────────────────────────
+    # observe(): 입력 9개로 확장
+    # [0] norm_lateral_err     현재 횡방향 오차
+    # [1] norm_heading_err     현재 헤딩 오차
+    # [2] speed_norm           현재 속도
+    # [3] progress_norm        트랙 진행도
+    # [4] speed_delta_now      현재 권장속도 대비 편차 (+면 가속 필요)
+    # [5] min_future_speed_norm 전방 ~30m 중 최솟값 (코너 존재 여부)  ★ 핵심
+    # [6] brake_urgency        현재속도 - 전방최소속도 (양수면 지금 브레이킹 필요)  ★ 핵심
+    # [7] la_heading_err       중거리 전방 헤딩 오차
+    # [8] curvature_ahead      전방 평균 곡률 절댓값 (코너 심각도)  ★ 핵심
+    # ──────────────────────────────────────────────────────────────────────────
     def observe(self) -> np.ndarray:
         idx = self._nearest_centerline_index(self.x, self.y)
         lat_err = self._lane_error(idx, self.x, self.y)
@@ -241,28 +257,53 @@ class CarEnv:
         speed_norm = self.speed / self.max_speed
         progress_norm = idx / max(1, len(self.center) - 1)
 
-        # Lookahead information (approx 15m ahead)
-        # Assuming average spacing is ~0.4m per raw point, stride-adjusted offset:
-        # 15m / 0.4m = 37.5 raw steps.
-        # We'll use a relative offset based on the current track length for simplicity.
-        lookahead_offset = max(5, len(self.center) // 25) 
-        lookahead_idx = (idx + lookahead_offset) % len(self.center)
-        
-        # Relative speed deltas: (target - current) / max_speed
-        # Positive if we should speed up, negative if we should slow down.
-        speed_delta = (self.target_speeds[idx] - self.speed) / self.max_speed
-        lookahead_delta = (self.target_speeds[lookahead_idx] - self.speed) / self.max_speed
-        heading_err_lookahead = self._heading_error(lookahead_idx, self.heading) / math.pi
+        n = len(self.center)
+        lo1 = max(3, n // 40)
+        lo2 = max(6, n // 20)
+        lo3 = max(12, n // 10)
+
+        idx1 = (idx + lo1) % n
+        idx2 = (idx + lo2) % n
+        idx3 = (idx + lo3) % n
+
+        ts_now = self.target_speeds[idx]
+        ts1 = self.target_speeds[idx1]
+        ts2 = self.target_speeds[idx2]
+        ts3 = self.target_speeds[idx3]
+
+        # 전방 구간 최소 권장속도 (코너 존재 시 낮아짐)
+        min_future_speed = min(ts1, ts2, ts3)
+
+        speed_delta_now = (ts_now - self.speed) / self.max_speed
+        min_future_speed_norm = min_future_speed / self.max_speed
+
+        # ★ 브레이킹 긴급도: 현재속도 - 전방 최소 권장속도
+        # 양수 = 지금 브레이크를 밟아야 함, 값이 클수록 급브레이킹 필요
+        brake_urgency = max(0.0, self.speed - min_future_speed) / self.max_speed
+
+        la_heading_err = self._heading_error(idx2, self.heading) / math.pi
+
+        # ★ 전방 평균 곡률: 코너의 심각도를 직접 인지하게 함
+        # kappa가 크면 = 앞에 급코너 있음
+        kappa_vals = [
+            abs(float(self.track.raceline_kappa[
+                (idx + lo1 * k // lo1) % len(self.track.raceline_kappa)
+            ])) for k in range(lo1, lo3, max(1, (lo3 - lo1) // 5))
+        ]
+        curvature_ahead = float(np.mean(kappa_vals)) * 100.0  # 스케일 조정 (값이 매우 작으므로)
+        curvature_ahead = min(curvature_ahead, 1.0)  # 클리핑
 
         return np.array(
             [
-                norm_err,
-                heading_err / math.pi,
-                speed_norm,
-                progress_norm,
-                speed_delta,
-                lookahead_delta,
-                heading_err_lookahead,
+                norm_err,                   # [0] 횡방향 오차
+                heading_err / math.pi,      # [1] 헤딩 오차
+                speed_norm,                 # [2] 현재 속도
+                progress_norm,              # [3] 진행도
+                speed_delta_now,            # [4] 현재 지점 속도 편차
+                min_future_speed_norm,      # [5] 전방 최소 권장속도  ★
+                brake_urgency,              # [6] 브레이킹 긴급도     ★
+                la_heading_err,             # [7] 중거리 헤딩 오차
+                curvature_ahead,            # [8] 전방 곡률 심각도    ★
             ],
             dtype=np.float64,
         )
@@ -276,7 +317,9 @@ class CarEnv:
         accel = float(np.clip(throttle_cmd, -1.0, 1.0)) * self.max_accel
 
         self.heading += steer * self.dt
-        self.speed = float(np.clip(self.speed + accel * self.dt, self.min_speed, self.max_speed))
+        self.speed = float(
+            np.clip(self.speed + accel * self.dt, self.min_speed, self.max_speed)
+        )
         x_prev, y_prev = self.x, self.y
         self.x += self.speed * math.cos(self.heading) * self.dt
         self.y += self.speed * math.sin(self.heading) * self.dt
@@ -288,15 +331,23 @@ class CarEnv:
         half_width = max(0.6, float(self.track_half_width[idx]))
         heading_err = abs(self._heading_error(idx, self.heading))
 
-        # Lookahead for reward/penalty calculation
-        lookahead_offset = max(5, len(self.center) // 25)
-        lookahead_idx = (idx + lookahead_offset) % len(self.center)
+        # ── 다중 전방 탐색 ─────────────────────────────────────────────────────
+        n_center = len(self.center)
+        lo1 = max(3, n_center // 40)
+        lo2 = max(6, n_center // 20)
+        lo3 = max(12, n_center // 10)
+
+        idx1 = (idx + lo1) % n_center
+        idx2 = (idx + lo2) % n_center
+        idx3 = (idx + lo3) % n_center
+
         target_speed_now = self.target_speeds[idx]
-        target_speed_lookahead = self.target_speeds[lookahead_idx]
+        ts1 = self.target_speeds[idx1]
+        ts2 = self.target_speeds[idx2]
+        ts3 = self.target_speeds[idx3]
 
         reward = 0.0
         if self.lap_started:
-            # ... (checkpoint logic omitted for brevity in replacement, but I will keep it)
             o = self.next_checkpoint_ord
             if not self.cleared_checkpoint[o]:
                 if self._crosses_checkpoint_segment(x_prev, y_prev, self.x, self.y, o):
@@ -325,36 +376,59 @@ class CarEnv:
                 self.lap_started = True
                 self.cleared_checkpoint[0] = True
                 self.next_checkpoint_ord = 1 % len(self.checkpoint_indices)
-                reward += self.checkpoint_base_reward * self.settings.checkpoint_pass_reward_scale * 0.35
+                reward += (
+                    self.checkpoint_base_reward
+                    * self.settings.checkpoint_pass_reward_scale
+                    * 0.35
+                )
 
         lane_penalty = (lat_err / half_width) ** 2
         heading_penalty = (heading_err / math.pi) ** 2
-        
-        # Speed matching reward: Higher reward if current speed is close to target_speed_now
-        speed_match_reward = (1.0 - abs(self.speed - target_speed_now) / self.max_speed) * self.settings.speed_scale
-        
-        # Lookahead speed penalty: Penalize if current speed is much higher than target_speed_lookahead
-        # This encourages braking BEFORE the corner.
-        lookahead_speed_err = max(0.0, self.speed - target_speed_lookahead)
-        lookahead_penalty = (lookahead_speed_err / self.max_speed) * self.settings.speed_scale * 1.5
 
-        # Lookahead heading penalty: Penalize if current heading is far from lookahead target heading
-        heading_err_lookahead = abs(self._heading_error(lookahead_idx, self.heading))
-        lookahead_heading_penalty = (heading_err_lookahead / math.pi) * self.settings.heading_penalty_weight * 0.5
+        # ── 1. 속도 매칭 보상 ──────────────────────────────────────────────────
+        speed_match_reward = (
+            1.0 - abs(self.speed - target_speed_now) / self.max_speed
+        ) * self.settings.speed_scale
 
-        steer_penalty = self.settings.steer_penalty_weight * (steer_norm**2)
-        
+        # ── 2. 예측 브레이킹 페널티 ★ 핵심 수정 ──────────────────────────────
+        #
+        # 아이디어: 전방 코너 권장속도보다 현재 속도가 높을수록 페널티.
+        # 단계별(근/중/원) 탐지로 코너가 가까울수록 더 강하게 페널티.
+        # ratio² 사용 → 약간의 과속은 용인, 심한 과속은 크게 처벌.
+        #
+        def _brake_penalty(current_spd: float, target_spd: float) -> float:
+            excess = max(0.0, current_spd - target_spd)
+            # max_speed 대비 비율로 정규화 (속도 스케일과 무관하게 일정한 신호)
+            ratio = excess / self.max_speed
+            return ratio ** 2
+
+        bp1 = _brake_penalty(self.speed, ts1) * self.settings.brake_penalty_weight * 3.0
+        bp2 = _brake_penalty(self.speed, ts2) * self.settings.brake_penalty_weight * 2.0
+        bp3 = _brake_penalty(self.speed, ts3) * self.settings.brake_penalty_weight * 1.0
+        brake_penalty = bp1 + bp2 + bp3
+
+        # ── 3. 전방 헤딩 페널티 ──────────────────────────────────────────────
+        heading_err_la = abs(self._heading_error(idx2, self.heading))
+        lookahead_heading_penalty = (
+            (heading_err_la / math.pi) * self.settings.heading_penalty_weight * 0.5
+        )
+
+        # ── 4. 조향 페널티 ──────────────────────────────────────────────────
+        steer_penalty = self.settings.steer_penalty_weight * (steer_norm ** 2)
+
         reward += (
             speed_match_reward
             - self.settings.lane_penalty_weight * lane_penalty
             - self.settings.heading_penalty_weight * heading_penalty
-            - lookahead_penalty
+            - brake_penalty
             - lookahead_heading_penalty
             - steer_penalty
         )
 
+        # ── 트랙 이탈: 빠를수록 더 큰 페널티 ★ ─────────────────────────────
         if lat_err > half_width * (1.15 * self.settings.offtrack_scale):
-            reward -= 8.0
+            speed_factor = self.speed / self.max_speed
+            reward -= 8.0 + 12.0 * speed_factor   # 최대 -20 (max_speed 시)
             self.done = True
         elif self.step_count >= self.max_steps:
             self.done = True
@@ -395,7 +469,9 @@ class LiveVizReporter(neat.reporting.BaseReporter):
         self.current_generation = -1
 
         if self.show_net:
-            self.fig, (self.ax_track, self.ax_fit, self.ax_net) = plt.subplots(1, 3, figsize=(18, 6))
+            self.fig, (self.ax_track, self.ax_fit, self.ax_net) = plt.subplots(
+                1, 3, figsize=(18, 6)
+            )
         else:
             self.fig, (self.ax_track, self.ax_fit) = plt.subplots(1, 2, figsize=(13, 6))
             self.ax_net = None
@@ -408,7 +484,9 @@ class LiveVizReporter(neat.reporting.BaseReporter):
     def _init_track_axes(self) -> None:
         c = self.env.track.centerline_xy
         self.ax_track.clear()
-        self.ax_track.plot(c[:, 0], c[:, 1], color="gray", alpha=0.65, linewidth=1.0, label="centerline")
+        self.ax_track.plot(
+            c[:, 0], c[:, 1], color="gray", alpha=0.65, linewidth=1.0, label="centerline"
+        )
         self.ax_track.plot(
             self.env.track.raceline_xy[:, 0],
             self.env.track.raceline_xy[:, 1],
@@ -434,16 +512,23 @@ class LiveVizReporter(neat.reporting.BaseReporter):
         self.ax_net.clear()
         self.ax_net.set_title("Neural Network Activity")
         self.ax_net.set_ylim(-1.1, 1.1)
-        self.in_labels = ['LatErr', 'HeadErr', 'Speed', 'Prog', 'SpdDelta', 'LA-Delta', 'LA-Head']
-        self.out_labels = ['Steer', 'Throttle']
+        # 입력 9개로 업데이트
+        self.in_labels = [
+            "LatErr", "HeadErr", "Speed", "Prog",
+            "SpdΔNow", "FutSpd", "BrakeUrg", "LA-Head", "Curv"
+        ]
+        self.out_labels = ["Steer", "Throttle"]
         self.all_labels = self.in_labels + ["|"] + self.out_labels
         self.ax_net.set_xticks(range(len(self.all_labels)))
-        self.ax_net.set_xticklabels(self.all_labels, rotation=45, ha='right', fontsize=8)
-        self.ax_net.grid(True, axis='y', alpha=0.3)
-        self.net_bars = self.ax_net.bar(range(len(self.all_labels)), [0]*len(self.all_labels), color='skyblue')
-        # Distinguish output bars
+        self.ax_net.set_xticklabels(
+            self.all_labels, rotation=45, ha="right", fontsize=8
+        )
+        self.ax_net.grid(True, axis="y", alpha=0.3)
+        self.net_bars = self.ax_net.bar(
+            range(len(self.all_labels)), [0] * len(self.all_labels), color="skyblue"
+        )
         for i in range(len(self.in_labels) + 1, len(self.all_labels)):
-            self.net_bars[i].set_color('salmon')
+            self.net_bars[i].set_color("salmon")
 
     def _init_axes(self) -> None:
         self._init_track_axes()
@@ -452,8 +537,12 @@ class LiveVizReporter(neat.reporting.BaseReporter):
             self._init_net_axes()
 
     def _plot_fitness_curves(self) -> None:
-        self.ax_fit.plot(self.generation_ids, self.best_fitness_history, color="green", label="best")
-        self.ax_fit.plot(self.generation_ids, self.avg_fitness_history, color="orange", label="average")
+        self.ax_fit.plot(
+            self.generation_ids, self.best_fitness_history, color="green", label="best"
+        )
+        self.ax_fit.plot(
+            self.generation_ids, self.avg_fitness_history, color="orange", label="average"
+        )
         self.ax_fit.legend(loc="best", fontsize=8)
 
     def start_generation(self, generation: int) -> None:
@@ -476,7 +565,11 @@ class LiveVizReporter(neat.reporting.BaseReporter):
             self.best_path = self.gen_best_path.copy()
 
         self._redraw()
-        if self.animate_best and self.gen_best_path is not None and len(self.gen_best_path) > 2:
+        if (
+            self.animate_best
+            and self.gen_best_path is not None
+            and len(self.gen_best_path) > 2
+        ):
             self._animate_generation_best(self.gen_best_path, net)
 
     def _redraw(self) -> None:
@@ -503,49 +596,48 @@ class LiveVizReporter(neat.reporting.BaseReporter):
         except Exception:
             pass
 
-    def _animate_generation_best(self, path: np.ndarray, net: neat.nn.FeedForwardNetwork) -> None:
-        # Re-simulate to get neural activity
+    def _animate_generation_best(
+        self, path: np.ndarray, net: neat.nn.FeedForwardNetwork
+    ) -> None:
         self.env.reset()
-        
         self._init_track_axes()
         self._init_fitness_axes()
         self._init_net_axes()
         self._plot_fitness_curves()
         self.ax_track.set_title(f"Gen {self.current_generation} Best (Animated)")
-        
-        line, = self.ax_track.plot([], [], color="crimson", linewidth=2.2, label="gen best")
-        dot, = self.ax_track.plot([], [], marker="o", color="red", markersize=6)
+
+        (line,) = self.ax_track.plot([], [], color="crimson", linewidth=2.2, label="gen best")
+        (dot,) = self.ax_track.plot([], [], marker="o", color="red", markersize=6)
         self.ax_track.legend(loc="upper right", fontsize=8)
 
-        # We will step through the environment again to sync neural activity with position
         step_limit = len(path)
         for i in range(step_limit):
             obs = self.env.observe()
             out = net.activate(obs.tolist())
             steer, throttle = out[0], out[1]
-            
-            # Update path and car dot
-            partial = path[:i+1]
+
+            partial = path[: i + 1]
             line.set_data(partial[:, 0], partial[:, 1])
             dot.set_data([path[i, 0]], [path[i, 1]])
-            
-            # Update neural bars
+
             if self.show_net:
                 activations = obs.tolist() + [0.0] + [steer, throttle]
                 for bar, val in zip(self.net_bars, activations):
                     bar.set_height(val)
-            
-            # Camera follow
-            if i % 2 == 0: # Update camera every 2 steps to reduce jitter/CPU
+
+            if i % 2 == 0:
                 x_c, y_c = path[i, 0], path[i, 1]
-                self.ax_track.set_xlim(x_c - self.animation_window_m, x_c + self.animation_window_m)
-                self.ax_track.set_ylim(y_c - self.animation_window_m, y_c + self.animation_window_m)
+                self.ax_track.set_xlim(
+                    x_c - self.animation_window_m, x_c + self.animation_window_m
+                )
+                self.ax_track.set_ylim(
+                    y_c - self.animation_window_m, y_c + self.animation_window_m
+                )
 
             self.fig.canvas.draw_idle()
             self.pump_events()
             plt.pause(self.animation_step_pause)
-            
-            # Step the env to keep in sync
+
             self.env.step(steer, throttle)
             if self.env.done:
                 break
@@ -590,7 +682,6 @@ def eval_genomes(
         net = neat.nn.FeedForwardNetwork.create(genome, config)
         fitness, _ = env.rollout(net)
         genome.fitness = fitness
-        # Keep GUI responsive during long per-generation evaluation loops.
         if live_reporter is not None and (idx + 1) % 6 == 0:
             live_reporter.pump_events()
 
@@ -643,7 +734,9 @@ def run_training(
     else:
         pop.add_reporter(SilentReporter())
 
-    winner = pop.run(lambda gs, cfg: eval_genomes(gs, cfg, env, live_reporter), generations)
+    winner = pop.run(
+        lambda gs, cfg: eval_genomes(gs, cfg, env, live_reporter), generations
+    )
     print("\nTraining complete.")
     print(f"Winner fitness: {winner.fitness:.3f}")
     return winner
@@ -651,64 +744,34 @@ def run_training(
 
 def parse_args() -> argparse.Namespace:
     script_dir = Path(__file__).resolve().parent
-    parser = argparse.ArgumentParser(description="Train NEAT on F1TENTH racetrack data with live visualization.")
+    parser = argparse.ArgumentParser(
+        description="Train NEAT on F1TENTH racetrack data with live visualization."
+    )
     parser.add_argument(
         "--track-dir",
         type=Path,
         default=script_dir.parent / "f1tenth_racetracks-main" / "Austin",
-        help="Path to one track folder (contains *_centerline.csv, *_raceline.csv, *_map.yaml).",
     )
     parser.add_argument(
         "--config",
         type=Path,
         default=script_dir / "neat_config.ini",
-        help="Path to neat-python config file.",
     )
-    parser.add_argument("--generations", type=int, default=40, help="Number of generations to evolve.")
+    parser.add_argument("--generations", type=int, default=40)
     parser.add_argument(
         "--difficulty",
         type=str,
         default="easy",
         choices=["normal", "easy", "very-easy", "overfit"],
-        help="Training difficulty preset. Easier modes learn faster but can overfit.",
     )
-    parser.add_argument("--no-gui", action="store_true", help="Disable live matplotlib visualization.")
-    parser.add_argument("--show-net", action="store_true", help="Show neural network activity graph (requires GUI).")
-    parser.add_argument(
-        "--animate-best",
-        action="store_true",
-        help="Animate generation-best trajectory each generation from the start point.",
-    )
-    parser.add_argument(
-        "--animate-step-pause",
-        type=float,
-        default=0.01,
-        help="Delay per animation frame in seconds (lower is faster).",
-    )
-    parser.add_argument(
-        "--animate-window-m",
-        type=float,
-        default=18.0,
-        help="Half-size of zoomed animation window in meters.",
-    )
-    parser.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=45,
-        help="Roughly one checkpoint every N raw centerline samples (scaled by downsampling stride).",
-    )
-    parser.add_argument(
-        "--checkpoint-pass-reward",
-        type=float,
-        default=72.0,
-        help="Reward for clearing the next checkpoint in order.",
-    )
-    parser.add_argument(
-        "--checkpoint-miss-penalty",
-        type=float,
-        default=48.0,
-        help="Penalty for crossing a checkpoint that is not the current target.",
-    )
+    parser.add_argument("--no-gui", action="store_true")
+    parser.add_argument("--show-net", action="store_true")
+    parser.add_argument("--animate-best", action="store_true")
+    parser.add_argument("--animate-step-pause", type=float, default=0.01)
+    parser.add_argument("--animate-window-m", type=float, default=18.0)
+    parser.add_argument("--checkpoint-every", type=int, default=45)
+    parser.add_argument("--checkpoint-pass-reward", type=float, default=72.0)
+    parser.add_argument("--checkpoint-miss-penalty", type=float, default=48.0)
     return parser.parse_args()
 
 

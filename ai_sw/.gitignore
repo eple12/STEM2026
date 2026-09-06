@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+selftest.png
+assets/textures/*.png
+shot_*.png
+assets/audio/*.wav
+car_preview/
+asset_preview/
+assets/vendor/
+
+menu_preview/
+hud_preview/

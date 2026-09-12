@@ -344,6 +344,7 @@ def main():
     warmup_now = args.warmup
     learner_steps0 = 0
     h_state = None
+    resume_stale_since = 0
     best_eval, best_tier = 0.0, 3
     if args.resume and out_path.exists():
         dR = np.load(out_path, allow_pickle=False)
@@ -362,6 +363,14 @@ def main():
                 bsrc = bd
         if "best_eval" in bsrc.files:
             best_eval, best_tier = float(bsrc["best_eval"]), int(bsrc["best_tier"])
+        # --stop-after-stale counts iterations since the last *_best
+        # improvement, tracked in an in-memory dict that a resume otherwise
+        # wipes -- so a run that plateaued, then survived a session death,
+        # would never trigger it again no matter how stale it got (found by
+        # watching one sail 800+ iterations past its threshold after a
+        # resume). best_path's own "seen" is exactly when that best was set.
+        if "seen" in bsrc.files:
+            resume_stale_since = int(bsrc["seen"]) // per_iter
         # If the full learner state survived, this is a continuation rather
         # than a restart: buffer, target net, Adam moments and the n-step
         # window all come back and nothing has to be re-warmed.
@@ -526,7 +535,7 @@ def main():
     # Ctrl-C / SIGTERM finishes the current iteration and then runs the
     # shutdown eval, rather than dropping the run wherever it happened to be.
     stop = {"asked": False}
-    stale = {"since": 0}          # iteration of the last *_best improvement
+    stale = {"since": resume_stale_since}  # iteration of the last *_best win
 
     def _on_signal(_sig, _frame):
         if stop["asked"]:                          # second one: go now

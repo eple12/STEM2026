@@ -71,10 +71,27 @@ run occupying most cores:
 | 128 | 883 | 3.5× |
 | 1024 | 3,939 | 15.8× |
 
-Still scaling sub-linearly in batch size at 1024 (8× the environments for
-1.8× the step time), i.e. per-step overhead dominates and there is a lot of
-headroom left. What a CUDA device does with this has **not** been measured
-here and should not be guessed at — run `tests/bench.py` on one.
+On a **Colab Tesla T4** (16 GB, torch 2.11+cu128), measured 2026-09-12 via
+the Colab CLI:
+
+| envs | decisions/s | vs CPU trainer | ms/step |
+| --- | --- | --- | --- |
+| 16 | 479 | 1.9× | 33.4 |
+| 128 | 3,873 | 15.5× | 33.0 |
+| 1024 | 30,346 | 121× | 33.7 |
+| 4096 | 87,248 | 349× | 46.9 |
+| 16384 | 421,848 | **1687×** | 38.8 |
+
+Note the ms/step column: a step costs about the same whether it advances 16
+cars or 16384. The step is latency-bound — a long chain of small kernels plus
+the handful of host syncs in the stale-hint fallback — so throughput scales
+almost linearly with the batch until something else gives. Reproduce with
+`tests/bench.py --device cuda`.
+
+**This measures environment stepping only**, which is what the CPU trainer is
+bottlenecked on. It is not a training-time speedup: the learner still runs 48
+gradient steps of batch 512 per iteration, and once the rollout is this cheap
+the learner is the bottleneck instead. That side has not been measured.
 
 ## Training
 

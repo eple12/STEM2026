@@ -429,15 +429,40 @@ RL_RL_SPEED_PACE = 1.00      # v25: v_ref = the physics grip-limited profile,
                             #  train_iqn is now flat at 1.0.
 # Clean-lap-time bonus, added once on a finish-line crossing that closed a
 # whole lap with <= RL_RL_LAP_OFF_TOL off-steps and no recovery. v20 makes it
-# STEEP: base 300, so a 94 s clean lap is +64 and a 130 s crawl is 0 (clamped),
-# and every second cut off the lap is worth RL_RL_LAP_W = 2.5 -- about twice
-# the base per-second time penalty (1.2), so once the policy is clean, going
-# faster is a clear, large net gain rather than the marginal gamble it was for
-# v18 (progress-minus-time only). A Monza lap earns ~58 in progress reward, so
-# the bonus is comparable in size, not swamping.
-RL_RL_LAP_BASE = 300.0
+# STEEP: every second cut off the lap is worth RL_RL_LAP_W = 2.5 -- about
+# twice the base per-second time penalty (1.2), so once the policy is clean,
+# going faster is a clear, large net gain rather than the marginal gamble it
+# was for v18 (progress-minus-time only).
+#
+# The BASE is computed per circuit (rlenv.RaceEnv / gpuenv.VecRaceEnv set it
+# from the track's own analytic modelled lap time, RL_RL_LAP_W * model_lap),
+# not read from here. 2026-09-13: found that a flat BASE=300 gave a
+# break-even of exactly 300/2.5=120.0 s -- which is Monza's OWN modelled lap
+# time (120.6 s) to within 0.5 %, not a coincidence but an un-generalised
+# calibration. It meant the bonus was healthy for Monza (94 s clean laps,
+# well under 120) but effectively ZERO for Spa, whose clean laps (~122 s)
+# sit ABOVE Spa's fixed 120 s break-even even though they are well inside
+# Spa's own modelled lap (148.9 s) -- the "make fast-and-clean the literal
+# payoff" mechanism that drove v27 past v18 on Monza was providing no
+# gradient on Spa at all. Setting BASE = W * model_lap replicates the exact
+# same design (break-even at the conservative modelled pace, grows as the
+# policy beats it) for whichever circuit is actually loaded.
 RL_RL_LAP_W = 2.5
 RL_RL_LAP_OFF_TOL = 3        # off-steps a lap may have and still count as clean
+
+#: The trainers' *_best selection tolerance: off-track physics ticks (60 Hz)
+#: a 7-launch eval may show and still count as tier-0 PERFECT. This is a
+#: SELECTION criterion only -- it never touches the training reward above,
+#: so widening it cannot destabilise learning, only change which already-
+#: trained checkpoint gets written out as *_best. 2026-09-13: raised from 2
+#: (0.033 s, "an edge kiss nobody sees") to 8 (0.13 s) -- still under a third
+#: of OFF_TRACK_PATIENCE (0.45 s, the real recovery trigger below), but
+#: loose enough that a policy which grazes the line once across seven
+#: launches isn't discarded in favour of a slower one purely by eval-noise,
+#: which was quietly biasing *_best toward whichever checkpoint happened to
+#: have zero excursions on that specific eval rather than the best policy on
+#: average.
+RL_OFF_PERFECT_TOL = 8
 
 # Potential-based line term: Phi = -K * clip(|offset|, LO, HI). Linesight uses
 # K = 0.1 and accepts that it pulls the car off the racing line ("any pull at
@@ -473,7 +498,18 @@ RL_LINE_HI = 25.0
 # off the line" actually happens.
 RL_EDGE_K = 0.090          # v26: back to v18's value -- v26 is "pure v18 reward
                            #  + linear term", full v18 shaping.
-RL_EDGE_MARGIN = 2.4      # v26: back to v18.
+RL_EDGE_MARGIN = 1.0      # 2026-09-13: down from v18's 2.4. At a ~6.75 m
+                           #  per-side half-width that 2.4 m repulsion zone
+                           #  covered the outer ~36 % of legally usable track
+                           #  -- the policy paid a shaping cost for using a
+                           #  wide, fully legal strip nowhere near the white
+                           #  line, well short of where a real racing line
+                           #  would use the kerb. 1.0 m (~half the car's own
+                           #  width) shrinks that to the outer ~15 %, closer
+                           #  to "discourage only genuinely near the limit"
+                           #  without touching RL_EDGE_OUT_K/CAP or the
+                           #  off-track/recovery costs below, which are what
+                           #  actually induce PERFECT and are left alone.
 # Beyond the white line the edge term above is flat zero, so there is no
 # potential gradient pulling a car that has *just* stepped out back onto the
 # road -- only the centreline term and the per-second fee, both weak in that

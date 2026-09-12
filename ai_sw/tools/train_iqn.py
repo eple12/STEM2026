@@ -402,10 +402,9 @@ def main():
     # so a single 4/4 was too thin a reed to pick *_best from. 7/7 clean is a
     # policy that actually has margin.
     EVAL_LAUNCHES = (0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90)
-    #: Off-track physics steps still counted as tier-0 "perfect". Two steps at
-    #: the eval's 60 Hz is 0.03 s -- an edge kiss nobody sees -- and holding
-    #: out for a literal zero made *_best ratchet up far too slowly.
-    OFF_PERFECT_TOL = 2
+    #: Off-track physics steps still counted as tier-0 "perfect". See
+    #: config.RL_OFF_PERFECT_TOL for the current value and why.
+    OFF_PERFECT_TOL = config.RL_OFF_PERFECT_TOL
 
     def greedy_eval(weights, mean, std):
         """(mean reach, tier, per-launch detail). Tier 0 is the checkpoint

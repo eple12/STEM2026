@@ -283,8 +283,7 @@ class VecRaceEnv:
         if _RACELINE_TASK:
             lap_bonus = torch.where(
                 clean,
-                (config.RL_RL_LAP_BASE
-                 - config.RL_RL_LAP_W * lap_s).clamp(min=0.0), zf)
+                (t.lap_base - config.RL_RL_LAP_W * lap_s).clamp(min=0.0), zf)
         better = clean & ((self.best_lap_time == 0.0)
                           | (lap_s < self.best_lap_time))
         self.best_lap_time = torch.where(better, lap_s, self.best_lap_time)

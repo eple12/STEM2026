@@ -78,6 +78,15 @@ class TrackGPU:
         self.v_ref = _t(v_ref, dev)
         self.look_idx = _t(rlpolicy._lookahead_indices(line), dev, torch.long)
 
+        # Clean-lap bonus break-even: this circuit's own analytic modelled
+        # lap time (same formula as raceline.lap_time()) times RL_RL_LAP_W,
+        # computed once here since v_ref is a per-circuit (TrackGPU), not
+        # per-environment, quantity. See the long comment above RL_RL_LAP_W
+        # in config.py -- a flat BASE was silently calibrated to Monza only.
+        v_seg = np.maximum(0.5 * (v_ref + np.roll(v_ref, -1)), 1e-3)
+        model_lap = float(np.sum(shape.seg_len / v_seg))
+        self.lap_base = config.RL_RL_LAP_W * model_lap
+
         self._build_barriers(track, dev)
 
     # ------------------------------------------------------------------

@@ -125,6 +125,14 @@ class RaceEnv:
         self.v_ref = rl.speed_profile(self.shape_line.seg_len,
                                       self.shape_line.curvature,
                                       self.shape_line.curv_radius, _vpace)
+        # The clean-lap bonus's break-even point: this circuit's own analytic
+        # modelled lap time (same "time over each segment at the mean of its
+        # end speeds" raceline.lap_time() uses), times RL_RL_LAP_W. See the
+        # long comment above RL_RL_LAP_W in config.py for why this has to be
+        # per-circuit rather than a flat constant.
+        v_seg = np.maximum(0.5 * (self.v_ref + np.roll(self.v_ref, -1)), 1e-3)
+        model_lap = float(np.sum(self.shape_line.seg_len / v_seg))
+        self.lap_base = config.RL_RL_LAP_W * model_lap
         self._pace_mult = 1.0
         self.look_idx = rlpolicy._lookahead_indices(self.line)
 
@@ -371,8 +379,7 @@ class RaceEnv:
                         self.best_lap_time = lap_s
                     if getattr(config, "RL_TASK", "linesight") == "raceline":
                         lap_bonus = max(
-                            0.0, config.RL_RL_LAP_BASE
-                            - config.RL_RL_LAP_W * lap_s)
+                            0.0, self.lap_base - config.RL_RL_LAP_W * lap_s)
             self.lap_start_time = self.lap_time
             self.lap_off_steps = 0
             self._lap_rec0 = self.recoveries

@@ -24,6 +24,7 @@ import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
 from pathlib import Path
 
 import numpy as np
@@ -71,6 +72,9 @@ OFF_PERFECT_TOL = 2
 KAPPA = 5e-3
 IQN_N = 8
 A_EMB, E = IQN_EMBED, 256
+#: How many of an iteration's finished episodes to spell out before the
+#: columns turn into '+N'.
+EPISODE_COLS = 6
 
 
 class IQN(nn.Module):
@@ -212,6 +216,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu")
+    ap.add_argument("--eval-workers", type=int, default=1,
+                    help="concurrent --async-eval workers. One eval takes "
+                         "longer than --eval-every iterations, and a new one "
+                         "is skipped while another runs, so with a single "
+                         "worker the real eval period is a multiple of the "
+                         "requested one (75 not 25, on Spa). More workers "
+                         "close that gap; each is a CPU thread, so on a "
+                         "2-vCPU VM they also slow the main loop.")
     ap.add_argument("--async-eval", action="store_true",
                     help="run the eval in a worker thread so the GPU keeps "
                          "training through it. The result lands a few "
@@ -268,10 +280,17 @@ def main():
     eval_device = torch.device(args.eval_device)
     eval_track = (track if eval_device == device
                   else TrackGPU(args.circuit, eval_device))
-    eval_env = VecRaceEnv(args.circuit, len(EVAL_LAUNCHES), seed=99_991,
-                          randomise_start=False, device=eval_device,
-                          track=eval_track)
-    eval_net = IQN().to(eval_device) if eval_device != device else None
+    # One (env, net) pair per worker: they run concurrently, so sharing
+    # either would be a race. Seven CPU environments and a copy of a small
+    # net cost almost nothing; the track tensors are read-only and shared.
+    n_workers = max(1, args.eval_workers) if args.async_eval else 1
+    eval_pairs = Queue()
+    for w in range(n_workers):
+        eval_pairs.put((
+            VecRaceEnv(args.circuit, len(EVAL_LAUNCHES), seed=99_991,
+                       randomise_start=False, device=eval_device,
+                       track=eval_track),
+            IQN().to(eval_device) if eval_device != device else online))
 
     # Stagger the first episode so the 130 s truncations do not all land in
     # the same iteration forever -- they never desync on their own.
@@ -400,33 +419,34 @@ def main():
         thread while the learner keeps changing them. Everything it touches
         -- ``eval_net``, ``eval_env`` -- belongs to that thread alone.
         """
-        if eval_net is not None:
-            eval_net.load_state_dict(sd_cpu)
-            net = eval_net
-        else:
-            net = online
+        eval_env, net = eval_pairs.get()
+        try:
+            if net is not online:
+                net.load_state_dict(sd_cpu)
 
-        fr = torch.tensor(EVAL_LAUNCHES, device=eval_device)
-        o = eval_env.reset_grid(fr)
-        with torch.no_grad():
-            while True:
-                x = ((o - mean_e) / std_e.clamp(min=1e-4)).clamp(-10.0, 10.0)
-                a = net.q_mean(x).argmax(1)
-                o, _, d, _ = eval_env.step(a)
-                if bool(d.all()):
-                    break
-        reach = eval_env.progress
-        rec = eval_env.recoveries
-        off = eval_env.off_steps
-        tier = 0
-        if bool((rec > 0).any()):
-            tier = 2
-        elif bool((off > OFF_PERFECT_TOL).any()):
-            tier = 1
-        laps = eval_env.best_lap_time[eval_env.best_lap_time > 0]
-        best_lap = float(laps.min()) if laps.numel() else 0.0
-        return (float(reach.mean()), tier, rec.cpu().numpy(),
-                off.cpu().numpy(), best_lap)
+            fr = torch.tensor(EVAL_LAUNCHES, device=eval_device)
+            o = eval_env.reset_grid(fr)
+            with torch.no_grad():
+                while True:
+                    x = ((o - mean_e) / std_e.clamp(min=1e-4)).clamp(-10.0, 10.0)
+                    a = net.q_mean(x).argmax(1)
+                    o, _, d, _ = eval_env.step(a)
+                    if bool(d.all()):
+                        break
+            reach = eval_env.progress
+            rec = eval_env.recoveries
+            off = eval_env.off_steps
+            tier = 0
+            if bool((rec > 0).any()):
+                tier = 2
+            elif bool((off > OFF_PERFECT_TOL).any()):
+                tier = 1
+            laps = eval_env.best_lap_time[eval_env.best_lap_time > 0]
+            best_lap = float(laps.min()) if laps.numel() else 0.0
+            return (float(reach.mean()), tier, rec.cpu().numpy(),
+                    off.cpu().numpy(), best_lap)
+        finally:
+            eval_pairs.put((eval_env, net))
 
     # -- n-step history ----------------------------------------------------
     n_step = args.n_step
@@ -444,9 +464,10 @@ def main():
     # release the GIL, so it really does overlap. One at a time -- if the
     # previous eval is still running the next is skipped rather than queued,
     # because a backlog of stale evaluations helps nobody.
-    eval_pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
+    eval_pool = (ThreadPoolExecutor(max_workers=n_workers,
+                                    thread_name_prefix="eval")
                  if args.async_eval else None)
-    pending = None              # (future, weights snapshot, iteration, seen)
+    pending = []            # [(future, weights snapshot, iteration, seen)]
 
     def submit_eval(w_snapshot, it_at, seen_at):
         if args.state_every:
@@ -516,7 +537,7 @@ def main():
     learner_steps = learner_steps0
     last_it = last_seen = 0
     best = 0.0
-    recent = []                                   # last ~40 completed episodes
+    last_cols = None      # episode columns from the last iteration that had any
     eps_sched = EPS_SCHED_WARM if args.init_from else EPS_SCHED
     lr_sched = ([(0, 3e-4), (2_000_000, 1e-4), (5_000_000, 5e-5)]
                 if args.init_from else LR_SCHED)
@@ -708,33 +729,52 @@ def main():
                      best_eval=np.float32(best_eval),
                      best_tier=np.int64(best_tier))
 
-        if pending is not None:
-            eval_note, pending = harvest(pending)
-            eval_note = eval_note or ""
-        if due_eval and pending is None:
-            pending = submit_eval((w_now, mean_np, std_np), it + 1,
-                                  seen + per_iter)
+        # Collect every eval that finished since last time, oldest first.
+        notes, still = [], []
+        for entry in pending:
+            note, keep = harvest(entry)
+            if note:
+                notes.append(note)
+            if keep is not None:
+                still.append(keep)
+        pending = still
+        if due_eval and len(pending) < n_workers:
+            entry = submit_eval((w_now, mean_np, std_np), it + 1,
+                                seen + per_iter)
             if eval_pool is None:
-                eval_note, pending = harvest(pending)
+                note, _ = harvest(entry)
+                notes.append(note)
+            else:
+                pending.append(entry)
+        eval_note = "".join(notes)
 
-        if stat is not None:
-            recent.append(stat.cpu().numpy())
-            allr = np.concatenate(recent)[-40:]
-            recent = [allr]
+        # The episode columns report the episodes that ENDED THIS ITERATION,
+        # not a rolling mean: a mean over the last 40 keeps showing numbers
+        # from a policy several hundred iterations old, which is precisely
+        # when you want to see that something just changed. Each episode is
+        # listed; an iteration where none ended repeats the last line's
+        # values, and `n0` says that is what happened.
+        if stat is not None and len(stat):
+            r = stat.cpu().numpy()
+            k = len(r)
+            show = r[:EPISODE_COLS]
+            more = "" if k <= EPISODE_COLS else f"+{k - EPISODE_COLS}"
+            j = lambda col, f: "/".join(format(v, f) for v in col) + more  # noqa: E731
+            last_cols = (j(show[:, 0], ".0f"), j(show[:, 3] * 3.6, ".1f"),
+                         j(show[:, 1], ".0f"), j(show[:, 4] * 100, ".1f"),
+                         f"{r[:, 2].max():.0f}", k)
         mins = (time.perf_counter() - t0) / 60.0
-        if recent:
-            r = recent[0]
-            dist, rc, _, sp, of = r.mean(0)
-            laps = r[:, 2].max()
+        if last_cols is not None:
+            dist, sp, rc, of, laps, k = last_cols
+            n = k if (stat is not None and len(stat)) else 0
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
-                  f"dist {dist:5.0f}  spd {sp*3.6:5.1f}  rec {rc:4.1f}  "
-                  f"off {of*100:4.1f}%  laps {laps:.0f}  "
+                  f"dist {dist:>5s}  spd {sp:>5s}  rec {rc:>3s}  "
+                  f"off {of:>4s}%  laps {laps}  "
                   f"eps {eps:.2f}  oS {off_scale:.1f}  pc {pace_mult:.2f}  "
                   f"g {gamma:.4f}  "
                   f"loss {loss_acc/max(args.grad_steps,1):.3f}  "
-                  f"n{len(r):2d}+{0 if stat is None else len(stat):d}  "
-                  f"{mins:5.1f}m{eval_note}", flush=True)
+                  f"n{n:d}  {mins:5.1f}m{eval_note}", flush=True)
         else:
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
@@ -746,10 +786,11 @@ def main():
         if stop["asked"]:
             break
 
-    # Collect whatever eval was in flight...
-    if pending is not None:
-        note, _ = harvest(pending, force=True)
+    # Collect whatever evals were in flight...
+    for entry in pending:
+        note, _ = harvest(entry, force=True)
         print(f"  (in flight){note}", flush=True)
+    pending = []
     if eval_pool is not None:
         eval_pool.shutdown(wait=True)
 

@@ -183,6 +183,11 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu")
+    ap.add_argument("--eval-device", default="cpu",
+                    help="where the 7-launch greedy eval runs. Seven "
+                         "environments stepped 2600 times sequentially is a "
+                         "latency problem, not a throughput one, so the CPU "
+                         "wins; pass the training device to keep it there.")
     args = ap.parse_args()
 
     device = torch.device(args.device)
@@ -202,8 +207,21 @@ def main():
     env = VecRaceEnv(args.circuit, n_env, seed=args.seed,
                      start_at_line=args.start_at_line, device=device,
                      track=track)
+
+    # The eval is seven launches driven to their 130 s truncation: 2600
+    # SEQUENTIAL steps over seven environments. That shape is the opposite of
+    # what a GPU is for -- the kernels are trivial and the wall clock is all
+    # launch latency and host syncs, which measured ~7x slower per step than
+    # the same code at 16384 environments. Seven environments of numpy-sized
+    # work belong on the CPU, so the eval keeps its own CPU track and a CPU
+    # copy of the network.
+    eval_device = torch.device(args.eval_device)
+    eval_track = (track if eval_device == device
+                  else TrackGPU(args.circuit, eval_device))
     eval_env = VecRaceEnv(args.circuit, len(EVAL_LAUNCHES), seed=99_991,
-                          randomise_start=False, device=device, track=track)
+                          randomise_start=False, device=eval_device,
+                          track=eval_track)
+    eval_net = IQN().to(eval_device) if eval_device != device else None
 
     # Stagger the first episode so the 130 s truncations do not all land in
     # the same iteration forever -- they never desync on their own.
@@ -280,12 +298,21 @@ def main():
         ``EPISODE_SECONDS``, so they finish on the same step and nothing has
         to be frozen while the others catch up.
         """
-        fr = torch.tensor(EVAL_LAUNCHES, device=device)
+        if eval_net is not None:
+            eval_net.load_state_dict(
+                {k: v.to(eval_device) for k, v in online.state_dict().items()})
+            net = eval_net
+        else:
+            net = online
+        mean_e = mean_t.to(eval_device)
+        std_e = std_t.to(eval_device)
+
+        fr = torch.tensor(EVAL_LAUNCHES, device=eval_device)
         o = eval_env.reset_grid(fr)
         with torch.no_grad():
             while True:
-                x = ((o - mean_t) / std_t.clamp(min=1e-4)).clamp(-10.0, 10.0)
-                a = online.q_mean(x).argmax(1)
+                x = ((o - mean_e) / std_e.clamp(min=1e-4)).clamp(-10.0, 10.0)
+                a = net.q_mean(x).argmax(1)
                 o, _, d, _ = eval_env.step(a)
                 if bool(d.all()):
                     break

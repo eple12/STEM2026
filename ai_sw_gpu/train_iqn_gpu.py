@@ -610,7 +610,8 @@ def main():
                   f"eps {eps:.2f}  oS {off_scale:.1f}  pc {pace_mult:.2f}  "
                   f"g {gamma:.4f}  "
                   f"loss {loss_acc/max(args.grad_steps,1):.3f}  "
-                  f"n{len(r):2d}  {mins:5.1f}m{eval_note}", flush=True)
+                  f"n{len(r):2d}+{0 if stat is None else len(stat):d}  "
+                  f"{mins:5.1f}m{eval_note}", flush=True)
         else:
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "

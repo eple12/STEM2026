@@ -204,6 +204,14 @@ def main():
                          "iteration it actually measured.")
     ap.add_argument("--save-every", type=int, default=1,
                     help="iterations between running-checkpoint saves")
+    ap.add_argument("--resume-warmup", type=int, default=None,
+                    help="on --resume, collect this many transitions before "
+                         "learning again (default: half the buffer). The "
+                         "replay buffer does not survive a restart, and "
+                         "resuming a good policy straight into a nearly "
+                         "empty, highly correlated buffer at gamma 1.0 is "
+                         "how a resumed run throws away its progress. Pass "
+                         "0 to learn immediately.")
     ap.add_argument("--eval-device", default="cpu",
                     help="where the 7-launch greedy eval runs. Seven "
                          "environments stepped 2600 times sequentially is a "
@@ -284,6 +292,7 @@ def main():
         print(f"warm-started from {ip.name}", flush=True)
 
     resume_seen = 0
+    warmup_now = args.warmup
     best_eval, best_tier = 0.0, 3
     if args.resume and out_path.exists():
         dR = np.load(out_path, allow_pickle=False)
@@ -302,8 +311,16 @@ def main():
                 bsrc = bd
         if "best_eval" in bsrc.files:
             best_eval, best_tier = float(bsrc["best_eval"]), int(bsrc["best_tier"])
+        # The replay buffer is not saved, so a resumed run starts with an
+        # empty one. Learning from a nearly empty, highly correlated buffer
+        # at gamma 1.0 is how a resumed run undoes its own progress, so
+        # refill a decent fraction of it before touching the weights.
+        warmup_now = (args.buffer // 2 if args.resume_warmup is None
+                      else args.resume_warmup)
+        warmup_now = max(warmup_now, args.warmup)
         print(f"resumed {out_path.name} at {resume_seen:,} decisions "
-              f"(best {best_eval:.0f} T{best_tier})", flush=True)
+              f"(best {best_eval:.0f} T{best_tier}); refilling the buffer to "
+              f"{warmup_now:,} before learning", flush=True)
     elif args.resume:
         print(f"--resume: no {out_path.name} yet, starting fresh", flush=True)
 
@@ -562,7 +579,7 @@ def main():
         best = max(best, reach)
 
         loss_acc = 0.0
-        if b_fill >= args.warmup:
+        if b_fill >= warmup_now:
             std = torch.sqrt(obs_var)
             mean_l = obs_mean.to(torch.float32)
             std_l = std.to(torch.float32).clamp(min=1e-4)
@@ -601,7 +618,7 @@ def main():
                                 SOFT_TARGET_TAU * po)
 
         eval_note = ""
-        due_eval = b_fill >= args.warmup and (it + 1) % args.eval_every == 0
+        due_eval = b_fill >= warmup_now and (it + 1) % args.eval_every == 0
         last_iter = it == iters - 1
         # export() walks every weight back to the host, so at a quarter of a
         # second per iteration it is worth doing only when something needs it.
@@ -663,7 +680,7 @@ def main():
     # evals are skipped while one is running, so without this the last
     # hundreds of iterations could go unmeasured and *_best would be left
     # describing a policy from well before the stop.
-    if b_fill >= args.warmup:
+    if b_fill >= warmup_now:
         print("  final eval of the stopping weights...", flush=True)
         std_np = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
         mean_np = obs_mean.to(torch.float32).cpu().numpy()

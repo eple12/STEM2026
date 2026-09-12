@@ -20,6 +20,7 @@ import argparse
 import importlib.util
 import math
 import os
+import signal
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -146,6 +147,18 @@ def export(net):
 
 _NAME_MAP = {"ff.0": "ff0", "ff.2": "ff1", "phi.0": "iqn",
              "A.0": "A0", "A.2": "A1", "V.0": "V0", "V.2": "V1"}
+
+
+def savez_atomic(path, **kw):
+    """Write the checkpoint, then move it into place.
+
+    A checkpoint is copied off the machine while training continues, so a
+    reader must never catch a half-written file. ``os.replace`` is atomic on
+    the same filesystem, so the file at ``path`` is always a complete one.
+    """
+    tmp = path.with_name(path.name + ".tmp.npz")
+    np.savez(tmp, **kw)
+    os.replace(tmp, path)
 
 
 def load_into(net, d, device):
@@ -375,11 +388,11 @@ def main():
         """
         nonlocal best_eval, best_tier
         fut, w_snap, it_at, seen_at = entry
-        if eval_pool is not None:
+        if hasattr(fut, "result"):                  # a Future
             if not (force or fut.done()):
                 return None, entry
             ev, tier, rec_e, off_e, best_lap = fut.result()
-        else:
+        else:                                       # already a result tuple
             ev, tier, rec_e, off_e, best_lap = fut
         better = tier < best_tier or (tier == best_tier and ev > best_eval)
         TIER_TAG = {0: "PERFECT", 1: "off-track", 2: "wall/recover"}
@@ -389,11 +402,11 @@ def main():
         tag = TIER_TAG[tier] + (f"@{bad}" if tier and bad
                                 else f"(off{int(off_e.max())})")
         lap_s = f" lap{best_lap:5.1f}s" if best_lap > 0.0 else ""
-        at = f"@it{it_at}" if eval_pool is not None else ""
+        at = f"@it{it_at}" if hasattr(fut, "result") else ""
         if better:
             best_eval, best_tier = ev, tier
             w, mean_np, std_np = w_snap
-            np.savez(best_path, **w, obs_mean=mean_np, obs_std=std_np,
+            savez_atomic(best_path, **w, obs_mean=mean_np, obs_std=std_np,
                      circuit=args.circuit, seen=np.int64(seen_at),
                      best_eval=np.float32(best_eval),
                      best_tier=np.int64(best_tier))
@@ -401,7 +414,25 @@ def main():
         return (f"  eval{at} {ev:5.0f}m {tag}{lap_s} "
                 f"(best {best_eval:.0f}T{best_tier})"), None
 
+    # Ctrl-C / SIGTERM finishes the current iteration and then runs the
+    # shutdown eval, rather than dropping the run wherever it happened to be.
+    stop = {"asked": False}
+
+    def _on_signal(_sig, _frame):
+        if stop["asked"]:                          # second one: go now
+            raise KeyboardInterrupt
+        stop["asked"] = True
+        print("\n[stop requested -- finishing this iteration, then a final "
+              "eval of the weights we are stopping with]", flush=True)
+
+    for _s in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(_s, _on_signal)
+        except (ValueError, OSError):
+            pass
+
     learner_steps = 0
+    last_it = last_seen = 0
     best = 0.0
     recent = []                                   # last ~40 completed episodes
     eps_sched = EPS_SCHED_WARM if args.init_from else EPS_SCHED
@@ -580,7 +611,7 @@ def main():
             std_np = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
             mean_np = obs_mean.to(torch.float32).cpu().numpy()
             w_now = export(online)
-            np.savez(out_path, **w_now, obs_mean=mean_np, obs_std=std_np,
+            savez_atomic(out_path, **w_now, obs_mean=mean_np, obs_std=std_np,
                      circuit=args.circuit, seen=np.int64(seen + per_iter),
                      best_eval=np.float32(best_eval),
                      best_tier=np.int64(best_tier))
@@ -617,11 +648,37 @@ def main():
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
                   f"warming up  eps {eps:.2f}  {mins:5.1f}m", flush=True)
 
+        last_it, last_seen = it + 1, seen + per_iter
+        if stop["asked"]:
+            break
+
+    # Collect whatever eval was in flight...
     if pending is not None:
         note, _ = harvest(pending, force=True)
-        print(f"  (final){note}", flush=True)
+        print(f"  (in flight){note}", flush=True)
     if eval_pool is not None:
         eval_pool.shutdown(wait=True)
+
+    # ...and then evaluate the weights we are ACTUALLY stopping with. Async
+    # evals are skipped while one is running, so without this the last
+    # hundreds of iterations could go unmeasured and *_best would be left
+    # describing a policy from well before the stop.
+    if b_fill >= args.warmup:
+        print("  final eval of the stopping weights...", flush=True)
+        std_np = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
+        mean_np = obs_mean.to(torch.float32).cpu().numpy()
+        w_final = export(online)
+        savez_atomic(out_path, **w_final, obs_mean=mean_np, obs_std=std_np,
+                     circuit=args.circuit, seen=np.int64(last_seen),
+                     best_eval=np.float32(best_eval),
+                     best_tier=np.int64(best_tier))
+        sd_cpu = {k: v.detach().to(eval_device, copy=True)
+                  for k, v in online.state_dict().items()}
+        res = greedy_eval(sd_cpu,
+                          torch.as_tensor(mean_np, device=eval_device),
+                          torch.as_tensor(std_np, device=eval_device))
+        note, _ = harvest((res, (w_final, mean_np, std_np), last_it, last_seen))
+        print(f"  (stop){note}", flush=True)
 
     print(f"\nsaved {out_path}  (best greedy {best_eval:.0f} m -> "
           f"{best_path})", flush=True)

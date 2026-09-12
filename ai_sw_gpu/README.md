@@ -1,0 +1,96 @@
+# ai_sw_gpu — batched (GPU) twin of the ai_sw driving environment
+
+The CPU project in `../ai_sw` is untouched and stays authoritative. This is
+the same environment and the same IQN training recipe with every environment
+turned into a row of a tensor, so a rollout is a handful of kernels instead
+of a Python loop per car.
+
+**Why.** The CPU trainer is not GPU-starved, it is rollout-starved: seven
+worker processes each step two `RaceEnv`s in Python and the whole run manages
+roughly 250 decisions a second, so a 15 M-decision schedule takes 15–25
+hours. The network is small; moving only it to CUDA would change little.
+Batching the *environment* is the lever.
+
+## Layout
+
+| file | what it is |
+| --- | --- |
+| `gpuenv/trackgpu.py` | static circuit data, built by the CPU code and frozen into tensors (including a padded per-sample barrier-neighbourhood table) |
+| `gpuenv/surface.py` | batched `game.surface.Surface` — nearest-sample search, four-wheel grip, barrier penetration |
+| `gpuenv/physics.py` | batched `game.vehicle.Vehicle` — Pacejka tyres, friction circle, ABS/TC/ESC, wall impulse |
+| `gpuenv/vecenv.py` | batched `game.rlenv.RaceEnv` — reward, recovery, lap arming, potential shaping |
+| `train_iqn_gpu.py` | the trainer; schedules are **imported** from `ai_sw/tools/train_iqn.py`, not copied |
+| `tests/parity.py` | scalar-vs-batched trajectory comparison |
+| `tests/bench.py` | decisions/second at several batch sizes |
+
+Geometry is never re-derived: `TrackGPU` calls the CPU `load_track`,
+`reference_line`, `shaping_line` and `speed_profile` and converts the result,
+so the two implementations cannot disagree about the circuit. Checkpoints are
+written in the same `.npz` layout, so anything trained here loads straight
+into the game.
+
+## Parity
+
+`tests/parity.py` runs N scalar `RaceEnv`s and one `VecRaceEnv` from the same
+deterministic grid starts, feeds both the identical action stream and
+compares observation, reward, car state and every counter at every step. It
+runs in float64 so the only differences left are real ones.
+
+Three modes, because no single one reaches every branch:
+
+```bash
+python tests/parity.py --mode random --steps 900 --envs 8   # off-track, recovery, stall
+python tests/parity.py --mode wall   --steps 120 --envs 8   # barrier collision + contact-arm impulse
+python tests/parity.py --mode policy --steps 2200 --envs 4  # real driving, closed laps, lap bonus
+```
+
+Measured (2026-09-12), all three `PARITY OK`, counters identical at every
+step (`off_steps`, `recoveries`, `wall_steps`, `laps`):
+
+| mode | coverage | max abs diff (pos / reward) |
+| --- | --- | --- |
+| random, 900 steps × 8 | 76 recoveries, 1364 off-steps | 1.5e-13 / 4.7e-14 |
+| wall, 120 steps × 8 | 8 wall contacts | 3.6e-15 / 6.9e-18 |
+| policy, 2200 steps × 4 | 4 completed laps | 1.4e-11 / 4.0e-12 |
+
+The residual observation difference of ~5e-7 is not an error: the CPU
+`observe()` returns float32, so that is its own quantisation.
+
+## Throughput
+
+```bash
+python tests/bench.py --sizes 16 128 1024
+```
+
+On this laptop — **CPU only, no NVIDIA GPU**, and with the v26 CPU training
+run occupying most cores:
+
+| envs | decisions/s | vs CPU trainer |
+| --- | --- | --- |
+| 16 | 329 | 1.3× |
+| 128 | 883 | 3.5× |
+| 1024 | 3,939 | 15.8× |
+
+Still scaling sub-linearly in batch size at 1024 (8× the environments for
+1.8× the step time), i.e. per-step overhead dominates and there is a lot of
+headroom left. What a CUDA device does with this has **not** been measured
+here and should not be guessed at — run `tests/bench.py` on one.
+
+## Training
+
+Defaults reproduce the CPU run exactly (14 environments × 192 decisions =
+2688 decisions an iteration, same schedules, same eval):
+
+```bash
+python train_iqn_gpu.py --circuit Monza --steps 15000000 --out-name Monza_gpu
+```
+
+`--envs` is the throughput lever; raising it changes the decisions per
+iteration, so it is a different experiment, not just a faster one:
+
+```bash
+python train_iqn_gpu.py --circuit Monza --steps 15000000 --envs 2048 --device cuda --out-name Monza_gpu
+```
+
+`--resume`, `--init-from`, `--ddqn`, `--start-at-line` and the eval/tier logic
+behave exactly as in the CPU trainer.

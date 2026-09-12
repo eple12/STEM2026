@@ -138,10 +138,19 @@ class Vehicle:
         self.prev_pos = self.pos.copy()
         self.prev_yaw = self.yaw
         self.vel = np.zeros(2)
+        #: What the road is doing under the car: its height above the plane,
+        #: its camber angle, and that angle projected onto the car's own
+        #: lateral axis. Read by the car body, the camera and the HUD; all
+        #: three would otherwise have to find the nearest sample again.
+        self.track = None
+        self.surface_y = 0.0
+        self.surface_bank = 0.0
+        self.surface_roll = 0.0
         self.yaw_rate = 0.0
         self.steer_input = 0.0
         self.steer_angle = 0.0
         self._long_accel = 0.0
+        self._lat_accel = 0.0
         self.hit_wall = False
 
     # -- convenience ---------------------------------------------------
@@ -161,6 +170,16 @@ class Vehicle:
             return 0.0
         lat = float(np.dot(self.vel, _right(self.yaw)))
         return math.atan2(lat, abs(self.forward_speed) + 1e-6)
+
+    @property
+    def long_accel(self) -> float:
+        """Longitudinal acceleration, m/s^2 (car frame). Last physics tick."""
+        return float(self._long_accel)
+
+    @property
+    def lat_accel(self) -> float:
+        """Lateral acceleration, m/s^2 (car frame). Last physics tick."""
+        return float(self._lat_accel)
 
     # -- tyre model -------------------------------------------------------
     @staticmethod
@@ -519,6 +538,7 @@ class Vehicle:
         a_long = f_long / cfg.CAR_MASS
         a_lat = (lat_f * math.cos(self.steer_angle) + lat_r) / cfg.CAR_MASS
         self._long_accel = a_long
+        self._lat_accel = a_lat
 
         # Integrate in WORLD space. Carrying (v_long, v_lat) across the yaw
         # update instead would rotate the velocity vector along with the body,
@@ -528,6 +548,24 @@ class Vehicle:
         # as the lateral force actually bends it.
         fwd0, right0 = _fwd(self.yaw), _right(self.yaw)
         self.vel = self.vel + (fwd0 * a_long + right0 * a_lat) * dt
+        # Banking, and this one term is the whole of it. On a cambered road
+        # gravity has a component along the surface, pointing down the slope,
+        # and on the outside of a banked corner "down the slope" is towards
+        # the apex -- so some of the centripetal force comes from the planet
+        # instead of from the tyres, which is the entire reason circuits are
+        # banked. Added in world space beside the tyre forces rather than
+        # folded into the grip model: it is an acceleration the car gets for
+        # free, not extra grip, and the difference shows the moment you lift.
+        # Kept so the renderer can ask the road questions without carrying a
+        # Surface of its own -- see Car.sync, which samples it at the
+        # *interpolated* position rather than at this step's.
+        self.track = surface.track
+        bank, nrm, surf_y = surface.camber(self.pos)
+        self.surface_y = surf_y
+        self.surface_bank = bank
+        self.surface_roll = bank * float(np.dot(nrm, right0))
+        if bank:
+            self.vel = self.vel + nrm * (cfg.GRAVITY * math.sin(bank) * dt)
 
         if kinematic:
             # ...except at a crawl, where we steer the velocity directly.

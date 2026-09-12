@@ -108,17 +108,29 @@ class HUD:
         self._rpm = 0.0
         self._shown = -1
         self._lit = -1
+        #: Static text -- every label that never changes -- is collected here
+        #: during the build and then flattened into one node. Ursina gives each
+        #: Text its own node, its own draw call and its own shader bind; the
+        #: HUD had ~55 of them sitting idle every frame. Merged, they are one.
+        self._static_txt: list = []
 
         self._batch = _QuadBatch()
+        # Collect static text only from the widgets that are on screen for the
+        # whole race. The flag, spectator strip and the two end cards are
+        # toggled and mostly hidden, so their labels cost nothing where they
+        # sit and must not be baked into an always-visible node.
+        self._collect_static = True
         self._build_session_bar()
         self._build_tower()
         self._build_laptime()
         self._build_telemetry()
         self._build_minimap(track)
+        self._collect_static = False
         self._build_flag()
         if config.SHOW_KEY_HINTS:
             self._build_keys()
         self._batch.build(self.root)
+        self._freeze_static_text()
         self._build_lights()
         self._build_spectator()
         self._build_finish()
@@ -126,10 +138,47 @@ class HUD:
 
     # -- primitives -----------------------------------------------------
     def _txt(self, s, *, size=1.0, col=WHITE, pos=(0, 0), origin=(-0.5, 0),
-             parent=None, z=-0.1):
-        return Text(s, parent=parent if parent is not None else self.root,
-                    font=self.font, scale=size, color=col, origin=origin,
-                    position=(pos[0], pos[1], z))
+             parent=None, z=-0.1, static=True):
+        t = Text(s, parent=parent if parent is not None else self.root,
+                 font=self.font, scale=size, color=col, origin=origin,
+                 position=(pos[0], pos[1], z))
+        if static and self._collect_static:
+            self._static_txt.append(t)
+        return t
+
+    def _freeze_static_text(self):
+        """Bake every collected static label into one merged, static node.
+
+        Ursina attaches a live ``TextNode`` per label -- its own scene-graph
+        node, its own draw call, its own shader bind, re-evaluated every frame
+        for text that never changes. ``TextNode.generate()`` turns each into
+        plain glyph geometry; reparented under one holder and flattened, the
+        whole set -- same font page, same shader -- collapses to a single
+        Geom. Nothing about what is drawn changes.
+        """
+        from panda3d.core import TransparencyAttrib
+        from ursina import destroy
+        from ursina.shaders.text_shader import text_shader
+
+        holder = Entity(parent=self.root, name="hud_static_text")
+        shdr = getattr(text_shader, "_shader", None)
+        if shdr is not None:
+            holder.setShader(shdr)
+            for k, v in text_shader.default_input.items():
+                holder.setShaderInput(k, v)
+        holder.setTransparency(TransparencyAttrib.MAlpha)
+
+        for t in self._static_txt:
+            for tnp in list(getattr(t, "text_nodes", [])):
+                try:
+                    geom = tnp.node().generate()
+                except Exception:
+                    continue
+                np = holder.attachNewNode(geom)
+                np.setMat(tnp.getMat(self.root))
+            destroy(t)
+        self._static_txt = []
+        holder.flattenStrong()
 
     def _root_xy(self, e) -> tuple[float, float]:
         """Offset of an anchor entity from the HUD root, however deep it sits.
@@ -198,7 +247,7 @@ class HUD:
         self._txt(spaced("lap"), size=0.56, col=GREY, pos=(x + 0.020, 0.0),
                   parent=b)
         self.lap = self._txt("1/3", size=1.55, pos=(x + w - 0.024, -0.003),
-                             origin=(0.5, 0), parent=b)
+                             origin=(0.5, 0), parent=b, static=False)
         x += w
         # Circuit.
         self._plate(b, 0.012, H * 0.62, (x, 0, 0.05), col=GLASS_HI,
@@ -218,7 +267,7 @@ class HUD:
         self._txt(spaced("session"), size=0.50, col=GREY,
                   pos=(x + 0.020, 0.014), parent=b)
         self.clock = self._txt("00:00", size=1.0, pos=(x + 0.020, -0.014),
-                               parent=b)
+                               parent=b, static=False)
         self._bar_bottom = 0.455 - H / 2
 
     # -- timing tower (left) ----------------------------------------------
@@ -243,15 +292,16 @@ class HUD:
             bg = self._quad(row, W, RH, (W / 2, 0), GLASS, z=0.08)
             self._rect(row, 0.052, RH, (self.COL_POS, 0), PANEL_HI, z=0.07)
             pos = self._txt("", size=1.3, pos=(self.COL_POS, -0.002),
-                            origin=(0, 0), parent=row)
+                            origin=(0, 0), parent=row, static=False)
             bar = self._quad(row, 0.007, RH, (self.COL_BAR, 0), TEAM_YOU, z=0.05)
-            tla = self._txt("", size=1.08, pos=(self.COL_NAME, 0.009), parent=row)
+            tla = self._txt("", size=1.08, pos=(self.COL_NAME, 0.009), parent=row,
+                            static=False)
             name = self._txt("", size=0.46, col=GREY, pos=(self.COL_NAME, -0.015),
-                             parent=row)
+                             parent=row, static=False)
             gap = self._txt("", size=0.92, pos=(self.COL_GAP, -0.001),
-                            origin=(0.5, 0), parent=row)
+                            origin=(0.5, 0), parent=row, static=False)
             best = self._txt("", size=0.78, pos=(self.COL_BEST, -0.001),
-                             origin=(0.5, 0), parent=row)
+                             origin=(0.5, 0), parent=row, static=False)
             self.rows.append(dict(row=row, bg=bg, pos=pos, bar=bar, tla=tla,
                                   name=name, gap=gap, best=best))
 
@@ -272,7 +322,8 @@ class HUD:
         self._txt(spaced("current"), size=0.52, col=GREY, pos=(0.016, -0.059),
                   parent=r)
         self.cur = self._txt(lap_time(None), size=1.5, col=AMBER,
-                             pos=(W - 0.016, -0.061), origin=(0.5, 0), parent=r)
+                             pos=(W - 0.016, -0.061), origin=(0.5, 0), parent=r,
+                             static=False)
         self.sectors = []
         bw = (W - 0.032 - 0.016) / 3
         for k in range(3):
@@ -285,11 +336,12 @@ class HUD:
         self._txt(spaced("last"), size=0.52, col=GREY, pos=(0.016, -0.147),
                   parent=r)
         self.last = self._txt(lap_time(None), size=1.0, pos=(W - 0.016, -0.147),
-                              origin=(0.5, 0), parent=r)
+                              origin=(0.5, 0), parent=r, static=False)
         self._txt(spaced("best"), size=0.52, col=GREY, pos=(0.016, -0.181),
                   parent=r)
         self.best = self._txt(lap_time(None), size=1.0, col=PURPLE,
-                              pos=(W - 0.016, -0.181), origin=(0.5, 0), parent=r)
+                              pos=(W - 0.016, -0.181), origin=(0.5, 0), parent=r,
+                              static=False)
 
     # -- onboard telemetry (bottom-centre) --------------------------------
     BAR_H = 0.096            # throttle / brake bar travel
@@ -337,13 +389,13 @@ class HUD:
         # Gear, with the driver-aid and slip badges beside it.
         self._rect(s, 0.0015, 0.100, (0.092, -0.006), GLASS_HI, z=0.06)
         self.gear = self._txt("N", size=2.1, pos=(0.126, 0.008), origin=(0, 0),
-                              parent=s)
+                              parent=s, static=False)
         self._txt(spaced("gear"), size=0.44, col=GREY, pos=(0.126, -0.041),
                   origin=(0, 0), parent=s)
         self.aid_txt = self._txt("", size=0.44, pos=(0.172, 0.018), origin=(0, 0),
-                                 parent=s)
+                                 parent=s, static=False)
         self.slip_txt = self._txt("", size=0.44, col=AMBER, pos=(0.172, -0.014),
-                                  origin=(0, 0), parent=s)
+                                  origin=(0, 0), parent=s, static=False)
 
     # -- track map (bottom-right) -----------------------------------------
     def _build_minimap(self, track: Track):

@@ -145,7 +145,11 @@ class PropLibrary:
               parent=None, shader=None) -> Entity | None:
         """Stamp *placements* of one asset into a single flattened entity.
 
-        ``placements`` yields ``(x, z, yaw_deg)`` or ``(x, z, yaw_deg, scale)``.
+        ``placements`` yields ``(x, z, yaw_deg)``, ``(x, z, yaw_deg, scale)``
+        or ``(x, z, yaw_deg, scale, y)``. The height is optional because
+        almost nothing needs it: the ground is a plane except across the road
+        itself, and most of the roadside stands past where the camber has
+        faded out. A cone on the kerb of a banked corner does not.
 
         *shader* must be given here rather than assigned to the result later.
         ``flatten_strong`` composes the node states down onto the geoms, and
@@ -169,8 +173,9 @@ class PropLibrary:
         for p in placements:
             x, z, yaw = p[0], p[1], p[2]
             s = p[3] if len(p) > 3 else 1.0
+            y = p[4] if len(p) > 4 else 0.0
             copy = tmpl.copy_to(root)
-            copy.set_pos(float(x), 0.0, float(z))
+            copy.set_pos(float(x), float(y), float(z))
             # A scalar scales uniformly; a triple stretches per axis, which is
             # how one 0.8 m barrier module becomes a run of wall without
             # needing thousands of copies.

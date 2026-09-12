@@ -113,11 +113,79 @@ def _edge(track: Track, i: int, side: int, extra: float) -> np.ndarray:
     return track.center[i] + track.normal[i] * side * (w + extra)
 
 
+def _nearest_segment(track: Track, side: int, p):
+    """(closest point on the nearest barrier chord, its outward normal)."""
+    segs = track.barrier_lines()[0 if side > 0 else 1]
+    if len(segs) == 0:
+        return None
+    a, b = segs[:, 0], segs[:, 1]
+    d = b - a
+    L2 = np.maximum((d * d).sum(axis=1), 1e-9)
+    t = np.clip(((p - a) * d).sum(axis=1) / L2, 0.0, 1.0)
+    q = a + d * t[:, None]
+    k = int(((p - q) ** 2).sum(axis=1).argmin())
+    m = np.array([d[k][1], -d[k][0]], dtype=float)
+    m /= max(float(np.hypot(m[0], m[1])), 1e-9)
+    if float(np.dot(m, q[k] - p)) < 0.0:
+        m = -m
+    return q[k], m
+
+
 def _beyond_wall(track: Track, i: int, side: int, extra: float) -> np.ndarray:
-    """A point *extra* metres outside the barrier line on the given side."""
-    off_r, off_l = track.wall_offsets()
+    """A point *extra* metres outside the barrier line on the given side.
+
+    Measured off the fence's own chords, not by walking out along the
+    centreline normal by a stored radius. The wall is the outline of the
+    run-off, not an offset of the road: where the outline fans out round a
+    corner it stands metres past any radius, so a building "set back from the
+    barrier" by the second measurement is a building the fence runs through.
+    Falls back to the radius only if this side has no barrier at all.
+    """
+    seg = _nearest_segment(track, side, track.center[i])
+    if seg is not None:
+        return seg[0] + seg[1] * extra
+    off_r, off_l = track.wall_ray_offsets()
     off = (off_r if side > 0 else off_l)[i]
     return track.center[i] + track.normal[i] * side * (off + extra)
+
+
+def _across_span(track: Track, i: int, clear: float,
+                 min_extra: float = config.CAR_BODY_WIDTH,
+                 leg_frac: float = 1.0
+                 ) -> tuple[np.ndarray, float]:
+    """(centre, full span) for a structure standing across the circuit.
+
+    Its legs go *clear* metres outside the asphalt on both sides, never past
+    the barrier, and it is centred on the road rather than midway between the
+    two walls. Both halves of that matter. Spanning wall to wall was fine when
+    the run-off was thirteen metres of it; against a corner's fifty it gives a
+    beam the length of a football pitch. And a circuit whose barriers sit at
+    different distances on the two sides -- Zandvoort's, everywhere -- put the
+    midpoint of the two walls well off the road, which is why the start lights
+    hung over the run-off instead of over the grid.
+
+    Where the barrier is close enough that the clamp bites, *min_extra* is the
+    floor and it wins: a full car's width of clear ground between the white
+    line and the nearest leg, whatever else is going on. A leg any nearer than
+    that is one a car running wide reaches before it has run out of road.
+
+    *leg_frac* is where the structure's legs actually stand, as a fraction of
+    the half-span -- a bridge tower's inner face is at 0.75 of it, a gantry
+    leg at 0.80, not out at the very edge. Returning a span that only clears
+    the road at its extremes then leaves the legs themselves well inside the
+    white line, which on Zandvoort's narrow, close-walled corners put a bridge
+    pillar less than a car's width off the asphalt. The floor and the target
+    are divided by it so it is the *leg*, not the span edge, that keeps clear.
+    """
+    off_r, off_l = track.wall_ray_offsets()
+    w = float(max(track.w_right[i], track.w_left[i]))
+    # Less than the leg's own half-width from the fence is a leg through
+    # the fence, so the room stops short of it by more than a token metre.
+    room = float(min(off_r[i], off_l[i])) - 1.5
+    floor_half = (w + min_extra) / leg_frac
+    want_half = (w + clear) / leg_frac
+    half = max(min(want_half, max(room, floor_half)), floor_half)
+    return track.center[i], 2.0 * half
 
 
 def _nearest_index(track: Track, p) -> int:
@@ -164,6 +232,63 @@ def _clear(track: Track, p, need: float) -> bool:
     """
     d = track.center - np.asarray(p, dtype=float)
     return float(np.min(d[:, 0] ** 2 + d[:, 1] ** 2)) >= need * need
+
+
+def _ground(track: Track, p) -> float:
+    """Height of the ground under a roadside point.
+
+    Height only. Rolling the props to match the camber as well was tried and
+    is not worth what it costs: a batched prop is posed by heading alone, its
+    roll axis after that rotation is not the one the slope was measured
+    across, and the guardrail came out standing on edge. A rail is 1.25 m
+    tall and its posts are placed individually -- each at its own height --
+    so the run follows the bank without any of them being tilted at all.
+    """
+    return float(track.ground_y([p])[0])
+
+
+def _outside_wall(track: Track, pts, clear: float) -> bool:
+    """True if every one of *pts* is outside the fence, by *clear* metres.
+
+    Two tests, because either one alone lets a building through. The corridor
+    test says which side of the wall a point is on -- it is the same field the
+    barrier contour was taken from, so it cannot disagree about that -- and the
+    chord test says how far from the wall it is. A grandstand corner three
+    centimetres outside the corridor passes the first and still has the fence
+    running through its front wall.
+    """
+    q = np.atleast_2d(np.asarray(pts, dtype=float))
+    if (track.corridor_distance(q) < clear).any():
+        return False
+    return bool((track.barrier_distance(q) >= clear).all())
+
+
+def _footprint(p, u, out, w: float, d: float) -> np.ndarray:
+    """The four corners of a *w* x *d* box centred on *p*, plus its edge
+    midpoints -- enough samples that a chord cannot thread between them."""
+    hu, ho = u * (w * 0.5), out * (d * 0.5)
+    pts = []
+    for a in (-1.0, 0.0, 1.0):
+        for b in (-1.0, 0.0, 1.0):
+            if a or b:
+                pts.append(p + hu * a + ho * b)
+    return np.asarray(pts, dtype=float)
+
+
+def _true_runs(flags, least: int) -> list[tuple[int, int]]:
+    """[start, stop) spans of consecutive True at least *least* long."""
+    out, k, n = [], 0, len(flags)
+    while k < n:
+        if not flags[k]:
+            k += 1
+            continue
+        j = k
+        while j < n and flags[j]:
+            j += 1
+        if j - k >= least:
+            out.append((k, j))
+        k = j
+    return out
 
 
 def _runs(mask: np.ndarray) -> list[np.ndarray]:
@@ -325,14 +450,22 @@ def _barriers(track: Track, lib: PropLibrary, ents: list[Entity]):
             fyaw = yaw
             if np.dot(np.array([-u[1], u[0]]), out) < 0:
                 fyaw += 180.0
-            rails.append((p[0], p[1], fyaw, (length / rail_w, 1.0, 1.0)))
-            fences.append((q[0], q[1], fyaw, (length / fence_w, 1.0, 1.0)))
+            # On the surface and leaning with it. Where the run-off is
+            # narrower than the camber's fade -- which is most of a straight
+            # on a circuit with any camber at all -- the ground the rail
+            # stands on is not the plane, and a rail bolted to the plane there
+            # is a rail with daylight under one end and its foot buried at the
+            # other.
+            rails.append((p[0], p[1], fyaw, (length / rail_w, 1.0, 1.0),
+                          _ground(track, p)))
+            fences.append((q[0], q[1], fyaw, (length / fence_w, 1.0, 1.0),
+                           _ground(track, q)))
             for pitch, pts, base in ((config.GUARDRAIL_POST_PITCH, posts, p),
                                      (config.FENCE_POST_PITCH, fposts, q)):
                 n = max(2, int(round(length / pitch)))
                 for t in np.linspace(-0.5, 0.5, n):
                     r = base + u * (t * length)
-                    pts.append((r[0], r[1], fyaw))
+                    pts.append((r[0], r[1], fyaw, 1.0, _ground(track, r)))
 
     for name, places in (("guardrail", rails), ("guardrail_post", posts),
                          ("debris_fence", fences), ("debris_post", fposts)):
@@ -417,7 +550,7 @@ def _stand_spans(track: Track, depth: float):
     filling this circuit, and stands are the punctuation.
     """
     n = track.count
-    off_r, off_l = track.wall_offsets()
+    off_r, off_l = track.wall_ray_offsets()
     spans = []
     for si, run in enumerate(_straights(track)):
         # Alternate sides down the lap, and take a slice of each straight
@@ -466,7 +599,7 @@ def _stands(track: Track, lib: PropLibrary, ents: list[Entity], spans,
     w, d = (v * gs for v in lib.footprint(name))
     if w <= 0.0:
         return
-    off_r, off_l = track.wall_offsets()
+    off_r, off_l = track.wall_ray_offsets()
     places = []
     for side, run in spans:
         off = off_r if side > 0 else off_l
@@ -483,19 +616,40 @@ def _stands(track: Track, lib: PropLibrary, ents: list[Entity], spans,
             continue
         u = span_v / length
         yaw = yaw_towards(-out)          # one heading for every module
+        # Squared to the module's own heading, not to the span: every module
+        # in a row is aimed at -out, so that -- not the line the row happens
+        # to run along -- is where its walls are.
+        across = np.array([-out[1], out[0]], dtype=float)
+        ok = []
         for k in range(count):
             p = a0 + u * ((k + 0.5) * w)
-            if not _clear(track, p, config.RUNOFF_WIDTH + 4.0):
-                continue
-            places.append((p[0], p[1], yaw, gs))
-            blockers.append((p[0], p[1], max(w, d) * 0.62))
-            # ...and the ground *in front* of it, all the way to the barrier.
-            # Blocking only the footprint left the treeline free to grow
-            # between the stand and the circuit, which is the one place a
-            # grandstand cannot have a tree.
-            for f in np.linspace(0.15, 1.0, 5):
-                q = p - out * (config.STAND_SETBACK + d * 0.5) * f
-                blockers.append((q[0], q[1], w * 0.55))
+            # A span is one straight line and the wall beside it is not, so
+            # "set back from the barrier at both ends" does not mean every
+            # module in between clears it -- through a kink in the fence the
+            # middle of the row walked straight into the wall. Tested per
+            # module, against the fence's own chords, over the whole
+            # footprint rather than the centre point.
+            ok.append(_clear(track, p, config.RUNOFF_WIDTH + 4.0)
+                      and _outside_wall(track,
+                                        _footprint(p, across, out, w, d),
+                                        config.STAND_WALL_CLEAR))
+        # ...and then only the runs of at least two. Dropping a module the
+        # fence went through was right; leaving its neighbour standing on its
+        # own in a field was not, and that is what the rule at the top of this
+        # docstring is for. A survivor with nothing butted against it is a
+        # shed, so it goes too.
+        for a, b in _true_runs(ok, 2):
+            for k in range(a, b):
+                p = a0 + u * ((k + 0.5) * w)
+                places.append((p[0], p[1], yaw, gs))
+                blockers.append((p[0], p[1], max(w, d) * 0.62))
+                # ...and the ground *in front* of it, all the way to the
+                # barrier. Blocking only the footprint left the treeline free
+                # to grow between the stand and the circuit, which is the one
+                # place a grandstand cannot have a tree.
+                for f in np.linspace(0.15, 1.0, 5):
+                    q = p - out * (config.STAND_SETBACK + d * 0.5) * f
+                    blockers.append((q[0], q[1], w * 0.55))
     e = lib.batch(name, places, face_forward=True)
     if e is not None:
         ents.append(e)
@@ -540,13 +694,10 @@ def _forest(track: Track, lib: PropLibrary, ents: list[Entity], rng, blockers):
              for shape in ("tree_round", "tree_pine", "tree_bush",
                            "tree_spread", "tree_cypress")
              for tone in ("a", "b", "c")]
-    off_r, off_l = track.wall_offsets()
-    # Per-candidate, not one global maximum. Using the widest corridor
-    # anywhere on the lap -- now fifty metres, at the widest corner run-off --
-    # held the treeline that far back on every straight as well, which is the
-    # gap between the fence and the trees.
-
-    corridor = np.maximum(off_r, off_l)
+    # Only to place the candidates -- how far out from this leg to start
+    # throwing them. Whether one may actually stand there is a separate
+    # question, answered against the region below.
+    off_r, off_l = track.wall_ray_offsets()
     picks: dict[str, list] = {n: [] for n in names}
     for lo, hi, pitch in config.FOREST_BANDS:
         step = max(1, int(track.count * pitch / max(track.length, 1.0)))
@@ -569,14 +720,16 @@ def _forest(track: Track, lib: PropLibrary, ents: list[Entity], rng, blockers):
             d = near + lo + (hi - lo) * np.sqrt(rng.random(m))
             jit = (rng.random(m) - 0.5) * span * 1.6
             pts = base + nrm * d[:, None] + tan * jit[:, None]
-            # Cleared against the corridor of whatever leg the tree ends up
-            # nearest to, not the one it was generated from. Where the circuit
-            # folds -- Shanghai's hairpins -- a tree thrown off a narrow leg
-            # lands beside a wide one, and a threshold taken from its own leg
-            # let it through onto the other one's track surface.
-            dist, near_i = _dist_to_track(track, pts, want_index=True)
-            room = np.maximum(near, corridor[near_i])
-            good = (dist >= room + config.FOREST_CLEAR)                 & ~_blocked(pts, blockers, pad=config.FOREST_PROP_CLEAR)
+            # Tested against the drivable region itself, not against the
+            # nearest sample's run-off radius. The region is the union of
+            # every sample's radius, so a point can be outside the disc of the
+            # sample nearest to it and still be well inside the fence -- which
+            # is the whole of the ground a corner's outline fans over, and
+            # exactly where the trees standing inside the barrier stood. The
+            # barrier is drawn BARRIER_OUTSET outside this contour, so that
+            # comes off the clearance too.
+            good = (track.corridor_distance(pts)
+                    >= config.FOREST_CLEAR + config.BARRIER_OUTSET)                 & ~_blocked(pts, blockers, pad=config.FOREST_PROP_CLEAR)
             pts = pts[good]
             if not len(pts):
                 continue
@@ -694,7 +847,11 @@ def _spectator_bank(track: Track, ents: list[Entity], spans):
     if not getattr(config, "SPECTATOR_BANK_ENABLED", True):
         return
 
-    off_r, off_l = track.wall_offsets()
+    # The bank starts just outside the fence, so it has to be measured to the
+    # fence that is drawn. Against the requested radius its inner edge landed
+    # *inside* the barrier wherever the wall bulged, and a strip of the grass
+    # plane came up through the run-off on the wrong side of the wall.
+    off_r, off_l = track.wall_ray_offsets()
     n, step = track.count, 2
     profile = [(2.0, 0.0), (9.0, 1.9), (18.0, 3.4), (28.0, 4.2),
                (36.0, 4.3), (46.0, 0.15)]
@@ -771,15 +928,111 @@ def _pit_complex(track: Track, lib: PropLibrary, ents: list[Entity], straight,
     s_from = float(track.arclen[0]) - total * 0.65
     s_to = s_from + total
 
+    # One curve for the whole block, not a bay at a time. Placing each bay
+    # off the fence beside it gave every one its own distance out and its own
+    # heading, and a row of buildings that each stand where the wall happens
+    # to be is a row whose neighbours overlap where the wall comes in and show
+    # daylight where it goes out. A pit lane is one building.
+    #
+    # But not one straight line either: two hundred and fifty metres of it
+    # leaves the straight it started on, and at Zandvoort the far end came
+    # back over the circuit. The bays run along the centreline offset by a
+    # single distance -- so the block keeps the road's own gentle curve -- and
+    # are stepped along *that* curve rather than along the centreline, which
+    # is what makes them butt. Step by the centreline and the outside of a
+    # bend opens gaps between them and the inside overlaps them, which is the
+    # same bug one level down.
+    # Confined to the main straight, and stepped along the *offset* curve.
+    #
+    # Three separate things had to be true and none of them was. Placing each
+    # bay off the fence beside it gave every bay its own distance out and its
+    # own heading, so neighbours overlapped where the wall came in and showed
+    # daylight where it went out -- a pit lane is one building. Running the
+    # block on a single straight line instead fixed that and broke something
+    # worse: two hundred and fifty metres of straight line leaves the straight
+    # it started on, and at Zandvoort the far end came back over the circuit.
+    # And letting the block run past the end of the straight put its first
+    # bays beside the previous corner, where the run-off is forty metres wide
+    # -- so the setback taken from the widest point pushed the whole lane out
+    # there, and the offset curve round the inside of a 56 m corner offset by
+    # 44 m folds nearly to a point, which stacked two garages on one spot.
+    #
+    # So: the centreline of the straight, offset by one distance, resampled at
+    # exactly one garage width along that curve. Stepping along the centreline
+    # instead is the same bug one level down -- the outside of a bend opens
+    # gaps between the bays and the inside overlaps them.
+    run = np.asarray(straight, dtype=int)
     garages, walls, towers = [], [], []
-    for k in range(config.PIT_GARAGES):
-        s = (s_from + (k + 0.5) * garage_w) % track.length
-        i = int(np.searchsorted(track.arclen, s)) % n
-        p = _beyond_wall(track, i, side, config.PIT_SETBACK + front)
-        if not _clear(track, p, config.RUNOFF_WIDTH + 6.0):
+    if len(run) < 3:
+        return
+    nrm = track.normal[run] * side
+    need = np.array([float(np.dot(_beyond_wall(track, int(i), side,
+                                               config.PIT_SETBACK + front)
+                                  - track.center[int(i)],
+                                  _outward(track, int(i), side)))
+                     for i in run])
+    # Where the start line falls along the straight: the pits end just past it.
+    lap = np.abs(track.arclen[run] - track.arclen[0])
+    k0 = int(np.argmin(np.minimum(lap, track.length - lap)))
+    # Set back by the widest the fence gets *along the bays*, not along the
+    # whole straight. A straight run reaches into the corner at each end,
+    # where the run-off opens out to forty metres, and taking the maximum over
+    # all of it stood the pit lane out in that -- forty metres of empty ground
+    # between the garages and the barrier, which is not a pit lane, it is a
+    # car park.
+    d0 = np.concatenate([[0.0], np.cumsum(
+        np.linalg.norm(np.diff(track.center[run], axis=0), axis=1))])
+    win = (d0 >= d0[k0] - total * 0.65) & (d0 <= d0[k0] + total * 0.35)
+    reach = float(need[win].max() if win.any() else need.max())
+    # Try a few setbacks and keep the one that seats the most bays. Pushing
+    # out until every bay clears sounds right and is not: where the fence
+    # bulges at one end of the block, "push until it fits" walks the whole
+    # lane into the middle of a field to save two garages. Scored instead, so
+    # a short pit lane close to the circuit beats a long one nowhere near it,
+    # and the smallest setback that ties wins.
+    best = None
+    for attempt in range(6):
+        line = track.center[run] + nrm * (reach + attempt * 2.0)
+        cum = np.concatenate([[0.0], np.cumsum(
+            np.linalg.norm(np.diff(line, axis=0), axis=1))])
+        start = float(np.clip(cum[k0] - total * 0.65, 0.0,
+                              max(cum[-1] - garage_w, 0.0)))
+        want = np.arange(start + garage_w * 0.5,
+                         min(start + total, cum[-1]), garage_w)
+        want = want[:config.PIT_GARAGES]
+        if len(want) < 2:
+            break
+        # The outward direction at each bay, interpolated along the same
+        # curve, so a bay's heading matches the piece of road it faces.
+        outs = np.stack([np.interp(want, cum, nrm[:, 0]),
+                         np.interp(want, cum, nrm[:, 1])], axis=1)
+        outs /= np.maximum(np.linalg.norm(outs, axis=1), 1e-9)[:, None]
+        qs = [np.array([x, z]) for x, z in
+              zip(np.interp(want, cum, line[:, 0]),
+                  np.interp(want, cum, line[:, 1]))]
+        ok = [_outside_wall(track,
+                            _footprint(q, np.array([-o[1], o[0]]), o,
+                                       garage_w, depth),
+                            config.PIT_WALL_CLEAR)
+              for q, o in zip(qs, outs)]
+        runs = _true_runs(ok, 2)
+        if not runs:
             continue
-        garages.append((p[0], p[1], yaw_towards(track.center[i] - p)))
-        blockers.append((p[0], p[1], max(garage_w, depth) * 0.66))
+        lo, hi = max(runs, key=lambda r: r[1] - r[0])
+        if best is None or hi - lo > best[0]:
+            best = (hi - lo, qs[lo:hi], [yaw_towards(-o) for o in outs[lo:hi]])
+        if all(ok):
+            break
+    if best is not None:
+        pts, yaws = best[1], best[2]
+    else:
+        pts, yaws = [], []
+    for q, yw in zip(pts, yaws):
+        garages.append((q[0], q[1], yw))
+        blockers.append((q[0], q[1], max(garage_w, depth) * 0.66))
+    if pts:
+        s_from = float(track.arclen[_nearest_index(track, pts[0])]) - garage_w
+        s_to = float(track.arclen[_nearest_index(track, pts[-1])]) + garage_w
 
     # Pit wall: stretched runs along the same stretch, just outside the barrier.
     module = lib.footprint("pit_wall")[0] or 6.0
@@ -812,14 +1065,52 @@ def _start_gantry(track: Track, lib: PropLibrary, ents: list[Entity], blockers):
     from 12 to 15 m of asphalt and a gantry with its feet on the racing line is
     worse than no gantry at all.
     """
-    off_r, off_l = track.wall_offsets()
-    span = float(off_r[0] + off_l[0]) + 3.0
+    p, span = _across_span(track, 0, config.GANTRY_LEG_CLEAR, leg_frac=0.80)
     authored = lib.footprint("gantry")[0] or 18.65
-    p = track.center[0] + track.normal[0] * float(off_r[0] - off_l[0]) / 2.0
-    e = lib.batch("gantry", [(p[0], p[1], yaw_at(track, 0),
-                              (span / authored, 1.0, 1.0))])
+    scale = (span / authored, 1.0, 1.0)
+    # Turned to meet the cars. yaw_at is the direction of travel, and a gantry
+    # aimed that way shows the grid the back of its banner and the backs of
+    # its five lights -- which is the one piece of the circuit that has to be
+    # read from the car.
+    e = lib.batch("gantry", [(p[0], p[1], yaw_at(track, 0) + 180.0, scale)])
     if e is not None:
         ents.append(e)
+    # The dark lamp housings are the baked prop, stamped once at the gantry's
+    # transform and left on for the whole session.
+    yaw = yaw_at(track, 0) + 180.0
+    lamp = lib.batch("gantry_lamps_off", [(p[0], p[1], yaw, scale)])
+    if lamp is not None:
+        lamp.name = "gantry_lamps_off"
+        ents.append(lamp)
+    # The *lit* lamps are five independent columns, not one baked "all on"
+    # mesh: the gantry counts the start in one lamp at a time, exactly as the
+    # HUD does, and a single mesh cannot have four fifths of itself switched
+    # off. Each column carries the same two stacked faces as the baked prop
+    # (blender/circuit_kit._lamp_geometry), in the gantry's own coordinates,
+    # and is named so app.py can find it in the flat scenery list.
+    rig = Entity(parent=scene, name="gantry_lit",
+                 position=(p[0], 0.0, p[1]), rotation_y=yaw,
+                 scale=(scale[0], 1.0, 1.0))
+    ents.append(rig)
+    top, ht, pitch = 7.4 - 0.26, 1.30, 0.92
+    # Left to right for a car facing the gantry: column 0 is the first to
+    # light. The rig carries the gantry's +180 yaw, so the leftmost lamp sits
+    # at +x in the rig's own frame -- hence (2 - k), not (k - 2).
+    #
+    # The lit face is the same colour as the HUD's start lamps (ui.LAMP_ON)
+    # and is drawn unlit: a sunset-shaded red box just looks like red paint,
+    # and two of those stacked on the baked dark face at the same depth was
+    # the white shimmer -- z-fighting, not a lamp. Sat a few centimetres
+    # proud of the housing it reads as a light that is actually on.
+    for k in range(5):
+        col = Entity(parent=rig, name=f"gantry_lit_{k}", enabled=False,
+                     position=((2 - k) * pitch, 0.0, 1.03))
+        for z0 in (top - ht + 0.12, top - ht * 0.52):
+            Entity(parent=col, model="cube", unlit=True,
+                   color=pal.rgb(255, 28, 18),
+                   position=(0.0, z0 + ht * 0.17, 0.0),
+                   scale=(pitch * 0.56, ht * 0.36, 0.06))
+        ents.append(col)
 
     blockers.append((p[0], p[1], span * 0.6))
     flags = []
@@ -835,13 +1126,19 @@ def _bridges(track: Track, lib: PropLibrary, ents: list[Entity], blockers):
     """Spectator bridges. Two of these round a lap break the skyline more than
     any amount of extra grandstand does, and they give a long straight a
     landmark to measure distance against."""
-    off_r, off_l = track.wall_offsets()
     authored = lib.footprint("bridge")[0] or 25.6
     places = []
+    n = track.count
+    win = max(4, n // 50)
     for f in np.linspace(0.0, 1.0, config.BRIDGE_COUNT, endpoint=False)[1:]:
-        i = int(np.searchsorted(track.arclen, f * track.length)) % track.count
-        span = float(off_r[i] + off_l[i]) + 8.0
-        p = track.center[i] + track.normal[i] * float(off_r[i] - off_l[i]) / 2.0
+        i = int(np.searchsorted(track.arclen, f * track.length)) % n
+        # Slide to the straightest sample nearby: a bridge is a rigid beam set
+        # square to the tangent, so on a bend one pillar swings in towards the
+        # apex and the along-normal clearance _across_span guarantees is not
+        # the clearance the car actually sees.
+        js = (np.arange(i - win, i + win) % n)
+        i = int(js[np.argmax(track.curv_radius[js])])
+        p, span = _across_span(track, i, config.BRIDGE_LEG_CLEAR, leg_frac=0.75)
         places.append((p[0], p[1], yaw_at(track, i), (span / authored, 1.0, 1.0)))
         blockers.append((p[0], p[1], span * 0.6))
     e = lib.batch("bridge", places)
@@ -881,18 +1178,23 @@ def _distance_boards(track: Track, lib: PropLibrary, ents: list[Entity], corners
             # `side` is the *outside* of the bend -- left board for a
             # right-hander, right board for a left-hander, which is the side a
             # driver is already looking at on the way in.
-            out = _outward(track, i, side)
-            # Stood off the fence towards the track, not flush with it:
-            # on the fence line the panel is inside the rails.
-            p = _beyond_wall(track, i, side,
-                             config.FENCE_SETBACK - config.BOARD_STANDOFF)
-            # Angled back down the circuit, not flat against the fence.
-            # Square to the fence the board is edge-on to the car until the
-            # moment it is level with it, which is a board you cannot read;
-            # turned to face the oncoming driver it is legible for the whole
-            # approach, which is the only thing it is for.
-            aim = -track.tangent[i] * config.BOARD_AIM - out * (1.0 - config.BOARD_AIM)
-            buckets[name].append((p[0], p[1], yaw_towards(aim)))
+            # Square across the run-off, facing back down the circuit, not
+            # flat on the fence. A panel lying along the barrier is edge-on to
+            # the car until the instant it is level with it, which is a board
+            # you cannot read; turned to meet the driver it is legible for the
+            # whole approach, which is the only thing it is for.
+            #
+            # Its width then runs inward from the fence rather than along it,
+            # so it is stood off by its own half-width -- placed on the chord
+            # it would hang half outside the circuit.
+            seg = _nearest_segment(track, side, track.center[i])
+            if seg is None:
+                continue
+            q, m = seg
+            half = (lib.footprint(name)[0] or 2.3) * 0.5
+            p = q - m * (half + config.BOARD_STANDOFF)
+            buckets[name].append((p[0], p[1],
+                                  yaw_towards(-track.tangent[i])))
     for name, places in buckets.items():
         e = lib.batch(name, places)
         if e is not None:
@@ -919,7 +1221,27 @@ def _posts_and_lights(track: Track, lib: PropLibrary, ents: list[Entity],
             continue
         # Behind the barrier line, as on a real circuit -- inside it they stood
         # in the run-off where a car would hit them.
-        q = _beyond_wall(track, i, side, 2.5)
+        # Off the barrier chord, not off the centreline normal: the wall is
+        # the outline of the run-off, so a normal offset put posts metres
+        # inside it, standing in the gravel.
+        seg = _nearest_segment(track, side, track.center[i])
+        if seg is None:
+            continue
+        gap = config.LIGHTPOST_WALL_GAP
+        q = seg[0] + seg[1] * gap
+        # Placed off the nearest chord on this side, then checked back against
+        # every chord on *both* sides. Where the circuit doubles back the
+        # nearest wall to a point a metre and a half behind one barrier can be
+        # the other one, and the post that looked like it was hugging the
+        # fence was standing in the next corner's run-off. Out of tolerance is
+        # dropped, not nudged: a gap in a row of lamps reads as a gap, a lamp
+        # in the gravel reads as a bug.
+        if abs(float(track.barrier_distance(q)[0]) - gap) > config.LIGHTPOST_GAP_TOL:
+            continue
+        # ...and on the outside of it. The chord test alone is satisfied by a
+        # point the same distance *inside* the wall.
+        if float(track.corridor_distance(q)[0]) < gap * 0.5:
+            continue
         # Aimed by direction, not by heading-plus-90: the lamp reaches along the
         # model's own z, and a signed offset rule got that backwards on one
         # side, so half the posts lit the countryside.
@@ -941,8 +1263,15 @@ def _cones(track: Track, lib: PropLibrary, ents: list[Entity]):
         if not corner[i]:
             continue
         side = -1 if _turns_left(track, i) else 1      # inside of the corner
+        lat = side * ((track.w_right[i] if side > 0 else track.w_left[i])
+                      + config.KERB_WIDTH + 0.7)
         p = _edge(track, i, side, config.KERB_WIDTH + 0.7)
-        places.append((p[0], p[1], 0.0))
+        # On the road's own surface, not on the plane. These sit a metre off
+        # the kerb, which on a banked corner is a metre and a half above or
+        # below where the plane is -- a row of cones floating over the inside
+        # of the bend, or buried in it.
+        places.append((p[0], p[1], 0.0, 1.0,
+                       float(track.ground_y([p])[0])))
     e = lib.batch("pylon", places)
     if e is not None:
         ents.append(e)

@@ -153,10 +153,34 @@ def gantry():
         top = h - 0.26
         slab("light_case", x - w / 2, x + w / 2, rail_y0, rail_y1,
              top - ht, top, "Dark")
+    # The lamps themselves are a separate prop -- see gantry_lamps(). They are
+    # the one part of the circuit that changes during a session, and a mesh
+    # baked into the gantry cannot be switched off.
+
+
+def _lamp_geometry():
+    """The ten lamp faces, in the gantry's own coordinates."""
+    h = 7.4
+    pitch, w, ht = 0.92, 0.66, 1.30
+    rail_y0 = -0.92
+    for k in range(5):
+        x = (k - 2) * pitch
+        top = h - 0.26
         # Two lamps stacked in each case, which is what a real gantry carries.
-        for j, z0 in enumerate((top - ht + 0.12, top - ht * 0.52)):
+        for z0 in (top - ht + 0.12, top - ht * 0.52):
             slab("lamp", x - w / 2 + 0.09, x + w / 2 - 0.09,
                  rail_y0 - 0.07, rail_y0 - 0.01, z0, z0 + ht * 0.34, "Accent")
+
+
+def gantry_lamps():
+    """Just the gantry's ten lamp faces, as their own prop.
+
+    Placed on top of the gantry at the same transform and stretched with it.
+    Two painted copies are baked from this one mesh -- lit and dark -- and the
+    race swaps which is enabled, so the lights over the grid go out with the
+    ones on the HUD instead of glowing red for the whole session.
+    """
+    _lamp_geometry()
 
 
 
@@ -370,34 +394,40 @@ def _digit(x_mid, z0, w, h, t, glyph, mat="Dark"):
 
 
 def _board(text):
-    """Distance board, mounted on the debris fence rather than on its own post.
+    """Distance board on its own two posts, standing square across the run-off.
 
-    The post is gone: a board on a stick standing in the run-off is something
-    to hit, and a real one is bolted to the fence at about head height, which
-    is where a driver is already looking anyway.
+    It used to be a bare panel bolted flat to the debris fence, with two stubs
+    off the back reaching to the fence line. Flat on the fence is the one
+    angle a countdown board cannot be read from: it is edge-on to the car
+    until the instant the car is level with it, which is a hundred metres too
+    late to brake against. Turned to meet the driver it is legible for the
+    whole approach, which is the only thing it is for -- and turned, it is no
+    longer against the fence, so it needs legs and the stubs have nothing to
+    reach to.
 
-    Glyphs read left to right. Reversing them was a wrong fix for a real
-    symptom -- a yaw is a rotation and not a mirror, so the order was never
-    the problem, and reversing it turned "150" into "051". What was actually
-    wrong is above: a glyph narrower than its cell was not centred in it.
+    Authored facing -y, panel width along x, feet at z = 0. Placed on the
+    inside of the barrier by scenery._distance_boards, which stands it off by
+    its own half-width so no part of it hangs outside the circuit.
     """
     dw, dh, gap = 0.50, 0.82, 0.16
     span = len(text) * dw + (len(text) - 1) * gap
     half = span / 2 + 0.24
-    z0 = 2.05                                        # mid-height on the fence
+    z0 = 1.42                        # panel bottom well above a kerb, at eye
+    # Legs. Set in from the ends so the panel reads as carried rather than as
+    # a gate, and square in section -- a round post is more polygons than a
+    # thing this size is worth.
+    for x in (-half + 0.34, half - 0.34):
+        slab("board_post", x - 0.06, x + 0.06, -0.06, 0.06, 0.0, z0 + 0.22,
+             "Steel")
+    slab("board_foot", -half + 0.28, half - 0.28, -0.10, 0.10, 0.0, 0.10,
+         "Steel")
     slab("board_face", -half, half, -0.12, -0.02,
          z0 - 0.20, z0 + dh + 0.20, "White")
     slab("board_edge", -half, half, -0.02, 0.06,
          z0 - 0.20, z0 + dh + 0.20, "Steel")
-    # Two stubs off the back. The board is stood off the fence rather than
-    # buried in it, and without something reaching back to the fence line a
-    # panel floating half a metre clear reads as a mistake rather than as a
-    # sign hung on brackets.
-    for x in (-half + 0.30, half - 0.30):
-        slab("bracket", x - 0.05, x + 0.05, 0.06, 0.52,
-             z0 + dh * 0.62, z0 + dh * 0.62 + 0.10, "Steel")
     for k, ch in enumerate(text):
         _digit(-span / 2 + dw / 2 + k * (dw + gap), z0, dw, dh, 0.12, ch)
+
 
 
 PARTS = {
@@ -405,6 +435,7 @@ PARTS = {
     "pit_wall": pit_wall,
     "control_tower": control_tower,
     "gantry": gantry,
+    "gantry_lamps": gantry_lamps,
     "bridge": bridge,
     "tyre_wall": tyre_wall,
     "hoarding": hoarding,

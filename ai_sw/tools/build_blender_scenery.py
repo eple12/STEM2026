@@ -89,6 +89,13 @@ VARIANTS = {
                  "tree_cypress")
 }
 VARIANTS.update({
+    # The start lights, lit and out. One mesh, two paints, and the race
+    # enables one of them -- a colour scale on a batched, shader-lit node is
+    # not reliable, and two nodes are.
+    "gantry_lamps": {
+        "gantry_lamps_on": {"Accent": _c(232, 40, 32)},
+        "gantry_lamps_off": {"Accent": _c(34, 22, 22)},
+    },
     "hoarding": {
         "hoarding_a": {"Panel": _c(96, 124, 168)},
         "hoarding_b": {"Panel": _c(176, 84, 76)},

@@ -30,3 +30,11 @@ blender/preview*.png
 blender/kit_sheet.png
 blender/closeup_*.png
 blender/*.blend1
+
+# EMNIST source archives (587 MB) -- public data, re-downloadable from
+# the NIST/EMNIST distribution. The notebooks in lowercase_letters_extension/
+# read these; the trained models next to them are what is worth keeping.
+gzip/
+
+# Claude Code's own project notes. Delete this line to version them.
+memory/

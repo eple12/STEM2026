@@ -53,6 +53,19 @@ class Surface:
             return config.KERB_GRIP_SCALE
         return config.OFF_TRACK_GRIP_SCALE
 
+    def camber(self, pos_xz) -> tuple[float, np.ndarray, float]:
+        """(bank angle, the track normal there, surface height) at a point.
+
+        One call, because everything that wants one of these wants the others:
+        the physics needs the angle and the direction it falls in, and the car
+        and the camera need the height so they sit on the road rather than
+        through it.
+        """
+        t = self.track
+        i, offset, _edge = self._local(pos_xz)
+        return (float(t.bank()[i]), t.normal[i],
+                float(t.surface_y(i, offset)))
+
     def grip(self, pos_xz, yaw: float | None = None) -> tuple[bool, float]:
         """(within track limits, grip multiplier) -- asphalt / kerb / grass.
 
@@ -123,18 +136,40 @@ class Surface:
         L2 = np.maximum((d * d).sum(axis=1), 1e-12)
         t = np.clip(((p - a) * d).sum(axis=1) / L2, 0.0, 1.0)
         q = a + d * t[:, None]
-        k = int(np.argmin(((p - q) ** 2).sum(axis=1)))
 
-        # Outward normal of the chosen chord, oriented away from the track.
-        m = np.array([d[k][1], -d[k][0]], dtype=float)
-        m /= max(float(np.hypot(m[0], m[1])), 1e-9)
-        if float(np.dot(m, self.track.normal[i] * side)) < 0.0:
-            m = -m
-        # Signed distance past the chord's centre line, plus the half thickness
-        # that puts the contact on the face the eye sees rather than the middle
-        # of the rail.
-        u = float(np.dot(p - a[k], m))
-        return u + config.BARRIER_HALF_DEPTH, m
+        # Outward normals, oriented away from the track.
+        m = np.stack([d[:, 1], -d[:, 0]], axis=1)
+        m /= np.maximum(np.hypot(m[:, 0], m[:, 1]), 1e-9)[:, None]
+        flip = (m @ (self.track.normal[i] * side)) < 0.0
+        m[flip] = -m[flip]
+
+        # Signed distance past each chord's centre line, plus the half
+        # thickness that puts the contact on the face the eye sees rather than
+        # the middle of the rail.
+        u = ((p - a) * m).sum(axis=1) + config.BARRIER_HALF_DEPTH
+
+        # Only a chord the car is actually *alongside* can stop it. Measuring
+        # against the infinite line instead was an invisible wall generator:
+        # wherever a run ends -- and it now ends at every chicane, where the
+        # barrier wraps the complex instead of threading it -- the last
+        # chord's half-space carries straight on across the road, and the car
+        # stops dead in the middle of the track against nothing at all. Past
+        # an end the chord only reaches as far as a rounded cap, so a car out
+        # in the open never meets it.
+        cap = config.BARRIER_HALF_DEPTH + config.BODY_HALF_WIDTH
+        along = (t > 0.0) & (t < 1.0)
+        near_end = ((p - q) ** 2).sum(axis=1) <= cap * cap
+        # ...and only to a believable depth. Round the outside of a bend the
+        # far chords face back across the circuit, so a car on the racing line
+        # is tens of metres "through" them.
+        u = np.where((along | near_end) & (u <= config.BARRIER_MAX_PENETRATION),
+                     u, -1e9)
+
+        # Deepest, not nearest: a corner buried past a joint between two
+        # chords is inside both, and the one it is further through is the one
+        # that has to push it out.
+        k = int(np.argmax(u))
+        return float(u[k]), m[k]
 
     def resolve_body(self, pos_xz, yaw: float):
         """Push the car's body box out of the barrier.

@@ -242,8 +242,39 @@ class Car(Entity):
         v = self.vehicle
         t = v.tele
         px, pz, yaw = lerp_pose(v, alpha)
-        self.position = Vec3(px, 0.0, pz)
         self.rotation_y = math.degrees(yaw)
+        # Sat on the road and lain along it, from five samples of the surface
+        # taken at the *interpolated* position.
+        #
+        # Interpolated, because that is what fixes the stutter: the physics
+        # runs at a fixed step and the frame lands somewhere between two of
+        # them, so reading back the height the last step computed makes the
+        # car climb a banked corner in visible stairs while its x and z glide.
+        #
+        # And five samples rather than a formula, because the attitude of a
+        # body on a surface is the surface's own slope under it. Taking the
+        # camber angle and working out which way to roll means getting a sign
+        # right in a convention nobody can check; measuring the road a metre
+        # to each side and asking which is higher cannot be got backwards.
+        if v.track is not None:
+            c, sn = math.cos(yaw), math.sin(yaw)
+            fx, fz = sn, c                      # the car's forward, in world
+            rx, rz = c, -sn                     # ...and its right
+            probe = [(px, pz), (px + fx * 1.6, pz + fz * 1.6),
+                     (px - fx * 1.6, pz - fz * 1.6),
+                     (px + rx * 1.0, pz + rz * 1.0),
+                     (px - rx * 1.0, pz - rz * 1.0)]
+            h, _bank, _n = v.track.surface_pose(probe)
+            self.position = Vec3(px, float(h[0]), pz)
+            # Rolled towards the low side of the road and pitched nose-up
+            # where it climbs away in front. The two signs are opposite, which
+            # is not a mistake: Ursina's rotation_x and rotation_z turn the
+            # model about axes of opposite handedness, so laying the same body
+            # on the same surface needs one of each.
+            self.rotation_x = -math.degrees(math.atan2(float(h[1] - h[2]), 3.2))
+            self.rotation_z = -math.degrees(math.atan2(float(h[3] - h[4]), 2.0))
+        else:
+            self.position = Vec3(px, 0.0, pz)
 
         # Rain light on the built car: two meshes, one lit and one dark,
         # swapped on the brake. Vertex-coloured, so the ghost's alpha scale

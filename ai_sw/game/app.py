@@ -15,6 +15,7 @@ from .freecam import FreeCam
 from .ghost import Ghost
 from .enginesound import EngineSound
 from .hud import HUD
+from .cinematic import Intro
 from .lighting import Sunset
 from .scenery import build_scenery
 from .surface import Surface
@@ -24,7 +25,7 @@ from .trackmesh import TrackScene, line_markers
 from .vehicle import Controls, Vehicle
 
 DT = 1.0 / config.PHYSICS_HZ
-COUNTDOWN, RACING, FINISHED, PAUSED = range(4)
+COUNTDOWN, RACING, FINISHED, PAUSED, INTRO = range(5)
 
 
 class Game:
@@ -118,9 +119,25 @@ class Game:
         self.sound = EngineSound(config.ASSET_DIR)
         self.muted = mute
 
-        # session state
-        self.state = COUNTDOWN
-        self._resume_state = COUNTDOWN
+        # The two painted copies of the start lights, picked back out of the
+        # flat scenery list. Either may be missing on an old asset bake, and a
+        # race without start lights is better than a race that will not start.
+        self._lamps = {e.name: e for e in self.scenery
+                       if getattr(e, "name", "").startswith("gantry_lamps_")}
+        # The five lit lamp columns on the gantry, left to right. They come on
+        # one at a time through the countdown, mirroring the HUD lamps exactly.
+        self._lit_lamps = sorted(
+            (e for e in self.scenery
+             if getattr(e, "name", "").startswith("gantry_lit_")),
+            key=lambda e: e.name)
+
+        # session state. The film runs first and holds the start clock at zero
+        # until it is done, so the countdown timeline below is untouched by it.
+        self.intro = Intro(self.track) if config.INTRO_ENABLED else None
+        if self.intro is not None and self.intro.done:
+            self.intro = None
+        self.state = INTRO if self.intro is not None else COUNTDOWN
+        self._resume_state = self.state
         # Seconds since the loading card lifted. The whole start sequence --
         # gantry drop, five lamps, held pause, lights out, gantry rise -- is
         # driven off this one clock; the pause length is randomised the way a
@@ -195,7 +212,12 @@ class Game:
         cos, sin = math.cos(yaw), math.sin(yaw)
         wx = ox * cos + oz * sin
         wz = -ox * sin + oz * cos
-        return Vec3(px + wx, oy, pz + wz)
+        # Lifted onto the road, and sampled where the camera actually is
+        # rather than where the last physics step left the car -- the same
+        # reason Car.sync does it that way, and the same stutter if it does
+        # not.
+        h, _b, _n = self.track.surface_pose([(px + wx, pz + wz)])
+        return Vec3(px + wx, oy + float(h[0]), pz + wz)
 
     def _cam_aim_point(self) -> Vec3:
         """Look ahead down the road, not at the car's nose."""
@@ -359,6 +381,10 @@ class Game:
             v.traction_control = v.abs_enabled = v.steer_assist = on
         elif key == "f":
             window.fullscreen = not window.fullscreen
+        elif self.state == INTRO:
+            # Any key at all skips the film. Somebody on their fifth lap of the
+            # evening should not have to remember which one.
+            self.intro.skip()
         elif key == "escape":
             if self.state == PAUSED:
                 self.state = self._resume_state
@@ -421,6 +447,19 @@ class Game:
             self._reveal_hud = False
             self.hud.root.enabled = True
         dt = min(time.dt, 0.05)
+        if self.state == INTRO:
+            # Nothing else runs: no clock, no physics, no engine. The HUD is
+            # hidden rather than dimmed -- a lap counter over an establishing
+            # shot of a circuit nobody has driven yet is furniture.
+            self.hud.root.enabled = False
+            self.intro.update(dt)
+            self.sound.update(0.0, config.MAX_SPEED, 0.0, dt, muted=True)
+            if self.intro.done:
+                self.state = COUNTDOWN
+                self._resume_state = COUNTDOWN
+                self.hud.root.enabled = True
+                self._snap_camera()
+            return
         if not self._cam_warm:
             self._cam_warm = True
             self._snap_camera()
@@ -434,6 +473,14 @@ class Game:
         # the gantry finishes riding up while the race is already on.
         if self.start_t < self._T_rise1 + 0.1:
             self.start_t += dt
+        # The lamps on the gantry follow the ones on the HUD exactly: column k
+        # comes on once the count has reached k + 1, and all five drop together
+        # at lights-out (_start_lights() back to 0 -- the go signal).
+        n_lit = max(self._start_lights(), 0)
+        for k, e in enumerate(self._lit_lamps):
+            want = k < n_lit
+            if e.enabled != want:
+                e.enabled = want
         if self.state == COUNTDOWN:
             if self.start_t >= self._T_out:          # lights out -> go
                 self.state = RACING

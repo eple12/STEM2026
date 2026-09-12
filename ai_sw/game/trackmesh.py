@@ -6,9 +6,9 @@ import math
 import numpy as np
 from ursina import Entity, Mesh, color, scene
 
-from . import config, terrain, textures
+from . import config, terrain, textures, trackdata
 from . import palette as pal
-from .trackdata import Track
+from .trackdata import Track, _smooth_ring
 
 ASPHALT_UV_LEN = 12.0     # metres per texture repeat, lengthwise
 # Bigger than it was (8 m). A small tile on a plane that reaches the
@@ -39,6 +39,18 @@ def _ring(track: Track):
     return L, R, s
 
 
+def _heights(y, m: int) -> np.ndarray:
+    """A height per vertex, from either a number or a per-sample array.
+
+    Every strip in here used to be flat because the circuits are flat. With
+    camber they are not, and the two edges of the road are at different
+    heights that change all the way round the lap -- so the one number each
+    rail used to carry becomes a column.
+    """
+    a = np.asarray(y, dtype=float)
+    return np.full(m, float(a)) if a.ndim == 0 else a
+
+
 def _append_strip(verts: list, uvs: list, tris: list,
                   inner: np.ndarray, outer: np.ndarray, s: np.ndarray,
                   y_inner: float, y_outer: float, uv_len: float,
@@ -46,10 +58,11 @@ def _append_strip(verts: list, uvs: list, tris: list,
     """Triangulate a quad strip into existing buffers, offsetting the indices."""
     base = len(verts)
     m = len(inner)
+    yi, yo = _heights(y_inner, m), _heights(y_outer, m)
     for i in range(m):
         u = s[i] / uv_len
-        verts.append((inner[i, 0], y_inner, inner[i, 1]))
-        verts.append((outer[i, 0], y_outer, outer[i, 1]))
+        verts.append((inner[i, 0], yi[i], inner[i, 1]))
+        verts.append((outer[i, 0], yo[i], outer[i, 1]))
         uvs.append((u, 0.0))
         uvs.append((u, v_tiles))
     for i in range(m - 1):
@@ -63,10 +76,11 @@ def _strip_mesh(inner: np.ndarray, outer: np.ndarray, s: np.ndarray,
     """Triangulate a quad strip between two poly-lines (already closed)."""
     verts, uvs, tris = [], [], []
     m = len(inner)
+    yi, yo = _heights(y_inner, m), _heights(y_outer, m)
     for i in range(m):
         u = s[i] / uv_len
-        verts.append((inner[i, 0], y_inner, inner[i, 1]))
-        verts.append((outer[i, 0], y_outer, outer[i, 1]))
+        verts.append((inner[i, 0], yi[i], inner[i, 1]))
+        verts.append((outer[i, 0], yo[i], outer[i, 1]))
         uvs.append((u, 0.0))
         uvs.append((u, v_tiles))
     for i in range(m - 1):
@@ -78,8 +92,20 @@ def _strip_mesh(inner: np.ndarray, outer: np.ndarray, s: np.ndarray,
     # inside a degree, and stating it costs nothing. Mesh.generate_normals is
     # the alternative and its smooth path is O(n^2) over the vertex list, which
     # on a 1159-sample circuit does not finish.
+    # Normals from the strip's own cross-slope. Straight up is right to
+    # within a degree on a flat circuit and wrong by the bank angle on a
+    # banked one, which on an eighteen-degree corner is the difference
+    # between a road that catches the sun and a road that does not.
+    nrm = []
+    for i in range(m):
+        d = outer[i] - inner[i]
+        run = float(np.hypot(d[0], d[1])) or 1.0
+        slope = (yo[i] - yi[i]) / run
+        v = np.array([-slope * d[0] / run, 1.0, -slope * d[1] / run])
+        v /= np.linalg.norm(v)
+        nrm += [tuple(v), tuple(v)]
     return Mesh(vertices=verts, triangles=tris, uvs=uvs,
-                normals=[(0.0, 1.0, 0.0)] * len(verts), mode="triangle")
+                normals=nrm, mode="triangle")
 
 
 def _tint(mesh: Mesh, base, amt: float, seed: int) -> Mesh:
@@ -128,85 +154,159 @@ def mottle(x: float, z: float) -> float:
                   + 0.035 * math.sin((x - z) * 0.121 + 2.3))
 
 
-def _runoff_mesh(track: Track, side: int) -> Mesh:
-    """The apron between the asphalt edge and the barrier line, on one side.
+def _mix(a, b, t):
+    return a * (1.0 - t) + b * t
+
+
+def _ramp_v(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    """_ramp over a whole array."""
+    t = np.clip((x - a) / max(b - a, 1e-6), 0.0, 1.0)
+    return t * t * (3.0 - 2.0 * t)
+
+
+def mottle_v(x: np.ndarray, z: np.ndarray) -> np.ndarray:
+    """mottle() over whole arrays."""
+    return 1.0 + (0.065 * np.sin(x * 0.081) + 0.055 * np.sin(z * 0.063 + 1.7)
+                  + 0.045 * np.sin((x + z) * 0.037 + 0.4)
+                  + 0.035 * np.sin((x - z) * 0.121 + 2.3))
+
+
+def _runoff_mesh(track: Track) -> Mesh:
+    """Everything inside the barrier that is not the road: one mesh, both sides.
 
     Without this the ground goes track -> grass at the white line and the
     barrier stands thirteen metres away across an empty field, which is the
     single most "unfinished" thing about the scene: a real circuit's run-off
     is paved, and paving reads as *circuit* the way grass never does.
 
-    One vertex-coloured mesh rather than several: the surface changes with
-    where you are on the lap, and blending it across a shared vertex is both
-    cheaper and softer than butting three separately-coloured strips together.
+    This is the **interior of the drivable region**, and the barrier is that
+    region's outline, so the ground and the fence are one object seen from
+    two sides and there is nothing left for them to disagree about. It used to
+    be a quad strip walked out along each sample's normal, which is a
+    different construction, and a strip cannot cover this region: where the
+    circuit turns, the outline turns with it and opens a wedge no normal
+    points into. That wedge is the triangle of grass inside the fence on the
+    inside of Monza's first chicane, and a quarter of Zandvoort. Clamping the
+    strip only moved the problem -- pull it in and the grass plane shows
+    through, push it out and run-off is painted across the countryside.
+
+    So the region is filled as a region (``trackdata.runoff_fill``), with its
+    edge snapped onto the barrier chords, and the colour of a point is decided
+    from where that point actually is: how far across the run-off, how much of
+    a corner it is beside, and whether it is on the outside of that corner.
+    One mesh, so two aprons can no longer be laid over the same ground either.
     """
+    verts2, tris, outer = trackdata.runoff_fill(
+        track, config.RUNOFF_CELL, config.BARRIER_OUTSET, config.RUNOFF_SKIRT)
     n = track.count
-    corner = _corner_mask(track, dilate=14)
-    outside = turn_sign(track) == side
-    off_r, off_l = track.wall_offsets()
-    off = off_r if side > 0 else off_l
-    w = track.w_right if side > 0 else track.w_left
+    # Both of these used to be booleans read per sample, and a boolean that
+    # flips between two rows of the mesh is a hard edge running straight out
+    # across the apron -- the green wedge where a corner's gravel met the
+    # straight's grass in the space of one five-metre row. Smoothed along the
+    # lap they become weights, and the surface changes over fifty metres of
+    # circuit instead of over one row.
+    k_smooth = max(5, n // 60)
+    corner = _smooth_ring(_corner_mask(track, dilate=14).astype(float), k_smooth)
+    turn = turn_sign(track)
+    out_r = _smooth_ring((turn == +1).astype(float), k_smooth)
+    out_l = _smooth_ring((turn == -1).astype(float), k_smooth)
+    reach_r, reach_l = track.corridor_reach()
+
+    # Which sample each vertex belongs to -- everything painted here is read
+    # off the circuit at that sample.
+    near = track.nearest_indices(verts2)
+
+    rel = verts2 - track.center[near]
+    lat = (rel * track.normal[near]).sum(axis=1)
+    right = lat > 0.0
+    dist = np.abs(lat)
+    w = np.where(right, track.w_right[near], track.w_left[near])
+    reach = np.where(right, reach_r[near], reach_l[near])
+    outside = np.where(right, out_r[near], out_l[near])
+    cw = corner[near]
+    # How far across the run-off, 0 at the white line and 1 at the fence. The
+    # reach is the region's own edge along that sample's normal, so a corner
+    # whose run-off opens out to fifty metres gets its gravel spread over all
+    # fifty rather than the thirteen a straight has.
+    q = np.clip((dist - w) / np.maximum(reach - w, 1.0), 0.0, 1.0)
 
     grass = np.array([pal.GRASS.r, pal.GRASS.g, pal.GRASS.b]) * RUNOFF_GAIN
     paved = np.array([0.355, 0.365, 0.385]) * RUNOFF_GAIN   # lighter than track
     gravel = np.array([0.560, 0.492, 0.372]) * RUNOFF_GAIN
 
-    # Four rails across the apron: edge, then two intermediate bands, then the
-    # wall. Bands are fractions of the local width, so this follows a run-off
-    # that opens out at a corner instead of stopping short of the barrier.
-    # The last two rails are *past* the barrier. The apron used to stop dead at
-    # the wall, so a gravel trap met the grass plane on a hard line -- and a
-    # gravel trap that ends in a straight edge is the one thing that says
-    # "painted polygon" loudest. These carry the surface out beyond the wall
-    # and fade it into the turf.
-    fracs = (0.0, 0.42, 0.74, 1.0, 1.16, 1.42)
-    span = np.maximum(off - w, 0.5)
+    # Every boundary is a blend, across the apron and along the lap: sand into
+    # gravel into turf, and corner into straight. Nothing is painted past the
+    # fence any more, so the trap fades to turf in its last fifth instead of
+    # out in the country -- which is where a real one's grass verge is.
+    # The paved shoulder runs a good way out before the turf starts. It used
+    # to give up almost at the white line, and with the apron now filling the
+    # whole region that put a field on both sides of the fence -- which is the
+    # other half of "you cannot tell the inside of the circuit from the
+    # outside". A real straight has metres of paving beyond the line before
+    # the grass, and the grass is a verge, not a lawn.
+    r_in = _ramp_v(q, 0.24, 0.78)
+    r_tr = _ramp_v(q, 0.08, 0.50)
+    r_gr = _ramp_v(q, 0.84, 1.0)
+    trap = _mix(_mix(paved, gravel, r_tr[:, None]), grass, r_gr[:, None])
+    inner = _mix(paved, grass, r_in[:, None])
+    col = _mix(grass, _mix(inner, trap, outside[:, None]), cw[:, None])
+    col = np.where(outer[:, None], grass[None, :], col)
 
-    # Per-vertex brightness jitter on top of the band colours. Four rails is
-    # far too coarse a mesh to carry detail on its own, so the grain comes from
-    # textures.ground() through the UVs below; this only breaks up the long
-    # even runs the bands would otherwise have.
     rng = np.random.default_rng(19)
+    jit = (mottle_v(verts2[:, 0], verts2[:, 1])
+           + (rng.random(len(verts2)) - 0.5) * 0.05)
+    col = np.clip(col * jit[:, None], 0.0, 1.0)
 
-    verts, tris, cols, uvs = [], [], [], []
-    y = config.Y_RUNOFF
-    for i in range(n + 1):
-        k = i % n
-        base = track.center[k] + track.normal[k] * side * w[k]
-        step = track.normal[k] * side * span[k]
-        u = float(track.arclen[k]) / RUNOFF_TILE
-        for b, f in enumerate(fracs):
-            p = base + step * f
-            verts.append((p[0], y, p[1]))
-            # v follows real metres across the apron, so the grain does not
-            # stretch where the run-off opens out at a corner.
-            uvs.append((u, float(w[k] + span[k] * f) / RUNOFF_TILE))
-            if not corner[k]:
-                c = grass
-            elif not outside[k]:
-                # Inside of a corner: a paved strip to run wide onto, then
-                # straight back to grass -- there is nothing to catch there.
-                c = paved if b <= 1 else grass
-            elif b <= 1:
-                c = paved
-            elif b == 2:
-                c = gravel
-            else:
-                # Past the wall: mix towards turf over the last two rails, so
-                # the trap has a scruffy edge instead of a cut one.
-                mix = (b - 2) / 3.0
-                c = gravel * (1.0 - mix) + grass * mix
-            j = mottle(float(p[0]), float(p[1])) + (rng.random() - 0.5) * 0.05
-            cols.append(color.rgba(c[0] * j, c[1] * j, c[2] * j, 1.0))
-    m = len(fracs)
-    for i in range(n):
-        a0 = i * m
-        b0 = (i + 1) * m
-        for b in range(m - 1):
-            tris += [a0 + b, b0 + b, b0 + b + 1, a0 + b, b0 + b + 1, a0 + b + 1]
-    return Mesh(vertices=verts, triangles=tris, colors=cols, uvs=uvs,
-                normals=[(0.0, 1.0, 0.0)] * len(verts), mode="triangle",
-                static=True)
+    # A gentle rise away from the road. Real run-off is not a billiard table,
+    # and a dead-flat plane the size of a corner's gravel trap reads as one.
+    #
+    # And a dive under it. The fill covers the whole region, road included --
+    # cutting the asphalt out of a grid fill would only put a seam where there
+    # is no seam -- so the part of it under the track has to stay clear of the
+    # track: twelve millimetres is under what the depth buffer resolves at the
+    # far end of a straight, and gravel flickering through the racing line a
+    # kilometre away is the one artifact worse than the ones this replaces.
+    # The road surface under each vertex, interpolated along the lap. Taken
+    # from the nearest sample instead -- which is what surface_y alone does --
+    # the camber steps at every sample boundary, and on a banked corner a
+    # four-metre grid cell of apron can then step *above* the road strip
+    # beside it, which is run-off lying across the kerb and the racing line.
+    # One formula for "how high is the ground here", shared with everything
+    # that stands on it -- see Track.ground_y. Two descriptions of the same
+    # ground is how the fence came to float over it.
+    y = track.ground_y(verts2)
+    # The skirt's far edge lands on the plane, so the ground leaves the
+    # circuit at the height the rest of the world is at instead of stopping
+    # at a lip. Its colour goes with it: past the fence it is the same field.
+    y = np.where(outer, config.Y_GRASS, y)
+
+    # Straight off world x and z. The obvious mapping is track-relative --
+    # distance along the lap against distance across the run-off -- and it is
+    # a polar coordinate system centred on every corner: the same span of lap
+    # covers a fan of ground on the outside of a bend and a wedge on the
+    # inside, so the grain smears into arcs radiating from the apex. That is
+    # the banding across the gravel. Worse, two vertices of one triangle can
+    # land on samples half a lap apart where the circuit folds back on itself,
+    # and the whole texture then streaks across that triangle in one step.
+    #
+    # The ground texture is a grain with no direction in it, so it has nothing
+    # to gain from following the lap and everything to lose from a coordinate
+    # that is not continuous. In world space it tiles evenly over the whole
+    # circuit, exactly like the grass plane it meets at the fence.
+    u = verts2[:, 0] / RUNOFF_TILE
+    v = verts2[:, 1] / RUNOFF_TILE
+
+    # Handed over through .tolist(): a comprehension that pulls twenty
+    # thousand numpy scalars out one at a time and boxes each of them costs
+    # two seconds of load on its own, and every one of those seconds is spent
+    # on the conversion rather than on anything about the track.
+    xyz = np.stack([verts2[:, 0], y, verts2[:, 1]], axis=1)
+    return Mesh(
+        vertices=list(map(tuple, xyz.tolist())),
+        triangles=tris.reshape(-1).tolist(),
+        colors=[color.rgba(c[0], c[1], c[2], 1.0) for c in col.tolist()],
+        uvs=list(map(tuple, np.stack([u, v], axis=1).tolist())),
+        normals=[(0.0, 1.0, 0.0)] * len(verts2), mode="triangle", static=True)
 
 
 def _kerb_segments(track: Track, side: int):
@@ -232,7 +332,7 @@ def _kerb_segments(track: Track, side: int):
             j += 1
         idx = list(range(i, min(j + 1, n)))
         if len(idx) >= 2:
-            yield edge[idx], outer[idx], track.arclen[idx]
+            yield edge[idx], outer[idx], track.arclen[idx], np.asarray(idx)
         i = j + 1
 
 
@@ -268,16 +368,22 @@ class TrackScene:
         # --- run-off apron ------------------------------------------------
         # Drawn before the asphalt so it is the surface the track sits on,
         # and before the kerbs so a kerb still reads on top of paved run-off.
-        ground_tex = textures.ground()
-        for side in (+1, -1):
-            self._add(Entity(parent=scene, model=_runoff_mesh(t, side),
-                             texture=ground_tex, double_sided=True))
+        self._add(Entity(parent=scene, model=_runoff_mesh(t),
+                         texture=textures.ground(), double_sided=True))
 
         # --- asphalt (flat colour + tiny vertex jitter, no repeating texture) --
         base = (pal.ASPHALT.r, pal.ASPHALT.g, pal.ASPHALT.b)
+        # The two edges of the road are at different heights wherever the
+        # circuit is cambered, and the closed ring carries the seam sample
+        # twice, so the columns are closed the same way the point arrays are.
+        ring = np.concatenate([np.arange(t.count), [0]])
+        yL = np.concatenate([t.surface_y(np.arange(t.count), -t.w_left)])
+        yR = np.concatenate([t.surface_y(np.arange(t.count), t.w_right)])
+        yL = np.concatenate([yL, yL[:1]])
+        yR = np.concatenate([yR, yR[:1]])
         asphalt = self._add(Entity(
             parent=scene,
-            model=_tint(_strip_mesh(L, R, s, 0.0, 0.0, 1.0, 1.0), base, 0.06, 11),
+            model=_tint(_strip_mesh(L, R, s, yL, yR, 1.0, 1.0), base, 0.06, 11),
             double_sided=True))
 
         # --- white edge lines -----------------------------------------
@@ -294,10 +400,15 @@ class TrackScene:
                 outer = c - nrm * (t.w_left[:, None] - 0.55)
             inner = np.vstack([inner, inner[:1]])
             outer = np.vstack([outer, outer[:1]])
+            li = side * ((t.w_right if side > 0 else t.w_left) - 0.55)
+            lo = side * ((t.w_right if side > 0 else t.w_left) - 0.05)
+            yi = t.surface_y(ring[:-1], li) + config.Y_LINE
+            yo = t.surface_y(ring[:-1], lo) + config.Y_LINE
+            yi = np.concatenate([yi, yi[:1]])
+            yo = np.concatenate([yo, yo[:1]])
             e = self._add(Entity(
                 parent=scene,
-                model=_strip_mesh(inner, outer, s, config.Y_LINE, config.Y_LINE,
-                                  1.0, 1.0),
+                model=_strip_mesh(inner, outer, s, yi, yo, 1.0, 1.0),
                 color=color.rgba(0.94, 0.94, 0.94, 1.0), double_sided=True))
 
         # --- tar seams across the track -------------------------------
@@ -314,10 +425,12 @@ class TrackScene:
         kerb_tex = textures.kerb()
         verts, uvs, tris = [], [], []
         for side in (+1, -1):
-            for inner, outer, seg in self._kerb_iter(side):
+            for inner, outer, seg, idx in self._kerb_iter(side):
+                w = (t.w_right if side > 0 else t.w_left)[idx]
+                yi = t.surface_y(idx, side * w) + config.Y_KERB
+                yo = t.surface_y(idx, side * (w + config.KERB_WIDTH))                     + config.Y_KERB + 0.03
                 _append_strip(verts, uvs, tris, inner, outer, seg,
-                              config.Y_KERB, config.Y_KERB + 0.03,
-                              KERB_UV_LEN, 1.0)
+                              yi, yo, KERB_UV_LEN, 1.0)
         if verts:
             self._add(Entity(
                 parent=scene, texture=kerb_tex, double_sided=True,
@@ -342,10 +455,12 @@ class TrackScene:
         a = p - nn * half_l
         b = p + nn * half_r
         d = fwd * 4.0
+        ya = float(t.surface_y(i0, -half_l)) + config.Y_START
+        yb = float(t.surface_y(i0, half_r)) + config.Y_START
         verts = [
-            (a[0], config.Y_START, a[1]), (b[0], config.Y_START, b[1]),
-            (b[0] + d[0], config.Y_START, b[1] + d[1]),
-            (a[0] + d[0], config.Y_START, a[1] + d[1]),
+            (a[0], ya, a[1]), (b[0], yb, b[1]),
+            (b[0] + d[0], yb, b[1] + d[1]),
+            (a[0] + d[0], ya, a[1] + d[1]),
         ]
         sf = self._add(Entity(
             parent=scene,
@@ -371,10 +486,11 @@ class TrackScene:
             b = c + n_ * t.w_right[i]
             d = tg * width
             k = len(verts)
-            y = config.Y_SEAM
-            verts += [(a[0], y, a[1]), (b[0], y, b[1]),
-                      (b[0] + d[0], y, b[1] + d[1]),
-                      (a[0] + d[0], y, a[1] + d[1])]
+            ya = float(t.surface_y(i, -t.w_left[i])) + config.Y_SEAM
+            yb = float(t.surface_y(i, t.w_right[i])) + config.Y_SEAM
+            verts += [(a[0], ya, a[1]), (b[0], yb, b[1]),
+                      (b[0] + d[0], yb, b[1] + d[1]),
+                      (a[0] + d[0], ya, a[1] + d[1])]
             cols += [col] * 4
             tris += [k, k + 1, k + 2, k, k + 2, k + 3]
         return Mesh(vertices=verts, triangles=tris, colors=cols,

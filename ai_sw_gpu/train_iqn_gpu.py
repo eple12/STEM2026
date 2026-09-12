@@ -216,6 +216,14 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu")
+    ap.add_argument("--stop-after-stale", type=int, default=0,
+                    help="stop once *_best has not improved for this many "
+                         "iterations, counted only after the first tier-0 "
+                         "eval. Past its peak this recipe does not plateau, "
+                         "it erodes -- measured on Spa, 1650 iterations past "
+                         "the best cost 2.6 s of lap time and took the "
+                         "policy from 0 to 12 off-track steps -- so the rest "
+                         "of the run is worse than useless. 0 disables.")
     ap.add_argument("--eval-workers", type=int, default=1,
                     help="concurrent --async-eval workers. One eval takes "
                          "longer than --eval-every iterations, and a new one "
@@ -508,6 +516,7 @@ def main():
         at = f"@it{it_at}" if hasattr(fut, "result") else ""
         if better:
             best_eval, best_tier = ev, tier
+            stale["since"] = it_at
             w, mean_np, std_np = w_snap
             savez_atomic(best_path, **w, obs_mean=mean_np, obs_std=std_np,
                      circuit=args.circuit, seen=np.int64(seen_at),
@@ -520,6 +529,7 @@ def main():
     # Ctrl-C / SIGTERM finishes the current iteration and then runs the
     # shutdown eval, rather than dropping the run wherever it happened to be.
     stop = {"asked": False}
+    stale = {"since": 0}          # iteration of the last *_best improvement
 
     def _on_signal(_sig, _frame):
         if stop["asked"]:                          # second one: go now
@@ -783,6 +793,14 @@ def main():
         last_it, last_seen = it + 1, seen + per_iter
         if args.state_every and (it + 1) % args.state_every == 0:
             dump_state()
+        if (args.stop_after_stale and best_tier == 0
+                and stale["since"]
+                and (it + 1) - stale["since"] >= args.stop_after_stale):
+            gap = (it + 1) - stale["since"]
+            print(f"\n[best has not improved since it{stale['since']}, "
+                  f"{gap} iterations ago -- stopping before the run erodes "
+                  f"what it found]", flush=True)
+            stop["asked"] = True
         if stop["asked"]:
             break
 

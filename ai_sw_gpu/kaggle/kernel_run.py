@@ -26,7 +26,14 @@ INPUT = Path("/kaggle/input")
 # Read by kaggle_push.sh when it writes the kernel; edit there, not here.
 CIRCUIT = os.environ.get("AISW_CIRCUIT", "Spa")
 OUT_NAME = os.environ.get("AISW_OUT", "Spa_v26d")
-EXTRA = os.environ.get("AISW_EXTRA", "--ddqn --stop-after-stale 600").split()
+EXTRA = os.environ.get(
+    "AISW_EXTRA",
+    # Boltzmann-revival experiment (2026-09-13) fired on schedule but never
+    # found a new best over a full decay window and briefly got dirtier --
+    # dropped. This run instead asks whether the raceline-pull itself
+    # (RL_LINE_K) is what keeps the driven line from finding a genuinely
+    # faster one, now that DDQN's stability fix is in the recipe.
+    "--ddqn --line-k 0 --stop-after-stale 600").split()
 
 print("=" * 64, flush=True)
 # Diagnostics must never be able to kill the run: nvidia-smi is absent from
@@ -46,6 +53,27 @@ if not CUDA:
     print("WARNING: no GPU attached. Check that the kernel metadata asked "
           "for one and that the account may use accelerators; this run would "
           "take days on CPU.", flush=True)
+elif CUDA and torch.cuda.get_device_capability(0) < (7, 0):
+    # This build's cu128 wheel only ships kernels for sm_70+, so a Pascal
+    # card (P100 = sm_60, sometimes assigned instead of the requested T4)
+    # cannot actually run anything -- every op raises at first use. Stop
+    # here with a clear reason rather than burning the GPU-hour quota on a
+    # traceback from deep inside the first matmul.
+    sys.exit(f"GPU {torch.cuda.get_device_name(0)} has compute capability "
+             f"{torch.cuda.get_device_capability(0)}, below what this torch "
+             f"build supports (7.0+). This happens when Kaggle assigns a "
+             f"P100 despite --accelerator NvidiaTeslaT4 -- push again, or "
+             f"check quota with `kaggle quota` and try later.")
+
+# Diagnostic dump, unconditional: which datasets are actually mounted and
+# under what path. Kaggle has mounted the same dataset at a different path
+# across two otherwise-identical pushes here (once as /kaggle/input/aisw-code,
+# once as /kaggle/input/datasets), so print the real layout every run instead
+# of only on failure.
+print("--- /kaggle/input ---", flush=True)
+for p in sorted(INPUT.glob("*")):
+    kids = sorted(x.name for x in p.iterdir())[:8] if p.is_dir() else []
+    print(f"  {p}  {'-> ' + ', '.join(kids) if kids else ''}", flush=True)
 print("=" * 64, flush=True)
 
 # -- get the code into place ----------------------------------------------
@@ -53,10 +81,13 @@ print("=" * 64, flush=True)
 # attachment is usually the extracted tree rather than the tarball we sent.
 # Take whichever turns up.
 WORK.mkdir(parents=True, exist_ok=True)
-tarballs = list(INPUT.glob("*/ai_sw_bench.tar.gz"))
+# Search a few levels deep rather than assuming one: the same dataset has
+# mounted at /kaggle/input/<slug>/... on one push and
+# /kaggle/input/datasets/<slug>/... on another.
+tarballs = list(INPUT.glob("**/ai_sw_bench.tar.gz"))
 # .parent is ai_sw_gpu; .parent.parent is the bundle root that holds
 # ai_sw/, ai_sw_gpu/ and the track data side by side.
-trees = [p.parent.parent for p in INPUT.glob("*/ai_sw_gpu/train_iqn_gpu.py")]
+trees = [p.parent.parent for p in INPUT.glob("**/ai_sw_gpu/train_iqn_gpu.py")]
 
 if tarballs:
     with tarfile.open(tarballs[0]) as tf:
@@ -90,13 +121,21 @@ for src in INPUT.glob(f"*/{OUT_NAME}*"):          # flattened output layout
 print(f"resuming from: {sorted(set(resumed)) or 'nothing, fresh run'}", flush=True)
 
 # -- train -----------------------------------------------------------------
+# The eval now runs as real separate PROCESSES (multiprocessing, not
+# threads -- see train_iqn_gpu.py), so it genuinely uses however many cores
+# are handed a worker each, unlike the old thread-based version where the
+# GIL serialised them regardless of core count. Training itself is
+# GPU-bound; leave the main process one core and give the rest to eval.
+n_eval_workers = max(1, (os.cpu_count() or 4) - 1)
+print(f"cpu_count={os.cpu_count()} -> --eval-workers {n_eval_workers}", flush=True)
+
 cmd = [sys.executable, "-u", str(WORK / "ai_sw_gpu" / "train_iqn_gpu.py"),
        "--circuit", CIRCUIT, "--steps", "15000000",
        "--envs", "112", "--rollout", "24",
        "--start-at-line", "0.20", "--target-sync", "48",
        "--eval-every", "25",
        "--device", "cuda" if CUDA else "cpu", "--eval-device", "cpu",
-       "--async-eval", "--eval-workers", "2",
+       "--async-eval", "--eval-workers", str(n_eval_workers),
        "--save-every", "5", "--state-every", "50", "--resume",
        *EXTRA, "--out-name", OUT_NAME]
 print("launching:", " ".join(cmd[1:]), flush=True)

@@ -497,19 +497,20 @@ RL_LINE_HI = 25.0
 # where the centreline term is already clipped flat and where "very slightly
 # off the line" actually happens.
 RL_EDGE_K = 0.090          # v26: back to v18's value -- v26 is "pure v18 reward
-                           #  + linear term", full v18 shaping.
-RL_EDGE_MARGIN = 1.0      # 2026-09-13: down from v18's 2.4. At a ~6.75 m
-                           #  per-side half-width that 2.4 m repulsion zone
-                           #  covered the outer ~36 % of legally usable track
-                           #  -- the policy paid a shaping cost for using a
-                           #  wide, fully legal strip nowhere near the white
-                           #  line, well short of where a real racing line
-                           #  would use the kerb. 1.0 m (~half the car's own
-                           #  width) shrinks that to the outer ~15 %, closer
-                           #  to "discourage only genuinely near the limit"
-                           #  without touching RL_EDGE_OUT_K/CAP or the
-                           #  off-track/recovery costs below, which are what
-                           #  actually induce PERFECT and are left alone.
+                           #  + linear term", full v18 shaping. Moot with
+                           #  MARGIN 0 below (nothing left for it to scale),
+                           #  kept only so a future non-zero margin has its
+                           #  slope ready-configured.
+RL_EDGE_MARGIN = 0.0      # 2026-09-13: 2.4 (v18) -> 1.0 -> 0.0. clip(edge-off,
+                           #  0, MARGIN) is identically 0 at MARGIN=0 for any
+                           #  position still on the track, so this term now
+                           #  costs NOTHING anywhere inside the white line --
+                           #  no shaping penalty for using any part of the
+                           #  legally available track, full width, right up
+                           #  to the line. RL_EDGE_OUT_K/CAP and the
+                           #  off-track/recovery costs below are UNCHANGED:
+                           #  those fire only once a wheel is actually past
+                           #  the line, which is what still induces PERFECT.
 # Beyond the white line the edge term above is flat zero, so there is no
 # potential gradient pulling a car that has *just* stepped out back onto the
 # road -- only the centreline term and the per-second fee, both weak in that

@@ -88,10 +88,46 @@ the handful of host syncs in the stale-hint fallback — so throughput scales
 almost linearly with the batch until something else gives. Reproduce with
 `tests/bench.py --device cuda`.
 
-**This measures environment stepping only**, which is what the CPU trainer is
-bottlenecked on. It is not a training-time speedup: the learner still runs 48
-gradient steps of batch 512 per iteration, and once the rollout is this cheap
-the learner is the bottleneck instead. That side has not been measured.
+Across three T4 sessions the 16384-env figure came out 421k / 359k / 373k
+decisions/s — instance-to-instance spread of about ±10 %.
+
+**This measures environment stepping only.** For training time see below;
+the two are not the same number.
+
+## Training time — `tests/bench_train.py`
+
+Times a whole iteration: `--rollout` decisions per environment, then 48
+gradient steps of batch 512. Measured on the same T4, against the CPU
+trainer's 10.7 s per 2688-decision iteration (`train_monza_v26.log`, it 1324
+at 237.0 min):
+
+```
+learner:   0.21 s per iteration (48 steps x batch 512)
+
+  envs  decisions  rollout s  total s  s/1k dec    vs CPU
+    14      2,688       7.21     7.41     2.757      1.4x
+  2048    393,216       8.63     8.84     0.022    177.2x
+  8192  1,572,864      11.52    11.73     0.007    533.8x
+```
+
+**The learner is not the bottleneck — it is 0.21 s, under 3 % of an
+iteration.** And at the CPU trainer's own shape (14 envs) the GPU is only
+**1.4×**, because the cost is 192 *sequential* environment steps at ~38 ms
+each and that does not shrink with the batch.
+
+So the headline 1687× is real but it is a throughput number, not a
+wall-clock one: it comes from putting 16384 cars through the same step, which
+is a different experiment. A 15 M-decision run at 8192 envs finishes in ~2
+minutes, but it is 9 iterations — 456 gradient steps against the CPU run's
+267,840. Decisions are not the thing that is scarce; gradient steps are.
+
+The lever that follows from these numbers is **rollout length, not
+environment count**: 2688 envs × 1 step per iteration collects the same 2688
+decisions per 48 gradient steps as the CPU run, in one ~44 ms env step plus
+0.21 s of learner ≈ 0.25 s, against 10.7 s. That is ~40× on the same
+data-to-gradient ratio. Projected from the two measured components, **not
+measured end to end** — run `bench_train.py --envs 2688 --rollout 1` to
+confirm before relying on it.
 
 ## Training
 

@@ -22,6 +22,7 @@ import math
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import numpy as np
@@ -183,6 +184,13 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu")
+    ap.add_argument("--async-eval", action="store_true",
+                    help="run the eval in a worker thread so the GPU keeps "
+                         "training through it. The result lands a few "
+                         "hundred iterations late and is logged with the "
+                         "iteration it actually measured.")
+    ap.add_argument("--save-every", type=int, default=1,
+                    help="iterations between running-checkpoint saves")
     ap.add_argument("--eval-device", default="cpu",
                     help="where the 7-launch greedy eval runs. Seven "
                          "environments stepped 2600 times sequentially is a "
@@ -291,21 +299,23 @@ def main():
           f"{iters} iters ({iters * per_iter:,} decisions)", flush=True)
 
     # -- greedy evaluation -------------------------------------------------
-    def greedy_eval(mean_t, std_t):
+    def greedy_eval(sd_cpu, mean_e, std_e):
         """Mean reach and the cleanliness tier over the seven fixed launches.
 
         All seven run in one batch: every launch truncates at the same
         ``EPISODE_SECONDS``, so they finish on the same step and nothing has
         to be frozen while the others catch up.
+
+        Takes a detached CPU snapshot of the weights rather than reading
+        ``online``, because with ``--async-eval`` this runs in a worker
+        thread while the learner keeps changing them. Everything it touches
+        -- ``eval_net``, ``eval_env`` -- belongs to that thread alone.
         """
         if eval_net is not None:
-            eval_net.load_state_dict(
-                {k: v.to(eval_device) for k, v in online.state_dict().items()})
+            eval_net.load_state_dict(sd_cpu)
             net = eval_net
         else:
             net = online
-        mean_e = mean_t.to(eval_device)
-        std_e = std_t.to(eval_device)
 
         fr = torch.tensor(EVAL_LAUNCHES, device=eval_device)
         o = eval_env.reset_grid(fr)
@@ -335,6 +345,61 @@ def main():
     h_act = torch.zeros(n_step, n_env, dtype=torch.long, device=device)
     h_rew = torch.zeros(n_step, n_env, device=device)
     h_cnt = torch.zeros(n_env, dtype=torch.long, device=device)
+
+    # An eval is ~54 s of CPU work on a snapshot of the weights, so there is
+    # no reason for the GPU to sit idle through it: hand it to a worker
+    # thread and collect the answer whenever it turns up. The torch CPU ops
+    # release the GIL, so it really does overlap. One at a time -- if the
+    # previous eval is still running the next is skipped rather than queued,
+    # because a backlog of stale evaluations helps nobody.
+    eval_pool = (ThreadPoolExecutor(max_workers=1, thread_name_prefix="eval")
+                 if args.async_eval else None)
+    pending = None              # (future, weights snapshot, iteration, seen)
+
+    def submit_eval(w_snapshot, it_at, seen_at):
+        sd_cpu = {k: v.detach().to(eval_device, copy=True)
+                  for k, v in online.state_dict().items()}
+        mean_e = obs_mean.to(torch.float32).to(eval_device)
+        std_e = torch.sqrt(obs_var).to(torch.float32).to(eval_device)
+        if eval_pool is None:
+            return (greedy_eval(sd_cpu, mean_e, std_e), w_snapshot, it_at,
+                    seen_at)
+        return (eval_pool.submit(greedy_eval, sd_cpu, mean_e, std_e),
+                w_snapshot, it_at, seen_at)
+
+    def harvest(entry, force=False):
+        """Turn a finished eval into the *_best ratchet and a log note.
+
+        The checkpoint written is the snapshot that was evaluated, not
+        whatever the learner has moved on to since.
+        """
+        nonlocal best_eval, best_tier
+        fut, w_snap, it_at, seen_at = entry
+        if eval_pool is not None:
+            if not (force or fut.done()):
+                return None, entry
+            ev, tier, rec_e, off_e, best_lap = fut.result()
+        else:
+            ev, tier, rec_e, off_e, best_lap = fut
+        better = tier < best_tier or (tier == best_tier and ev > best_eval)
+        TIER_TAG = {0: "PERFECT", 1: "off-track", 2: "wall/recover"}
+        bad = ",".join(f"{sf:.2f}" for sf, rc, os_ in
+                       zip(EVAL_LAUNCHES, rec_e, off_e)
+                       if rc > 0 or os_ > OFF_PERFECT_TOL)
+        tag = TIER_TAG[tier] + (f"@{bad}" if tier and bad
+                                else f"(off{int(off_e.max())})")
+        lap_s = f" lap{best_lap:5.1f}s" if best_lap > 0.0 else ""
+        at = f"@it{it_at}" if eval_pool is not None else ""
+        if better:
+            best_eval, best_tier = ev, tier
+            w, mean_np, std_np = w_snap
+            np.savez(best_path, **w, obs_mean=mean_np, obs_std=std_np,
+                     circuit=args.circuit, seen=np.int64(seen_at),
+                     best_eval=np.float32(best_eval),
+                     best_tier=np.int64(best_tier))
+            return f"  eval{at} {ev:5.0f}m {tag}{lap_s} *BEST*", None
+        return (f"  eval{at} {ev:5.0f}m {tag}{lap_s} "
+                f"(best {best_eval:.0f}T{best_tier})"), None
 
     learner_steps = 0
     best = 0.0
@@ -504,37 +569,30 @@ def main():
                             pt.mul_(1.0 - SOFT_TARGET_TAU).add_(
                                 SOFT_TARGET_TAU * po)
 
-        std_np = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
-        mean_np = obs_mean.to(torch.float32).cpu().numpy()
-        w_now = export(online)
-        np.savez(out_path, **w_now, obs_mean=mean_np, obs_std=std_np,
-                 circuit=args.circuit, seen=np.int64(seen + per_iter),
-                 best_eval=np.float32(best_eval),
-                 best_tier=np.int64(best_tier))
-
         eval_note = ""
-        if b_fill >= args.warmup and (it + 1) % args.eval_every == 0:
-            ev, tier, rec_e, off_e, best_lap = greedy_eval(
-                obs_mean.to(torch.float32), torch.sqrt(obs_var).to(torch.float32))
-            better = tier < best_tier or (tier == best_tier and ev > best_eval)
-            TIER_TAG = {0: "PERFECT", 1: "off-track", 2: "wall/recover"}
-            bad = ",".join(f"{sf:.2f}" for sf, rc, os_ in
-                           zip(EVAL_LAUNCHES, rec_e, off_e)
-                           if rc > 0 or os_ > OFF_PERFECT_TOL)
-            tag = TIER_TAG[tier] + (f"@{bad}" if tier and bad
-                                    else f"(off{int(off_e.max())})")
-            lap_s = f" lap{best_lap:5.1f}s" if best_lap > 0.0 else ""
-            if better:
-                best_eval, best_tier = ev, tier
-                np.savez(best_path, **w_now, obs_mean=mean_np,
-                         obs_std=std_np, circuit=args.circuit,
-                         seen=np.int64(seen + per_iter),
-                         best_eval=np.float32(best_eval),
-                         best_tier=np.int64(best_tier))
-                eval_note = f"  eval {ev:5.0f}m {tag}{lap_s} *BEST*"
-            else:
-                eval_note = (f"  eval {ev:5.0f}m {tag}{lap_s} "
-                             f"(best {best_eval:.0f}T{best_tier})")
+        due_eval = b_fill >= args.warmup and (it + 1) % args.eval_every == 0
+        last_iter = it == iters - 1
+        # export() walks every weight back to the host, so at a quarter of a
+        # second per iteration it is worth doing only when something needs it.
+        need_w = (due_eval or last_iter
+                  or (it + 1) % args.save_every == 0)
+        if need_w:
+            std_np = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
+            mean_np = obs_mean.to(torch.float32).cpu().numpy()
+            w_now = export(online)
+            np.savez(out_path, **w_now, obs_mean=mean_np, obs_std=std_np,
+                     circuit=args.circuit, seen=np.int64(seen + per_iter),
+                     best_eval=np.float32(best_eval),
+                     best_tier=np.int64(best_tier))
+
+        if pending is not None:
+            eval_note, pending = harvest(pending)
+            eval_note = eval_note or ""
+        if due_eval and pending is None:
+            pending = submit_eval((w_now, mean_np, std_np), it + 1,
+                                  seen + per_iter)
+            if eval_pool is None:
+                eval_note, pending = harvest(pending)
 
         if stat is not None:
             recent.append(stat.cpu().numpy())
@@ -557,6 +615,12 @@ def main():
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
                   f"warming up  eps {eps:.2f}  {mins:5.1f}m", flush=True)
+
+    if pending is not None:
+        note, _ = harvest(pending, force=True)
+        print(f"  (final){note}", flush=True)
+    if eval_pool is not None:
+        eval_pool.shutdown(wait=True)
 
     print(f"\nsaved {out_path}  (best greedy {best_eval:.0f} m -> "
           f"{best_path})", flush=True)

@@ -17,8 +17,9 @@ from .surface import VecSurface
 from .trackgpu import TrackGPU, config
 
 from game import rlpolicy                                  # noqa: E402
-from game.rlenv import (EPISODE_SECONDS, OFF_TRACK_PATIENCE,   # noqa: E402
-                        STALL_PATIENCE, STALL_SPEED)
+from game.rlenv import (EPISODE_SECONDS,                       # noqa: E402
+                        EPISODE_SECONDS_BY_CIRCUIT,
+                        OFF_TRACK_PATIENCE, STALL_PATIENCE, STALL_SPEED)
 
 ACTION_REPEAT = rlpolicy.ACTION_REPEAT
 N_ACTIONS = rlpolicy.N_ACTIONS
@@ -40,6 +41,8 @@ class VecRaceEnv:
         self.dt = dt
         self.randomise_start = randomise_start
         self.start_at_line = start_at_line
+        self.episode_seconds = EPISODE_SECONDS_BY_CIRCUIT.get(
+            circuit, EPISODE_SECONDS)
         self.gen = torch.Generator(device=self.device)
         self.gen.manual_seed(seed)
 
@@ -333,7 +336,7 @@ class VecRaceEnv:
             self._place(reason, i, frac)
 
         diverged = ~torch.isfinite(v.pos).all(dim=-1)
-        truncated = self.lap_time >= EPISODE_SECONDS
+        truncated = self.lap_time >= self.episode_seconds
         done = truncated | diverged
         reward = torch.where(diverged, zf, reward)
         return self.observe(), reward, done, {"truncated": truncated,

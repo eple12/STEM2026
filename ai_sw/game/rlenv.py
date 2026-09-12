@@ -50,6 +50,20 @@ from .vehicle import Controls, Vehicle
 #: the final sector is trained from grid starts, not only the scattered ones.
 EPISODE_SECONDS = 130.0
 
+#: ...and this has to grow with the circuit. The clean-lap bonus only fires
+#: when an episode contains TWO finish-line crossings, so the window has to
+#: hold a whole lap on top of wherever the car happened to start. At Monza
+#: (driven lap ~94 s) 130 s leaves the last ~28 % of the lap able to close
+#: one; hand the same 130 s to Spa, which is 21 % longer, and only the last
+#: ~12 % can, which quietly halves the reward the v26 recipe is built on.
+#: Sized at ~1.38x the DRIVEN lap, estimated as 0.78x the modelled lap from
+#: ``speed_profile`` (the ratio measured at Monza: 94 s driven vs 120.8 s
+#: modelled). Monza stays at exactly 130 s so every earlier run remains
+#: comparable.
+EPISODE_SECONDS_BY_CIRCUIT = {
+    "Spa": 160.0,          # modelled 149.0 s -> driven ~116 s
+}
+
 #: Seconds continuously off the track before the car is recovered onto the
 #: line. Zero tolerance (tried once) converged too slowly and never drove
 #: ``rec`` to 0 during training -- every ordinary kerb wobble mid-exploration
@@ -79,6 +93,10 @@ class RaceEnv:
         #: observation from the Gran Turismo Sport SAC paper.
         self.continuous = continuous
         self.track: Track = load_track(circuit)
+        #: Per-env so a longer circuit gets a longer window; the trace tools
+        #: raise it on the instance to watch several laps.
+        self.episode_seconds = EPISODE_SECONDS_BY_CIRCUIT.get(
+            circuit, EPISODE_SECONDS)
         self.surface = Surface(self.track)
         self.vehicle = Vehicle()
         self.dt = dt
@@ -460,7 +478,7 @@ class RaceEnv:
         #      onto the line is not itself a reward -----------------------
         reward += 0.0 if reason else (self._potential(i) - phi0)
 
-        truncated = self.lap_time >= EPISODE_SECONDS
+        truncated = self.lap_time >= self.episode_seconds
         done = truncated or terminal
         return self.observe(), float(reward), done, {
             "reason": reason or ("time" if truncated else ""),

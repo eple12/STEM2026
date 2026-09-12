@@ -478,9 +478,6 @@ def main():
     pending = []            # [(future, weights snapshot, iteration, seen)]
 
     def submit_eval(w_snapshot, it_at, seen_at):
-        if args.state_every:
-            dump_state()
-            print(f"  learner state saved -> {state_path.name}", flush=True)
         sd_cpu = {k: v.detach().to(eval_device, copy=True)
                   for k, v in online.state_dict().items()}
         mean_e = obs_mean.to(torch.float32).to(eval_device)
@@ -793,6 +790,8 @@ def main():
         last_it, last_seen = it + 1, seen + per_iter
         if args.state_every and (it + 1) % args.state_every == 0:
             dump_state()
+            print(f"  learner state saved -> {state_path.name} "
+                  f"(it{it + 1}, {b_fill:,} buffered)", flush=True)
         if (args.stop_after_stale and best_tier == 0
                 and stale["since"]
                 and (it + 1) - stale["since"] >= args.stop_after_stale):

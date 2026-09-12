@@ -446,6 +446,14 @@ RL_RL_LAP_OFF_TOL = 3        # off-steps a lap may have and still count as clean
 # and converged clean-but-SLOW (181 km/h). v20: back to Linesight's 0.10 --
 # turns out this mild pull keeps the car on a consistent efficient line, which
 # is what let v18 reach 215 km/h. The lap-time bonus is the speed driver now.
+#: Of grid-start resets, the fraction drawn from a near-zero launch-speed
+#: band instead of the full uniform(0, 0.95) range, and how wide that band
+#: is. 2026-09-13: raised from the ~1-in-20 a plain uniform draw gave, after
+#: the deployed policy was observed being visibly conservative off a literal
+#: standing start -- plausibly undertrained on that exact narrow state.
+RL_LAUNCH_STOP_FRAC = 0.35
+RL_LAUNCH_STOP_MAX = 0.15
+
 RL_LINE_K = 0.10           # v25: RESTORED to v18/Linesight. v24 (K=0) drove a
                            #  wider line that eval'd 10 s slower than v18 (105 s
                            #  vs 94.45 s) at the same cleanliness -- on this

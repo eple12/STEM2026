@@ -189,8 +189,16 @@ class VecRaceEnv:
         i = torch.where(scatter, i_rand, torch.zeros_like(i_rand))
         u = torch.rand(self.n, generator=self.gen, device=self.device)
         # Scattered starts roll in at speed; a grid start covers the launch
-        # itself, so 0.0 is in range on purpose.
-        frac = torch.where(scatter, 0.55 + 0.40 * u, 0.95 * u)
+        # itself, so 0.0 is in range on purpose. And it needs to come up
+        # often enough to be learned, not just tolerated -- see
+        # RL_LAUNCH_STOP_FRAC in the CPU rlenv.reset(), which this mirrors:
+        # a plain uniform(0, 0.95) draw put a true near-standing launch in
+        # only about 1 in 20 grid starts.
+        stop_pick = torch.rand(self.n, generator=self.gen, device=self.device)
+        stop_bias = stop_pick < config.RL_LAUNCH_STOP_FRAC
+        grid_frac = torch.where(stop_bias, u * config.RL_LAUNCH_STOP_MAX,
+                                u * 0.95)
+        frac = torch.where(scatter, 0.55 + 0.40 * u, grid_frac)
         self._place(m, i, frac)
         self.start_s = torch.where(m, self._last_s, self.start_s)
         return self.observe()

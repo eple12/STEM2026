@@ -233,7 +233,20 @@ class RaceEnv:
             # trained on -- and it grazed the wall on exactly that lap while
             # every synthetic (already-at-speed) start it was scored against
             # stayed clean. 0.0 is in range on purpose.
-            speed_frac = float(self.rng.uniform(0.0, 0.95))
+            #
+            # But it was barely IN range: uniform(0, 0.95) puts a true
+            # near-standing launch (speed_frac < ~0.05) in about 1 in 20 grid
+            # starts, and grid starts are themselves only start_at_line of
+            # all resets (~20%) -- under 1% of everything the network ever
+            # sees. A launch-specific behaviour (commit to full throttle
+            # immediately) gets correspondingly little gradient signal.
+            # RL_LAUNCH_STOP_FRAC of grid starts now draw from a narrow
+            # near-zero band instead, so standing starts are seen often
+            # enough to be learned rather than merely tolerated.
+            if self.rng.random() < config.RL_LAUNCH_STOP_FRAC:
+                speed_frac = float(self.rng.uniform(0.0, config.RL_LAUNCH_STOP_MAX))
+            else:
+                speed_frac = float(self.rng.uniform(0.0, 0.95))
         self._place(i, speed_frac)
         self.start_s = self._last_s
         return self.observe()

@@ -23,8 +23,7 @@ import os
 import signal
 import sys
 import time
-from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
+import multiprocessing
 from pathlib import Path
 
 import numpy as np
@@ -72,9 +71,6 @@ OFF_PERFECT_TOL = 2
 KAPPA = 5e-3
 IQN_N = 8
 A_EMB, E = IQN_EMBED, 256
-#: How many of an iteration's finished episodes to spell out before the
-#: columns turn into '+N'.
-EPISODE_COLS = 6
 
 
 class IQN(nn.Module):
@@ -117,6 +113,80 @@ class IQN(nn.Module):
         v = self.V(mixed)
         q = v + a - a.mean(-1, keepdim=True)
         return q.mean(1)
+
+
+class _AsyncAdapter:
+    """A ``multiprocessing.pool.AsyncResult`` wearing a
+    ``concurrent.futures.Future`` costume -- only the ``.done()``/``.result()``
+    surface ``harvest()`` needs, so swapping the eval backend did not require
+    touching the harvesting logic at all.
+    """
+    __slots__ = ("_ar",)
+
+    def __init__(self, ar):
+        self._ar = ar
+
+    def done(self):
+        return self._ar.ready()
+
+    def result(self):
+        return self._ar.get()
+
+
+# Per-process eval state, set once by _eval_proc_init and read by
+# _eval_proc_run. Module-level because a Pool worker (its own process, no
+# shared memory with the trainer) can only receive picklable callables -- a
+# bound method or closure over local state would not survive the pickle.
+_EW: dict = {}
+
+
+def _eval_proc_init(circuit, eval_device_str):
+    """Pool initializer: build this worker's own eval env/net once.
+
+    Runs in a fresh process -- no CUDA context, no state shared with the
+    trainer. Single-threaded on purpose: the eval batch is seven launches,
+    far too small for intra-op threading to help, and with several worker
+    PROCESSES each spinning up its own multi-threaded ops the same handful
+    of cores would be oversubscribed by all of them at once.
+    """
+    torch.set_num_threads(1)
+    device = torch.device(eval_device_str)
+    track = TrackGPU(circuit, device)
+    env = VecRaceEnv(circuit, len(EVAL_LAUNCHES), seed=99_991,
+                     randomise_start=False, device=device, track=track)
+    net = IQN().to(device)
+    _EW["env"], _EW["net"], _EW["device"] = env, net, device
+
+
+def _eval_proc_run(sd_np, mean_np, std_np):
+    """The seven-launch greedy eval of one weight snapshot, using this
+    process's own env/net (see ``_eval_proc_init``). Everything in and out
+    is plain numpy/python so it pickles cheaply across the process boundary.
+    """
+    env, net, device = _EW["env"], _EW["net"], _EW["device"]
+    net.load_state_dict({k: torch.as_tensor(v, device=device)
+                         for k, v in sd_np.items()})
+    mean_e = torch.as_tensor(mean_np, device=device)
+    std_e = torch.as_tensor(std_np, device=device)
+    fr = torch.tensor(EVAL_LAUNCHES, device=device)
+    o = env.reset_grid(fr)
+    with torch.no_grad():
+        while True:
+            x = ((o - mean_e) / std_e.clamp(min=1e-4)).clamp(-10.0, 10.0)
+            a = net.q_mean(x).argmax(1)
+            o, _, d, _ = env.step(a)
+            if bool(d.all()):
+                break
+    reach, rec, off = env.progress, env.recoveries, env.off_steps
+    tier = 0
+    if bool((rec > 0).any()):
+        tier = 2
+    elif bool((off > OFF_PERFECT_TOL).any()):
+        tier = 1
+    laps = env.best_lap_time[env.best_lap_time > 0]
+    best_lap = float(laps.min()) if laps.numel() else 0.0
+    return (float(reach.mean()), tier, rec.cpu().numpy(), off.cpu().numpy(),
+            best_lap)
 
 
 def iqn_loss(tgt, out, tau_out):
@@ -206,6 +276,13 @@ def main():
     ap.add_argument("--grad-steps", type=int, default=48)
     ap.add_argument("--buffer", type=int, default=150_000)
     ap.add_argument("--warmup", type=int, default=20_000)
+    ap.add_argument("--line-k", type=float, default=None,
+                    help="override config.RL_LINE_K for this run only (the "
+                         "potential-shaping pull toward the raceline/shape "
+                         "line). Does not touch config.py, so the default "
+                         "recipe used elsewhere is unaffected. E.g. 0 to "
+                         "test whether the pull is what keeps the driven "
+                         "line from deviating toward a genuinely faster one.")
     ap.add_argument("--out-name", default=None)
     ap.add_argument("--eval-every", type=int, default=25)
     ap.add_argument("--target-sync", type=int, default=48)
@@ -278,6 +355,10 @@ def main():
 
     device = torch.device(args.device)
     torch.manual_seed(args.seed)
+    if args.line_k is not None:
+        print(f"overriding config.RL_LINE_K: {config.RL_LINE_K} -> "
+              f"{args.line_k}", flush=True)
+        config.RL_LINE_K = args.line_k
 
     online, target = IQN().to(device), IQN().to(device)
     target.load_state_dict(online.state_dict())
@@ -299,22 +380,21 @@ def main():
     # what a GPU is for -- the kernels are trivial and the wall clock is all
     # launch latency and host syncs, which measured ~7x slower per step than
     # the same code at 16384 environments. Seven environments of numpy-sized
-    # work belong on the CPU, so the eval keeps its own CPU track and a CPU
-    # copy of the network.
+    # work belong on the CPU.
+    #
+    # And they belong in separate PROCESSES, not threads: the eval loop is a
+    # tight Python while-loop around tiny tensor ops, and those ops do not
+    # hold the GIL released long enough for Python threads to actually run
+    # on separate cores -- --eval-workers as threads bought more evals fitting
+    # inside --eval-every, not each eval finishing any faster, because the
+    # GIL was still serialising the interpreted loop between them. A process
+    # pool sidesteps the GIL entirely; each worker builds its own env/net
+    # once (_eval_proc_init) and evaluates snapshots handed to it as plain
+    # numpy (_eval_proc_run).
     eval_device = torch.device(args.eval_device)
-    eval_track = (track if eval_device == device
-                  else TrackGPU(args.circuit, eval_device))
-    # One (env, net) pair per worker: they run concurrently, so sharing
-    # either would be a race. Seven CPU environments and a copy of a small
-    # net cost almost nothing; the track tensors are read-only and shared.
     n_workers = max(1, args.eval_workers) if args.async_eval else 1
-    eval_pairs = Queue()
-    for w in range(n_workers):
-        eval_pairs.put((
-            VecRaceEnv(args.circuit, len(EVAL_LAUNCHES), seed=99_991,
-                       randomise_start=False, device=eval_device,
-                       track=eval_track),
-            IQN().to(eval_device) if eval_device != device else online))
+    _eval_proc_init(args.circuit, args.eval_device)  # this process's own,
+                                                      # used when there is no pool
 
     # Stagger the first episode so the 130 s truncations do not all land in
     # the same iteration forever -- they never desync on their own.
@@ -439,48 +519,6 @@ def main():
           f"{N_ACTIONS} actions, {n_env} envs, {per_iter} decisions/iter, "
           f"{iters} iters ({iters * per_iter:,} decisions)", flush=True)
 
-    # -- greedy evaluation -------------------------------------------------
-    def greedy_eval(sd_cpu, mean_e, std_e):
-        """Mean reach and the cleanliness tier over the seven fixed launches.
-
-        All seven run in one batch: every launch truncates at the same
-        ``EPISODE_SECONDS``, so they finish on the same step and nothing has
-        to be frozen while the others catch up.
-
-        Takes a detached CPU snapshot of the weights rather than reading
-        ``online``, because with ``--async-eval`` this runs in a worker
-        thread while the learner keeps changing them. Everything it touches
-        -- ``eval_net``, ``eval_env`` -- belongs to that thread alone.
-        """
-        eval_env, net = eval_pairs.get()
-        try:
-            if net is not online:
-                net.load_state_dict(sd_cpu)
-
-            fr = torch.tensor(EVAL_LAUNCHES, device=eval_device)
-            o = eval_env.reset_grid(fr)
-            with torch.no_grad():
-                while True:
-                    x = ((o - mean_e) / std_e.clamp(min=1e-4)).clamp(-10.0, 10.0)
-                    a = net.q_mean(x).argmax(1)
-                    o, _, d, _ = eval_env.step(a)
-                    if bool(d.all()):
-                        break
-            reach = eval_env.progress
-            rec = eval_env.recoveries
-            off = eval_env.off_steps
-            tier = 0
-            if bool((rec > 0).any()):
-                tier = 2
-            elif bool((off > OFF_PERFECT_TOL).any()):
-                tier = 1
-            laps = eval_env.best_lap_time[eval_env.best_lap_time > 0]
-            best_lap = float(laps.min()) if laps.numel() else 0.0
-            return (float(reach.mean()), tier, rec.cpu().numpy(),
-                    off.cpu().numpy(), best_lap)
-        finally:
-            eval_pairs.put((eval_env, net))
-
     # -- n-step history ----------------------------------------------------
     n_step = args.n_step
     h_obs = torch.zeros(n_step, n_env, OBS_DIM, device=device)
@@ -493,24 +531,26 @@ def main():
 
     # An eval is ~54 s of CPU work on a snapshot of the weights, so there is
     # no reason for the GPU to sit idle through it: hand it to a worker
-    # thread and collect the answer whenever it turns up. The torch CPU ops
-    # release the GIL, so it really does overlap. One at a time -- if the
-    # previous eval is still running the next is skipped rather than queued,
-    # because a backlog of stale evaluations helps nobody.
-    eval_pool = (ThreadPoolExecutor(max_workers=n_workers,
-                                    thread_name_prefix="eval")
+    # process and collect the answer whenever it turns up. One eval per
+    # worker at a time -- if a worker's previous eval is still running the
+    # next submission is skipped rather than queued (len(pending) <
+    # n_workers gates it), because a backlog of stale evaluations helps
+    # nobody.
+    eval_pool = (multiprocessing.Pool(n_workers, initializer=_eval_proc_init,
+                                      initargs=(args.circuit, args.eval_device))
                  if args.async_eval else None)
     pending = []            # [(future, weights snapshot, iteration, seen)]
 
     def submit_eval(w_snapshot, it_at, seen_at):
-        sd_cpu = {k: v.detach().to(eval_device, copy=True)
-                  for k, v in online.state_dict().items()}
-        mean_e = obs_mean.to(torch.float32).to(eval_device)
-        std_e = torch.sqrt(obs_var).to(torch.float32).to(eval_device)
+        sd_np = {k: v.detach().cpu().numpy()
+                 for k, v in online.state_dict().items()}
+        emean = obs_mean.to(torch.float32).cpu().numpy()
+        estd = torch.sqrt(obs_var).to(torch.float32).cpu().numpy()
         if eval_pool is None:
-            return (greedy_eval(sd_cpu, mean_e, std_e), w_snapshot, it_at,
+            return (_eval_proc_run(sd_np, emean, estd), w_snapshot, it_at,
                     seen_at)
-        return (eval_pool.submit(greedy_eval, sd_cpu, mean_e, std_e),
+        return (_AsyncAdapter(eval_pool.apply_async(
+                    _eval_proc_run, (sd_np, emean, estd))),
                 w_snapshot, it_at, seen_at)
 
     def harvest(entry, force=False):
@@ -570,7 +610,7 @@ def main():
     learner_steps = learner_steps0
     last_it = last_seen = 0
     best = 0.0
-    last_cols = None      # episode columns from the last iteration that had any
+    recent = []            # last ~40 completed episodes, for the rolling mean
     eps_sched = EPS_SCHED_WARM if args.init_from else EPS_SCHED
     lr_sched = ([(0, 3e-4), (2_000_000, 1e-4), (5_000_000, 5e-5)]
                 if args.init_from else LR_SCHED)
@@ -805,33 +845,27 @@ def main():
                 pending.append(entry)
         eval_note = "".join(notes)
 
-        # The episode columns report the episodes that ENDED THIS ITERATION,
-        # not a rolling mean: a mean over the last 40 keeps showing numbers
-        # from a policy several hundred iterations old, which is precisely
-        # when you want to see that something just changed. Each episode is
-        # listed; an iteration where none ended repeats the last line's
-        # values, and `n0` says that is what happened.
+        # Rolling mean over the last ~40 completed episodes, matching the CPU
+        # trainer: `n` is how many episodes the average is over, `+k` how
+        # many of them ended just now.
         if stat is not None and len(stat):
-            r = stat.cpu().numpy()
-            k = len(r)
-            show = r[:EPISODE_COLS]
-            more = "" if k <= EPISODE_COLS else f"+{k - EPISODE_COLS}"
-            j = lambda col, f: "/".join(format(v, f) for v in col) + more  # noqa: E731
-            last_cols = (j(show[:, 0], ".0f"), j(show[:, 3] * 3.6, ".1f"),
-                         j(show[:, 1], ".0f"), j(show[:, 4] * 100, ".1f"),
-                         f"{r[:, 2].max():.0f}", k)
+            recent.append(stat.cpu().numpy())
+            allr = np.concatenate(recent)[-40:]
+            recent[:] = [allr]
         mins = (time.perf_counter() - t0) / 60.0
-        if last_cols is not None:
-            dist, sp, rc, of, laps, k = last_cols
-            n = k if (stat is not None and len(stat)) else 0
+        if recent:
+            r = recent[0]
+            dist, rc, _, sp, of = r.mean(0)
+            laps = r[:, 2].max()
+            k = len(stat) if stat is not None else 0
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
-                  f"dist {dist:>5s}  spd {sp:>5s}  rec {rc:>3s}  "
-                  f"off {of:>4s}%  laps {laps}  "
+                  f"dist {dist:5.0f}  spd {sp*3.6:5.1f}  rec {rc:4.1f}  "
+                  f"off {of*100:4.1f}%  laps {laps:.0f}  "
                   f"eps {eps:.2f}  oS {off_scale:.1f}  pc {pace_mult:.2f}  "
                   f"g {gamma:.4f}  "
                   f"loss {loss_acc/max(args.grad_steps,1):.3f}  "
-                  f"n{n:d}  {mins:5.1f}m{eval_note}", flush=True)
+                  f"n{len(r):2d}+{k:d}  {mins:5.1f}m{eval_note}", flush=True)
         else:
             print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                   f"buf {b_fill:>7,}  reach {reach:5.0f}/{best:5.0f} m  "
@@ -859,7 +893,8 @@ def main():
         print(f"  (in flight){note}", flush=True)
     pending = []
     if eval_pool is not None:
-        eval_pool.shutdown(wait=True)
+        eval_pool.close()
+        eval_pool.join()
 
     # ...and then evaluate the weights we are ACTUALLY stopping with. Async
     # evals are skipped while one is running, so without this the last
@@ -877,11 +912,9 @@ def main():
         if args.state_every:
             dump_state()
             print(f"  learner state saved -> {state_path.name}", flush=True)
-        sd_cpu = {k: v.detach().to(eval_device, copy=True)
-                  for k, v in online.state_dict().items()}
-        res = greedy_eval(sd_cpu,
-                          torch.as_tensor(mean_np, device=eval_device),
-                          torch.as_tensor(std_np, device=eval_device))
+        sd_np = {k: v.detach().cpu().numpy()
+                 for k, v in online.state_dict().items()}
+        res = _eval_proc_run(sd_np, mean_np, std_np)
         note, _ = harvest((res, (w_final, mean_np, std_np), last_it, last_seen))
         print(f"  (stop){note}", flush=True)
 

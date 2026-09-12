@@ -61,6 +61,20 @@ continuation rather than a restart; without the state file a resume drops a
 trained policy into an empty buffer at gamma 1.0 and undoes its own
 progress.
 
+## Accelerators need phone verification
+
+`enable_gpu` in the metadata, `machine_shape`, and `kaggle kernels push
+--accelerator` were all set, the stored kernel metadata read them back
+correctly — and the run still came up on `torch 2.10.0+cpu` with no
+`nvidia-smi`. Kaggle gates GPU and TPU behind **SMS phone verification**
+(Settings → Phone Verification); until that is done the accelerator request
+is silently ignored rather than refused, so a kernel looks like it started
+fine and is simply running on a CPU. VoIP numbers are commonly rejected, so
+use a carrier-backed one.
+
+`kernel_run.py` checks `torch.cuda.is_available()` and says so loudly rather
+than quietly spending hours of quota on a CPU.
+
 ## Notes
 
 - `enable_internet` is off. Kaggle requires phone verification to turn it

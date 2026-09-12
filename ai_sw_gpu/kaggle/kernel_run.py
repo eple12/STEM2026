@@ -29,22 +29,51 @@ OUT_NAME = os.environ.get("AISW_OUT", "Spa_v26d")
 EXTRA = os.environ.get("AISW_EXTRA", "--ddqn --stop-after-stale 600").split()
 
 print("=" * 64, flush=True)
-subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"])
+# Diagnostics must never be able to kill the run: nvidia-smi is absent from
+# the image when no accelerator is attached, and an unguarded call to it
+# took a whole kernel down before it trained a single step.
+try:
+    subprocess.run(["nvidia-smi", "--query-gpu=name,memory.total",
+                    "--format=csv,noheader"], check=False)
+except FileNotFoundError:
+    print("no nvidia-smi on this image", flush=True)
+
 import torch
-print(f"torch {torch.__version__}  cuda={torch.cuda.is_available()}  "
-      f"{torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU ONLY'}",
-      flush=True)
+CUDA = torch.cuda.is_available()
+print(f"torch {torch.__version__}  cuda={CUDA}  "
+      f"{torch.cuda.get_device_name(0) if CUDA else 'CPU ONLY'}", flush=True)
+if not CUDA:
+    print("WARNING: no GPU attached. Check that the kernel metadata asked "
+          "for one and that the account may use accelerators; this run would "
+          "take days on CPU.", flush=True)
 print("=" * 64, flush=True)
 
-# -- unpack the code -------------------------------------------------------
-tarballs = list(INPUT.glob("*/ai_sw_bench.tar.gz"))
-if not tarballs:
-    sys.exit("no ai_sw_bench.tar.gz among the attached datasets")
+# -- get the code into place ----------------------------------------------
+# Kaggle expands an uploaded archive when it publishes a dataset, so the
+# attachment is usually the extracted tree rather than the tarball we sent.
+# Take whichever turns up.
 WORK.mkdir(parents=True, exist_ok=True)
-with tarfile.open(tarballs[0]) as tf:
-    tf.extractall(WORK)
+tarballs = list(INPUT.glob("*/ai_sw_bench.tar.gz"))
+# .parent is ai_sw_gpu; .parent.parent is the bundle root that holds
+# ai_sw/, ai_sw_gpu/ and the track data side by side.
+trees = [p.parent.parent for p in INPUT.glob("*/ai_sw_gpu/train_iqn_gpu.py")]
+
+if tarballs:
+    with tarfile.open(tarballs[0]) as tf:
+        tf.extractall(WORK)
+    print(f"unpacked {tarballs[0]}", flush=True)
+elif trees:
+    for item in trees[0].iterdir():
+        dst = WORK / item.name
+        if item.is_dir():
+            shutil.copytree(item, dst, dirs_exist_ok=True)
+        else:
+            shutil.copy(item, dst)
+    print(f"copied the extracted tree from {trees[0]}", flush=True)
+else:
+    print("attached inputs:", [str(p) for p in INPUT.glob("*")], flush=True)
+    sys.exit("no ai_sw code among the attached datasets")
 POLICIES.mkdir(parents=True, exist_ok=True)
-print(f"unpacked {tarballs[0]}", flush=True)
 
 # -- carry a previous run forward, if one is attached ----------------------
 # A kernel's own output shows up as an input on the next run, so a run that
@@ -65,7 +94,8 @@ cmd = [sys.executable, "-u", str(WORK / "ai_sw_gpu" / "train_iqn_gpu.py"),
        "--circuit", CIRCUIT, "--steps", "15000000",
        "--envs", "112", "--rollout", "24",
        "--start-at-line", "0.20", "--target-sync", "48",
-       "--eval-every", "25", "--device", "cuda", "--eval-device", "cpu",
+       "--eval-every", "25",
+       "--device", "cuda" if CUDA else "cpu", "--eval-device", "cpu",
        "--async-eval", "--eval-workers", "2",
        "--save-every", "5", "--state-every", "50", "--resume",
        *EXTRA, "--out-name", OUT_NAME]

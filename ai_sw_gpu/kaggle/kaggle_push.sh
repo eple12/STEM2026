@@ -19,7 +19,7 @@ CIRCUIT="${2:-Spa}"
 OUT_NAME="${3:-${CIRCUIT}_v26d}"
 RESUME_FROM="${4:-}"
 
-REPO="/mnt/c/Users/user/Desktop/WorkSpace/Dongari/STEM2026"
+REPO="${AISW_REPO:-/mnt/c/Users/user/Desktop/WorkSpace/Dongari/STEM2026}"
 STAGE="$HOME/aisw_kaggle"
 DS_SLUG="aisw-code"
 K_SLUG="aisw-$(echo "$OUT_NAME" | tr '[:upper:]_' '[:lower:]-')"
@@ -28,10 +28,13 @@ export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:
 
 echo "=== bundling the code ==="
 rm -rf "$STAGE"; mkdir -p "$STAGE/data" "$STAGE/kernel"
-tar czf "$STAGE/data/ai_sw_bench.tar.gz" -C "$REPO" \
-  ai_sw/game/*.py ai_sw/tools/train_iqn.py ai_sw/assets/racelines \
-  "Neural_Network_NEAT-master/new/f1tenth_racetracks-main/$CIRCUIT" \
-  ai_sw_gpu/gpuenv ai_sw_gpu/tests ai_sw_gpu/train_iqn_gpu.py
+# cd rather than tar -C: the globs are expanded by the shell, in the shell's
+# directory, so -C would have tar looking in the right place for paths that
+# never matched anything.
+( cd "$REPO" && tar czf "$STAGE/data/ai_sw_bench.tar.gz" \
+    ai_sw/game/*.py ai_sw/tools/train_iqn.py ai_sw/assets/racelines \
+    "Neural_Network_NEAT-master/new/f1tenth_racetracks-main/$CIRCUIT" \
+    ai_sw_gpu/gpuenv ai_sw_gpu/tests ai_sw_gpu/train_iqn_gpu.py )
 ls -la "$STAGE/data/ai_sw_bench.tar.gz"
 
 cat > "$STAGE/data/dataset-metadata.json" <<JSON
@@ -43,11 +46,23 @@ cat > "$STAGE/data/dataset-metadata.json" <<JSON
 JSON
 
 echo "=== publishing the dataset ==="
-if kaggle datasets status "$USER_SLUG/$DS_SLUG" >/dev/null 2>&1; then
+if kaggle datasets status "$USER_SLUG/$DS_SLUG" 2>/dev/null | grep -q .; then
   kaggle datasets version -p "$STAGE/data" -m "code $(date '+%Y-%m-%d %H:%M')" --dir-mode zip
 else
   kaggle datasets create -p "$STAGE/data" --dir-mode zip
 fi
+
+# Publishing is asynchronous. Push the kernel before the dataset is ready and
+# Kaggle drops the attachment -- "not valid dataset sources" -- and the run
+# starts with no code to run.
+echo -n "waiting for the dataset to be ready"
+for _ in $(seq 1 60); do
+  ST=$(kaggle datasets status "$USER_SLUG/$DS_SLUG" 2>/dev/null | tr -d '[:space:]')
+  [ "$ST" = "ready" ] && { echo " -> ready"; break; }
+  echo -n "."
+  sleep 10
+done
+[ "${ST:-}" = "ready" ] || { echo; echo "dataset never became ready (last: ${ST:-none})"; exit 1; }
 
 echo "=== writing the kernel ==="
 # The circuit/out-name are baked in here because a script kernel takes no
@@ -83,7 +98,10 @@ JSON
 cat "$STAGE/kernel/kernel-metadata.json"
 
 echo "=== pushing (this starts the run) ==="
-kaggle kernels push -p "$STAGE/kernel"
+# --accelerator as well as the metadata: a push that set only enable_gpu in
+# kernel-metadata.json came back on a CPU image (torch 2.10.0+cpu), even
+# though the stored metadata read enable_gpu true.
+kaggle kernels push -p "$STAGE/kernel" --accelerator "${ACCEL:-nvidiaTeslaT4}"
 
 echo
 echo "kernel: $USER_SLUG/$K_SLUG"

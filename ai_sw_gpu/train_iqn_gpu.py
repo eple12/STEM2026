@@ -161,6 +161,21 @@ def savez_atomic(path, **kw):
     os.replace(tmp, path)
 
 
+def save_state(path, **kw):
+    """The whole learner state, next to the weights-only .npz.
+
+    ``<name>.npz`` stays exactly the format the game loads -- weights and obs
+    statistics, nothing else. Everything a resume needs to continue rather
+    than restart lives here instead: the replay buffer, the target network,
+    the Adam moments, the n-step window. Without them a resume drops a
+    trained policy into an empty buffer with a fresh optimiser and undoes its
+    own progress, which is exactly what the interrupted Monza run did.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    torch.save(kw, tmp)
+    os.replace(tmp, path)
+
+
 def load_into(net, d, device):
     sd = net.state_dict()
     for tk, nk in _NAME_MAP.items():
@@ -204,6 +219,12 @@ def main():
                          "iteration it actually measured.")
     ap.add_argument("--save-every", type=int, default=1,
                     help="iterations between running-checkpoint saves")
+    ap.add_argument("--state-every", type=int, default=0,
+                    help="iterations between full learner-state saves "
+                         "(replay buffer + target net + optimiser + n-step "
+                         "window) to <name>_state.pt, so --resume continues "
+                         "instead of restarting. 0 disables. The file is "
+                         "~75 MB at the default buffer size.")
     ap.add_argument("--resume-warmup", type=int, default=None,
                     help="on --resume, collect this many transitions before "
                          "learning again (default: half the buffer). The "
@@ -291,8 +312,11 @@ def main():
             obs_n = 1e5
         print(f"warm-started from {ip.name}", flush=True)
 
+    state_path = config.RL_POLICY / f"{name}_state.pt"
     resume_seen = 0
     warmup_now = args.warmup
+    learner_steps0 = 0
+    h_state = None
     best_eval, best_tier = 0.0, 3
     if args.resume and out_path.exists():
         dR = np.load(out_path, allow_pickle=False)
@@ -311,16 +335,51 @@ def main():
                 bsrc = bd
         if "best_eval" in bsrc.files:
             best_eval, best_tier = float(bsrc["best_eval"]), int(bsrc["best_tier"])
-        # The replay buffer is not saved, so a resumed run starts with an
-        # empty one. Learning from a nearly empty, highly correlated buffer
-        # at gamma 1.0 is how a resumed run undoes its own progress, so
-        # refill a decent fraction of it before touching the weights.
-        warmup_now = (args.buffer // 2 if args.resume_warmup is None
-                      else args.resume_warmup)
-        warmup_now = max(warmup_now, args.warmup)
-        print(f"resumed {out_path.name} at {resume_seen:,} decisions "
-              f"(best {best_eval:.0f} T{best_tier}); refilling the buffer to "
-              f"{warmup_now:,} before learning", flush=True)
+        # If the full learner state survived, this is a continuation rather
+        # than a restart: buffer, target net, Adam moments and the n-step
+        # window all come back and nothing has to be re-warmed.
+        restored = False
+        if state_path.exists():
+            try:
+                st = torch.load(state_path, map_location=device,
+                                weights_only=False)
+                if int(st.get("cap", -1)) == cap and \
+                        int(st.get("obs_dim", -1)) == OBS_DIM:
+                    b_obs.copy_(st["b_obs"]); b_next.copy_(st["b_next"])
+                    b_act.copy_(st["b_act"]); b_ret.copy_(st["b_ret"])
+                    b_gam.copy_(st["b_gam"]); b_done.copy_(st["b_done"])
+                    b_fill, b_pos = int(st["b_fill"]), int(st["b_pos"])
+                    target.load_state_dict(st["target"])
+                    opt.load_state_dict(st["opt"])
+                    obs_mean[:] = st["obs_mean"].to(device)
+                    obs_var[:] = st["obs_var"].to(device)
+                    obs_n = float(st["obs_n"])
+                    learner_steps0 = int(st.get("learner_steps", 0))
+                    h_state = st.get("hist")
+                    restored = True
+                else:
+                    print("  state file does not match this configuration, "
+                          "ignoring it", flush=True)
+            except Exception as e:                       # noqa: BLE001
+                print(f"  could not read {state_path.name}: {e}", flush=True)
+
+        if restored:
+            print(f"resumed {out_path.name} at {resume_seen:,} decisions "
+                  f"(best {best_eval:.0f} T{best_tier}) WITH its learner "
+                  f"state: {b_fill:,} buffered transitions, target net, "
+                  f"optimiser", flush=True)
+        else:
+            # No state file: the buffer starts empty. Learning from a nearly
+            # empty, highly correlated buffer at gamma 1.0 is how a resumed
+            # run undoes its own progress, so refill before touching the
+            # weights.
+            warmup_now = (args.buffer // 2 if args.resume_warmup is None
+                          else args.resume_warmup)
+            warmup_now = max(warmup_now, args.warmup)
+            print(f"resumed {out_path.name} at {resume_seen:,} decisions "
+                  f"(best {best_eval:.0f} T{best_tier}); NO learner state, "
+                  f"refilling the buffer to {warmup_now:,} before learning",
+                  flush=True)
     elif args.resume:
         print(f"--resume: no {out_path.name} yet, starting fresh", flush=True)
 
@@ -375,6 +434,9 @@ def main():
     h_act = torch.zeros(n_step, n_env, dtype=torch.long, device=device)
     h_rew = torch.zeros(n_step, n_env, device=device)
     h_cnt = torch.zeros(n_env, dtype=torch.long, device=device)
+    if h_state is not None and h_state["h_obs"].shape[1] == n_env:
+        h_obs.copy_(h_state["h_obs"]); h_act.copy_(h_state["h_act"])
+        h_rew.copy_(h_state["h_rew"]); h_cnt.copy_(h_state["h_cnt"])
 
     # An eval is ~54 s of CPU work on a snapshot of the weights, so there is
     # no reason for the GPU to sit idle through it: hand it to a worker
@@ -387,6 +449,9 @@ def main():
     pending = None              # (future, weights snapshot, iteration, seen)
 
     def submit_eval(w_snapshot, it_at, seen_at):
+        if args.state_every:
+            dump_state()
+            print(f"  learner state saved -> {state_path.name}", flush=True)
         sd_cpu = {k: v.detach().to(eval_device, copy=True)
                   for k, v in online.state_dict().items()}
         mean_e = obs_mean.to(torch.float32).to(eval_device)
@@ -448,7 +513,7 @@ def main():
         except (ValueError, OSError):
             pass
 
-    learner_steps = 0
+    learner_steps = learner_steps0
     last_it = last_seen = 0
     best = 0.0
     recent = []                                   # last ~40 completed episodes
@@ -617,6 +682,16 @@ def main():
                             pt.mul_(1.0 - SOFT_TARGET_TAU).add_(
                                 SOFT_TARGET_TAU * po)
 
+        def dump_state():
+            save_state(state_path, b_obs=b_obs, b_next=b_next, b_act=b_act,
+                       b_ret=b_ret, b_gam=b_gam, b_done=b_done,
+                       b_fill=b_fill, b_pos=b_pos, cap=cap, obs_dim=OBS_DIM,
+                       target=target.state_dict(), opt=opt.state_dict(),
+                       obs_mean=obs_mean.cpu(), obs_var=obs_var.cpu(),
+                       obs_n=obs_n, learner_steps=learner_steps,
+                       hist={"h_obs": h_obs, "h_act": h_act,
+                             "h_rew": h_rew, "h_cnt": h_cnt})
+
         eval_note = ""
         due_eval = b_fill >= warmup_now and (it + 1) % args.eval_every == 0
         last_iter = it == iters - 1
@@ -666,6 +741,8 @@ def main():
                   f"warming up  eps {eps:.2f}  {mins:5.1f}m", flush=True)
 
         last_it, last_seen = it + 1, seen + per_iter
+        if args.state_every and (it + 1) % args.state_every == 0:
+            dump_state()
         if stop["asked"]:
             break
 
@@ -689,6 +766,9 @@ def main():
                      circuit=args.circuit, seen=np.int64(last_seen),
                      best_eval=np.float32(best_eval),
                      best_tier=np.int64(best_tier))
+        if args.state_every:
+            dump_state()
+            print(f"  learner state saved -> {state_path.name}", flush=True)
         sd_cpu = {k: v.detach().to(eval_device, copy=True)
                   for k, v in online.state_dict().items()}
         res = greedy_eval(sd_cpu,

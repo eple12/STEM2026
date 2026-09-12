@@ -52,10 +52,15 @@ TRACK_WIDTH_VARIATION = 0.30   # how much of the stored width variation to keep
 RUNOFF_WIDTH = 13.0            # asphalt edge -> wall, on a straight
 # A corner gets more, and gets it towards the exit -- that is the direction
 # a car leaves the circuit in, and where a real one has acres of asphalt.
-# The medial-distance clamp in wall_offsets() still governs, so asking for
-# more room between the legs of a chicane just gets whatever fits.
-RUNOFF_CORNER_EXTRA = 48.0     # extra metres on the outside of a bend
+# Nothing clamps this any more: where two legs of a chicane both ask for
+# acres, their run-off simply merges and the barrier between them is dropped
+# (Track.wall_valid), which is how a real chicane is fenced -- one wall round
+# the whole complex, open asphalt inside it.
+RUNOFF_CORNER_EXTRA = 105.0    # extra metres on the outside of the worst bend
 RUNOFF_CORNER_RADIUS = 320.0   # what counts as a bend for run-off
+RUNOFF_SHARP_RADIUS = 60.0     # a bend this tight gets the full extra
+RUNOFF_ENTRY_LOOK = 320.0      # metres of approach that set the entry speed
+RUNOFF_ENTRY_RADIUS = 900.0    # an approach this open counts as flat out
 KERB_WIDTH = 1.1
 KERB_CURVATURE_RADIUS = 400.0  # a kerb is drawn where the radius drops below this
 
@@ -309,11 +314,21 @@ SHOW_LINE_MARKERS = False   # debug: draw the centreline and racing line on the 
 SHOW_DISTANCE_HUD = False   # debug: 'N m / total m' readout, for lining up with training logs
 SHOW_KEY_HINTS = False      # the keycap legend along the bottom edge in-race
 HUD_MARGIN = 0.022     # clear space between a panel and the screen edge
-RL_OFF_TRACK_COST = 0.21       # per second beyond track limits, times speed
-                              # (discrete IQN). A ~0.4 s wide-of-the-line
-                              # excursion at 160 km/h costs ~2.7, against a
-                              # ~58-per-lap progress reward -- a real cost,
-                              # small enough not to make the car timid.
+
+#: Which observation the discrete IQN driver uses -- see rlpolicy.RL_OBS.
+#: "rangefinder": white-line rangefinders + curvature + reference speed ahead
+#: (v14, the direct "how much room do I have" signal). "lookahead": the
+#: original centreline points in the car frame.
+RL_OBS = "lookahead"      # v14 rangefinder obs was worse (rec 8/ep, 170 km/h); reverted
+
+RL_OFF_TRACK_COST = 0.35       # per second beyond track limits, times speed.
+                              # v17: the clean-lap bonus (zeroed for a dirty
+                              # lap) does most of the work of forcing PERFECT;
+                              # this is a moderate backstop with a gentle ramp.
+RL_OFF_TRACK_COST_RAMP = ((0, 1.0), (300_000, 1.0), (1_500_000, 2.0))
+#: Multiplier on RL_OFF_TRACK_COST, keyed to decisions seen. train_iqn.py reads
+#: this and passes the scale per rollout; RaceEnv.step multiplies it in. Flat
+#: ((0,1),(1,1)) disables the ramp.
 
 # How hard the reference line pulls. The reference is the *centreline*, and a
 # racing line is by definition several metres off it, so any pull at all is
@@ -328,6 +343,20 @@ RL_OFF_TRACK_COST = 0.21       # per second beyond track limits, times speed
 # reward by accuracy against it paid the policy to drive a bad line well.
 RL_LINE_TOLERANCE = 2.0        # (kept for the debug overlays only)
 
+# v12: point the potential attractor (and the observation's reference-speed
+# profile) at this project's *own* optimised raceline -- assets/racelines/
+# <Circuit>.npy, from raceline.refine's CMA-ES on simulated lap time -- rather
+# than the centreline. Unlike the f1tenth line above this one is scale-correct
+# and bounds-constrained, and it is pulled inward by RL_RACELINE_SAFETY so the
+# whole car body clears the white line: verified on Monza, all four wheels
+# inside with margin. This turns the line term from a headwind (pull to centre,
+# away from the fast line) into a tailwind, without letting it prescribe a line
+# that clips a limit. The edge / off-track terms still measure from the
+# centreline, where the widths are defined. False -> centreline, as before.
+RL_SHAPE_TO_RACELINE = True
+RL_RACELINE_SAFETY = 0.20     # metres the saved raceline is pulled in so every
+                              #  wheel stays inside the white line by this much
+
 # --- Linesight-style reward -------------------------------------------------
 # Reward per metre advanced along the centreline, and time penalty per second.
 # Lifted straight from Linesight (5/500 and 6/5000 per ms = 1.2 per s). Over a
@@ -336,10 +365,94 @@ RL_LINE_TOLERANCE = 2.0        # (kept for the debug overlays only)
 RL_PROGRESS_W = 5.0 / 500.0
 RL_TIME_W = 6.0 / 5000.0 * 1000.0     # per second
 
-# Potential-based line term: Phi = -K * clip(|offset|, LO, HI). Potential-based
-# so it cannot change which policy is optimal -- only speeds learning toward
-# the middle of the road. Linesight: K = 0.1, clip [2, 25].
-RL_LINE_K = 0.10
+# --- v17 raceline task -----------------------------------------------------
+# "linesight": the v10-v16 reward -- sparse-ish progress minus time, the policy
+# has to *discover* how fast to take each corner, and the fast/clean balance is
+# tuned through the off-track fee (unstable: plateaus at 96.5 s clean or goes
+# ~90 s dirty). "raceline": add two things the sparse reward lacked --
+#   * a DENSE per-step speed-tracking reward against an ambitious speed profile
+#     (the deployed raceline's curvature at RL_RL_SPEED_PACE): "be going THIS
+#     fast here", a gradient from step one for braking zones and straights;
+#   * a LAP-TIME BONUS awarded only on a clean finish-line crossing
+#     (RL_RL_LAP_BASE - RL_RL_LAP_W * seconds, zero if the lap had more than
+#     RL_RL_LAP_OFF_TOL off-track steps) -- makes "fast AND clean" the literal
+#     payoff, not an emergent balance.
+# The centreline stays the reference for progress and the observation; only the
+# reward changes.
+RL_TASK = "raceline"         # v20: v18's EXACT Linesight reward (progress -
+                            #  time + centre-pull shaping, all restored below)
+                            #  PLUS just one thing -- a steep clean-lap-TIME
+                            #  bonus. v19 tried zeroing the centre-pull + a
+                            #  dense speed target and converged clean-but-SLOW
+                            #  (181 km/h, stuck): the dense target became a
+                            #  comfortable attractor. v20 removes that
+                            #  (RL_RL_SPEED = 0) and instead makes "once clean,
+                            #  every second faster is worth RL_RL_LAP_W" an
+                            #  unambiguous, large per-lap reward.
+RL_RL_SPEED = 0.0            # v26: BELL OFF entirely. v21/v22/v25b proved any
+                            #  monotone (no-overspeed-penalty) dense speed term
+                            #  diverges the IQN at gamma->1; v19/v24's two-sided
+                            #  bell converges clean but caps at the 30%-
+                            #  conservative v_ref (~105 s). v26 keeps v18's
+                            #  EXACT reward (progress-time + full shaping, which
+                            #  is self-limiting and gave 94.45 s) and adds ONLY
+                            #  the small linear term below as a gentle "a bit
+                            #  faster is a bit better" nudge on the proven base.
+RL_RL_SPEED_SIG = 9.0        # v25b: width of the ONE-SIDED-BELOW bell (m/s).
+                            #  Below v_ref the reward falls off over ~9 m/s;
+                            #  at or above v_ref it is flat at RL_RL_SPEED (no
+                            #  overspeed penalty -- v_ref is a 30%-conservative
+                            #  profile, not a real limit, see rlenv note).
+RL_RL_SPEED_CAP = 1.0        # (legacy, unused)
+RL_RL_SPEED_LIN = 0.022      # v26-retry (2026-09-12): re-enabled. The original
+                            #  v26 verdict ("diverges, rec stuck ~7, loss
+                            #  0.07->0.21") was reached at it 373 using an
+                            #  invalid absolute-loss threshold -- v27 (v18's
+                            #  exact reward, run to completion) later proved
+                            #  that v18 ITSELF shows rec 6-7 / loss up to 0.46
+                            #  during the normal gamma-ramp rough patch
+                            #  (it~558-930), self-correcting only after gamma
+                            #  hits 1.0 (~it930+). v26 was killed at it373 --
+                            #  well before that window even opens. Retrying to
+                            #  completion, judged by direct comparison against
+                            #  v18's own log at matching iterations (not an
+                            #  absolute loss number). If it still diverges past
+                            #  v18's resolution point (~it1100-1150), the
+                            #  original v26 verdict stands confirmed for real.
+RL_RL_SPEED_LIN_CAP = 1.0    # v/MAX_SPEED rarely exceeds 1; clip in case
+RL_RL_SPEED_PACE = 1.00      # v25: v_ref = the physics grip-limited profile,
+                            #  no inflation. The bell's peak sits exactly at
+                            #  the grip limit so overspeeding a corner is a
+                            #  real penalty. The v24 pace ramp is retired (it
+                            #  inflated corner targets past reachability and
+                            #  killed the corner discipline); PACE_SCHED in
+                            #  train_iqn is now flat at 1.0.
+# Clean-lap-time bonus, added once on a finish-line crossing that closed a
+# whole lap with <= RL_RL_LAP_OFF_TOL off-steps and no recovery. v20 makes it
+# STEEP: base 300, so a 94 s clean lap is +64 and a 130 s crawl is 0 (clamped),
+# and every second cut off the lap is worth RL_RL_LAP_W = 2.5 -- about twice
+# the base per-second time penalty (1.2), so once the policy is clean, going
+# faster is a clear, large net gain rather than the marginal gamble it was for
+# v18 (progress-minus-time only). A Monza lap earns ~58 in progress reward, so
+# the bonus is comparable in size, not swamping.
+RL_RL_LAP_BASE = 300.0
+RL_RL_LAP_W = 2.5
+RL_RL_LAP_OFF_TOL = 3        # off-steps a lap may have and still count as clean
+
+# Potential-based line term: Phi = -K * clip(|offset|, LO, HI). Linesight uses
+# K = 0.1 and accepts that it pulls the car off the racing line ("any pull at
+# all is pulling against the optimum") because Trackmania's runoff is narrow.
+# v19 zeroed this hoping for a wider racing line; instead the policy wandered
+# and converged clean-but-SLOW (181 km/h). v20: back to Linesight's 0.10 --
+# turns out this mild pull keeps the car on a consistent efficient line, which
+# is what let v18 reach 215 km/h. The lap-time bonus is the speed driver now.
+RL_LINE_K = 0.10           # v25: RESTORED to v18/Linesight. v24 (K=0) drove a
+                           #  wider line that eval'd 10 s slower than v18 (105 s
+                           #  vs 94.45 s) at the same cleanliness -- on this
+                           #  Monza layout the tight line IS the fast line.
+                           #  This mild pull toward shape_line is most of that
+                           #  10 s. Bell + linear term supply SPEED; this
+                           #  supplies the LINE; they don't overlap.
 RL_LINE_LO = 2.0
 RL_LINE_HI = 25.0
 
@@ -350,8 +463,19 @@ RL_LINE_HI = 25.0
 # keeps giving a gradient through the last metre before the edge -- exactly
 # where the centreline term is already clipped flat and where "very slightly
 # off the line" actually happens.
-RL_EDGE_K = 0.055
-RL_EDGE_MARGIN = 1.6           # metres of room past which "safely inside" saturates
+RL_EDGE_K = 0.090          # v26: back to v18's value -- v26 is "pure v18 reward
+                           #  + linear term", full v18 shaping.
+RL_EDGE_MARGIN = 2.4      # v26: back to v18.
+# Beyond the white line the edge term above is flat zero, so there is no
+# potential gradient pulling a car that has *just* stepped out back onto the
+# road -- only the centreline term and the per-second fee, both weak in that
+# first metre. This adds one: Phi keeps falling, linearly, with how far past
+# the line the car is, capped so a big off nets a bounded penalty. Still a
+# function of state alone -> still optimum-preserving. This is the term aimed
+# squarely at "0 track-limit steps".
+RL_EDGE_OUT_K = 0.40         # v14: back on (v11 value). v13 ran without it and
+                              # drifted off the limit like v5.
+RL_EDGE_OUT_CAP = 8.0         # metres past the line at which the pull saturates
 
 # Speed (as a fraction of the local reference speed) a recovered car is given
 # back after a mistake. Low enough that the mistake really costs time.
@@ -361,13 +485,49 @@ RL_RECOVER_FRAC = 0.20
 # SAC/continuous reward uses it (the GTS-SAC c_w term); the discrete run relied
 # on the recovery alone. GTS-SAC used 5e-4 with a similar speed range.
 RL_WALL_KE_COST = 4.0e-4
-RL_OFF_COURSE_COST = 0.02      # per second off the asphalt, times speed (SAC only)
+RL_OFF_COURSE_COST = 0.02      # per second off the asphalt, times speed (legacy;
+                              #  the v15 SAC reward uses RL_SAC_OFF_* below)
+
+# ---- v15 continuous SAC reward -------------------------------------------
+#: Off-track fee, continuous run. BASE is the flat per-second-off-times-speed
+#: charge (like the old RL_OFF_COURSE_COST); DEPTH multiplies metres-past-the-
+#: white-line-times-speed on top, so a wheel on the line is nearly free and a
+#: two-metre excursion is a steep loss. Tuned so a lap's worth of small
+#: excursions clearly loses to a clean lap (~58 progress reward at Monza).
+RL_SAC_OFF_BASE = 0.12
+RL_SAC_OFF_DEPTH = 0.25       # v15b: 0.35 -> 0.25. The first run over-braked
+                             #  into caution -- small-excursion penalty was
+                             #  beating the per-step progress reward.
+#: Penalty on ||a_t - a_{t-1}||^2 (each component of [steer, pedal] in [-1,1]),
+#: once per decision. Kills the steering chatter a squashed-Gaussian actor
+#: falls into without changing where it wants the wheel on average.
+RL_SAC_ACT_SMOOTH = 0.02      # v15b: 0.05 -> 0.02, it was also suppressing the
+                             #  throttle/brake modulation a fast lap needs.
+#: Flat time penalty per second, continuous run. v15's first attempt dropped
+#: this entirely (GT Sophy style) and collapsed toward a slow, safe policy:
+#: at gamma 0.99 the cost of not finishing the lap is beyond the horizon, so
+#: "brake now" always won locally. A third of the IQN figure (1.2) makes
+#: "every second slow is a loss" a *local* signal without swamping progress.
+RL_SAC_TIME_W = 0.40
+#: v15c: for the continuous run a crash ENDS the episode (no teleport-recover
+#: -- that poisoned the twin-Q critic, which regressed the flood of
+#: "action -> teleport -> random state" transitions to a flat low value and
+#: flatlined). Charged once at the terminal: a flat part plus one scaled by
+#: the speed carried in, so arriving at a wall slow beats arriving fast, and
+#: braking for the corner beats both. ~58 progress reward for a Monza lap.
+RL_SAC_CRASH_COST = 10.0
+RL_SAC_CRASH_SPEED_COST = 25.0
 # Charged once per recovery (wall / off-track / stall / wrong-way). Flat part
 # plus a part scaled by the speed carried in. A Monza lap earns ~58 in progress
 # reward (5793 m * RL_PROGRESS_W), so 2.5 + up to 4.5 per crash makes one or
 # two contacts a lap a real cost without making standing still attractive.
-RL_RECOVER_COST = 0.5
-RL_RECOVER_SPEED_COST = 1.0
+# Raised from 0.5 / 1.0: v9 drove clean at its peak then drifted back to ~2
+# wall contacts a lap because a recovery only cost the respawn time and a
+# token fee. With the runoff now much wider a genuine wall contact is rare, so
+# the few that remain should clearly hurt -- 1.2 flat + up to 3.0 by entry
+# speed, against ~58 progress a lap.
+RL_RECOVER_COST = 1.2         # v14: back to v11 (v13 tried v5's 0.5)
+RL_RECOVER_SPEED_COST = 3.0   # v14: back to v11 (v13 tried v5's 1.0)
 
 # Metres the centreline curvature is smoothed over before its speed profile is
 # built (the profile feeds the observation, not the reward).
@@ -469,11 +629,54 @@ CLIP_FAR = 6000.0
 # Road surface heights, in metres above the asphalt. These are real geometric
 # separations, not render tricks; each gap is comfortably larger than the depth
 # buffer can resolve out to ~600 m, beyond which fog hides everything anyway.
-Y_GRASS = -0.05
+# 38 mm below the apron was not a real separation at all: past a couple of
+# hundred metres the depth buffer cannot tell them apart, and the ground
+# plane's own quads punch up through the run-off as rectangles of grass
+# inside the barrier. Almost a third of a metre resolves out to the fog, and
+# the step is only ever seen at the outer rim of the apron, where that apron
+# has already faded to grass and the ground beyond is grass too.
+Y_GRASS = -0.32
 # The run-off apron sits between the two: above the grass plane so it is
 # the surface you see beside the track, below the asphalt so the edge line
 # and the kerbs still win where they overlap it.
 Y_RUNOFF = -0.012
+# Metres per cell of the grid the run-off apron is triangulated on. The apron
+# is the interior of the drivable region, filled cell by cell against the same
+# contour the barrier is drawn on -- see trackdata.runoff_fill. Four metres is
+# a couple of car lengths, which is finer than any gradient painted on it, and
+# it keeps the whole lap's ground under fifty thousand triangles.
+RUNOFF_CELL = 4.0
+# Metres the ground is carried on *past* the barrier before it meets the flat
+# plane behind it. Without this the run-off stops dead at the fence and the
+# plane picks up a third of a metre lower, which is a step running the whole
+# length of every barrier on the circuit.
+RUNOFF_SKIRT = 10.0
+# Metres of rise per metre out across the apron, and its cap. Real run-off is
+# not a billiard table and a corner's gravel trap is big enough to show it.
+# There is no side bias any more: the apron is one mesh covering the whole
+# region, so there are no longer two of them to keep apart.
+RUNOFF_RISE = 0.004
+RUNOFF_RISE_MAX = 0.12
+# How far the apron sinks below Y_RUNOFF directly under the centreline. It
+# fills the whole region, road included, and 12 mm of clearance is not enough
+# to keep it out of the asphalt at the far end of a straight. Kept a little
+# above the grass plane so those two do not trade places instead -- both are
+# under opaque asphalt there, but there is no reason to add a second fight.
+# ...and how far it sits below the road and the kerb it runs beside. Tapered
+# back to nothing over fourteen metres of run-off rather than over one, which
+# is the difference between a run-off that is slightly lower than the circuit
+# and a trench dug round the kerb.
+RUNOFF_UNDER_ROAD = 0.10
+# ...and how much further it drops where the road is cambered, ramped in over
+# this much bank. The apron is triangulated on its own grid and the road on
+# the circuit's samples, so on a steep bank the two descriptions of the same
+# surface disagree by a few centimetres -- enough for a cell of apron to lift
+# through the kerb beside it. The clearance is scaled by the camber rather
+# than set to a constant so that a flat circuit keeps its run-off flush with
+# the white line, and it varies only along the lap, never across it, so it
+# adds no step for the eye to catch.
+RUNOFF_BANK_SINK = 0.16
+RUNOFF_BANK_SINK_REF = 6.0     # degrees of camber at which the full drop applies
 Y_ASPHALT = 0.0
 Y_SEAM = 0.020
 Y_LINE = 0.035
@@ -695,10 +898,56 @@ STAND_MIN_FRONT = 34.0         # metres from the centreline to the front wall
 STAND_TIERS = 11               # visible seating tiers
 PIT_SIDE = +1                  # which side of the main straight the pits are on
 PIT_SETBACK = 7.0              # metres from the barrier to the pit wall
+PIT_WALL_CLEAR = 1.5           # metres a garage keeps clear of the barrier
 PIT_GARAGES = 20               # bays; ~250 m of building, like the real thing
 HOARDING_MIN_RUN = 8.0         # metres of straight wall worth a hoarding
 TYRE_WALL_MIN_RUN = 5.0
 MARSHAL_SPACING = 430.0        # metres between marshal posts
+# How far outside the asphalt edge a structure that straddles the circuit
+# puts its legs. Not "just outside the barrier", which is what it used to be:
+# the wall is the outline of the run-off, and now that a corner's run-off
+# opens out to fifty metres a gantry stretched to reach it stood with its
+# feet a cricket pitch apart and its beam a hundred metres long. Measured
+# from the road instead, and clamped inside the wall, so it reads as a gantry
+# over the circuit wherever it lands.
+# The cinematic that plays before the countdown: two corners, an aerial over
+# the grid, then a look down the main straight. Ten seconds all told -- long
+# enough to say where you are, short enough that nobody reaches for the skip
+# key on the second lap of the evening.
+# --- banking ---------------------------------------------------------
+# The stored circuits are a centreline and two widths; there is no elevation
+# in them and no camber, so the banking is synthesised from curvature. A
+# corner leans as much as its radius asks for, capped, and the cap is raised
+# per circuit for the ones that are actually famous for it.
+# Toggle the whole synthesised-camber system on or off. Off: every circuit is
+# dead flat (trackdata.bank returns zeros) and the run-off tilt, the cone/kerb
+# grounding and the pit/scenery height sampling all follow, because they read
+# the same bank profile. Kept off by default -- the camber here is guessed from
+# curvature, not measured, and a wrong guess reads worse than a flat corner.
+BANKING_ENABLED = False
+BANK_MAX_DEG = 5.0             # default cap, anywhere on any circuit
+# Radius at which the cap is reached, and how sharply the lean falls away
+# above it. Squared, and keyed to a genuinely tight corner: keyed to 90 m and
+# linear, Zandvoort came out banked over more than half its lap, which is not
+# a circuit with two banked corners, it is a bowl.
+BANK_RADIUS = 40.0
+BANK_FALLOFF = 2.0
+BANK_SMOOTH = 90.0             # metres of lap the profile is averaged over
+#: circuit -> cap in degrees. Zandvoort's Hugenholtzbocht and Arie Luyendyk
+#: are banked at about 18 degrees, which is most of what the circuit is known
+#: for and is worth having even though the source data cannot know it.
+BANK_CIRCUIT_MAX = {"Zandvoort": 18.0, "Monza": 6.0, "YasMarina": 4.0}
+#: Metres past the asphalt edge over which the tilt fades out. The road is
+#: banked; forty metres of run-off tilted with it would drive one edge of the
+#: apron underground and the other into the air.
+BANK_RUNOFF_FADE = 14.0
+
+INTRO_ENABLED = True
+INTRO_CORNER_TIME = 4.6
+INTRO_AERIAL_TIME = 3.0
+INTRO_STRAIGHT_TIME = 2.2
+GANTRY_LEG_CLEAR = 4.0
+BRIDGE_LEG_CLEAR = 8.0
 BRIDGE_COUNT = 3               # spectator bridges round the lap (one is skipped
                                # -- the start line already has the gantry)
 # The Kenney kit is authored for a smaller world than a 4.5 m GT car, so what
@@ -707,11 +956,23 @@ BRIDGE_COUNT = 3               # spectator bridges round the lap (one is skipped
 # stretchable part in blender/circuit_kit.py, which follows the wall instead of
 # stepping along it in fixed modules.
 LIGHTPOST_SCALE = 3.0          # -> 7.7 m
+# Lamp posts stand hard against the *outside* face of the barrier, at this gap
+# and no other. Placed off the nearest chord and then checked back against
+# every chord on both sides: a post two metres behind one wall can be a metre
+# inside another where the circuit doubles back, and one that drifts is a lamp
+# growing out of the run-off. Anything outside the tolerance is dropped rather
+# than nudged -- a missing lamp reads as a gap in a row, a wrong one reads as
+# a bug.
+LIGHTPOST_WALL_GAP = 1.6       # metres outside the barrier line
+LIGHTPOST_GAP_TOL = 0.7        # how far from that gap a post may still stand
+# Clearance a grandstand module's footprint must keep from the barrier, on top
+# of standing wholly outside the corridor.
+STAND_WALL_CLEAR = 2.0
 TREE_SCALE = (1.00, 1.80)      # random range -> 5.0 to 9.0 m
 # The barrier line is Track.wall_offsets(): a walk outward along each normal,
-# stopping where another part of the centreline becomes the nearest one. That
-# is the same corridor the collision test uses, so the wall you see and the
-# wall you hit are one line.
+# as far as the run-off asks for, minus the stretches Track.wall_valid() finds
+# already swallowed by another leg's run-off. That is the same corridor the
+# collision test uses, so the wall you see and the wall you hit are one line.
 # The module is 0.43 m tall against a 1.1 m wall mesh, so at kit scale the
 # barrier read as skirting board with grey wall looming over it. Stretched to
 # cover the wall it is what you actually see at the edge of the circuit.
@@ -723,13 +984,50 @@ BARRIER_MODULE_DEPTH = 0.40    # the asset's own depth, in metres
 # not at the line through the middle of the barrier. Derived, so rescaling the
 # module cannot leave the collision behind.
 BARRIER_HALF_DEPTH = BARRIER_MODULE_DEPTH * BARRIER_DEPTH_SCALE / 2.0
+# How far through a barrier the car can be and still be pushed back out. A
+# step at 90 m/s covers 1.5 m, so nothing legitimate ever reaches this. It is
+# there to disown chords the car is nowhere near: a chord round the far side
+# of a bend has its outward face pointing back across the circuit, and
+# without a depth limit the road 40 m away counts as "through" it.
+BARRIER_MAX_PENETRATION = 6.0
+# The drivable region is sampled onto a grid this fine before its outline is
+# taken. A metre resolves the waist of a chicane without the sampling costing
+# a noticeable part of the load.
+BARRIER_GRID = 1.0
+BARRIER_SMOOTH = 9             # smoothing passes over the raw contour
+BARRIER_RESAMPLE_SMOOTH = 5    # samples in the second pass, after resampling
 # Metres along the lap, either side of the car, to search for barrier segments.
 # One segment can be BARRIER_MAX_RUN long and is keyed by its midpoint, so this
 # has to cover half of that plus the car plus room to spare.
 BARRIER_QUERY_RANGE = 45.0
 
 WALL_GAP = 0.6                 # metres left short of the medial axis
-WALL_MAX_SLOPE = 0.06          # how fast the wall may close in, as a gradient
+# The strip of ground a barrier between two legs of the circuit needs, and
+# the width below which there is no room for one and the run-off of the two
+# legs is allowed to merge into a single wrapped complex. WALL_MERGE_SPREAD
+# widens the merged stretch so it cannot flicker on and off sample by sample.
+WALL_MERGE_GAP = 9.0
+# The wall never comes closer to the road than this, however tight the gap
+# between two legs. Below it the chords cut inside their own arc and stand on
+# the track.
+WALL_MIN_MARGIN = 3.5
+WALL_MERGE_FLOOR = 8.0
+WALL_MERGE_SPREAD = 6
+# Samples over which the merged/not-merged decision is cross-faded. A hard
+# switch is a step of tens of metres in the wall's radius inside one sample,
+# and the fence then leaves a chicane complex through most of a right angle --
+# which is exactly the sharp bend where the contour smoothing, the chord walk
+# and the run-off apron all stopped agreeing with each other.
+# The mask is already dilated by WALL_MERGE_SPREAD, so a window this size
+# leaves the middle of the shortest merged run at full weight and only ramps
+# its ends -- widening it instead swallows the walls that separate a circuit's
+# infield from itself, which is Zandvoort's whole layout.
+WALL_MERGE_BLEND = 9
+# Metres of lap between two legs before they stop counting as one complex.
+# A chicane doubles back within a few seconds; two straights that run side by
+# side are half a lap apart and must keep the wall between them.
+WALL_MERGE_LAP = 260.0
+WALL_MAX_SLOPE = 0.30          # how fast the wall may open out or close in
 WALL_SMOOTH = 5                # samples in the final averaging window
 # Grass embankment (hills) along the track outside barriers (True: enabled, False: disabled)
 SPECTATOR_BANK_ENABLED = False

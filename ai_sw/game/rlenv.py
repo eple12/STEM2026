@@ -57,7 +57,8 @@ EPISODE_SECONDS = 130.0
 #: Back to a real, if short, grace window: a brief excursion still costs the
 #: per-second off-track fee below the whole time, it just is not *also*
 #: teleported and fined the recovery charge unless it actually lingers.
-OFF_TRACK_PATIENCE = 0.7
+#: v14: back to 0.45 (the v10/v11 value; v13 tried v5's 0.7 and ran wide).
+OFF_TRACK_PATIENCE = 0.45
 
 #: Below this speed (m/s) for this many seconds, the car is stuck and is
 #: recovered. Not a failure -- the lost seconds are the cost.
@@ -91,8 +92,22 @@ class RaceEnv:
         self.start_at_line = start_at_line
 
         self.line = rlpolicy.reference_line(self.track)
-        self.v_ref = rl.speed_profile(self.line.seg_len, self.line.curvature,
-                                      self.line.curv_radius, 1.0)
+        # Progress and the lookahead geometry stay on the centreline. The
+        # potential attractor and the reference-speed profile follow
+        # shape_line, which is the optimised raceline (pulled inside the white
+        # line) when RL_SHAPE_TO_RACELINE is on, else the centreline again.
+        self.shape_line = rlpolicy.shaping_line(self.track)
+        # v24: v_ref is the profile at the BASELINE pace; the training
+        # curriculum scales it up over time via ``pace_mult`` (see step()).
+        # RL_RL_SPEED_PACE is that baseline -- attainable, so the policy
+        # converges clean against it fast (v19-style) before the ramp bites.
+        _vpace = (config.RL_RL_SPEED_PACE
+                  if getattr(config, "RL_TASK", "linesight") == "raceline"
+                  else 1.0)
+        self.v_ref = rl.speed_profile(self.shape_line.seg_len,
+                                      self.shape_line.curvature,
+                                      self.shape_line.curv_radius, _vpace)
+        self._pace_mult = 1.0
         self.look_idx = rlpolicy._lookahead_indices(self.line)
 
         if continuous:
@@ -121,17 +136,33 @@ class RaceEnv:
         self._armed = False
         self.prev_actions = [DEFAULT_ACTION] * N_PREV_ACTIONS
         self.prev_cont = np.zeros(2, np.float32)
+        # v17 raceline task: off-track steps within the current lap, and the
+        # lap-clock reading at the last finish crossing, for the clean lap
+        # bonus. last_lap_time is the most recent completed lap (0 = none yet).
+        self.lap_off_steps = 0
+        self.lap_start_time = 0.0
+        self.last_lap_time = 0.0
+        self.best_lap_time = 0.0
+        self._lap_rec0 = 0          # recoveries count at the last finish crossing
 
     def _index(self):
         i, _ = self.surface.progress(self.vehicle.pos)
         return i
 
     def _potential(self, i: int) -> float:
+        # Attractor term: distance from shape_line (the raceline, or the
+        # centreline if that is off). This is the only term that says *where*
+        # to drive; pointing it at the fast line is what makes the shaping a
+        # tailwind rather than a pull back to centre.
+        a_off = float(np.dot(self.vehicle.pos - self.shape_line.center[i],
+                             self.shape_line.normal[i]))
+        phi = -config.RL_LINE_K * min(max(abs(a_off), config.RL_LINE_LO),
+                                      config.RL_LINE_HI)
+        # The edge / limit terms below stay on the centreline, where the track
+        # widths are defined.
         off_signed = float(np.dot(self.vehicle.pos - self.line.center[i],
                                   self.line.normal[i]))
         off = abs(off_signed)
-        phi = -config.RL_LINE_K * min(max(off, config.RL_LINE_LO),
-                                      config.RL_LINE_HI)
         # Width-aware room to the white line on the side the car is leaning.
         # Positive while inside, drops to 0 at the line; the potential rises
         # with it so approaching the edge is a downhill step and pulling back
@@ -140,6 +171,11 @@ class RaceEnv:
         edge = float(self.track.w_right[i] if off_signed > 0.0
                      else self.track.w_left[i])
         phi += config.RL_EDGE_K * min(max(edge - off, 0.0), config.RL_EDGE_MARGIN)
+        # Past the white line the term above is flat, so it stops pulling
+        # exactly where a track-limit step happens. Keep Phi falling with how
+        # far out the car is, capped. State-only, so still optimum-preserving.
+        phi -= config.RL_EDGE_OUT_K * min(max(off - edge, 0.0),
+                                          config.RL_EDGE_OUT_CAP)
         return phi
 
     def observe(self) -> np.ndarray:
@@ -148,7 +184,7 @@ class RaceEnv:
             return observe_sac(self.vehicle, self.track, self.line,
                                self.v_ref, i, self.prev_cont, self.surface)
         return observe(self.vehicle, self.track, self.line, self.v_ref,
-                       i, self.prev_actions, self.look_idx)
+                       i, self.prev_actions, self.look_idx, self.surface)
 
     # -- the loop -----------------------------------------------------------
     def _place(self, i: int, speed_frac: float):
@@ -203,10 +239,24 @@ class RaceEnv:
         self._place(i, config.RL_RECOVER_FRAC)
         self.recoveries += 1
 
-    def step(self, action) -> tuple[np.ndarray, float, bool, dict]:
+    def step(self, action, off_cost_scale: float = 1.0,
+             pace_mult: float = 1.0
+             ) -> tuple[np.ndarray, float, bool, dict]:
+        # ``off_cost_scale`` is the training curriculum's multiplier on the
+        # per-second off-track fee (config.RL_OFF_TRACK_COST_RAMP). 1.0 for the
+        # game and for eval; train_iqn.py passes the ramped value.
+        # ``pace_mult`` (v24) is the training curriculum's multiplier on the
+        # dense-speed-reward target profile: it ramps 1.0 -> ~1.28 over training
+        # so the policy first converges clean against an attainable target (as
+        # v19 did, fast) and then is continuously pulled toward a faster line
+        # instead of parking at one comfortable speed (v19's 181 km/h stall).
+        # 1.0 for the game and for eval.
+        self._pace_mult = float(pace_mult)
         v = self.vehicle
+        act_jerk = 0.0
         if self.continuous:
             a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+            act_jerk = float(np.sum((a - self.prev_cont) ** 2))
             steer, pedal = float(a[0]), float(a[1])
             ctl = Controls(throttle=max(pedal, 0.0), brake=max(-pedal, 0.0),
                            steer=steer, analog_steer=True)
@@ -220,6 +270,7 @@ class RaceEnv:
         ke_at_wall = 0.0
         off_secs = 0.0
         off_dist_speed = 0.0
+        off_depth_speed = 0.0        # sum of (metres past the white line) * speed
         for _ in range(ACTION_REPEAT):
             v.step(ctl, self.dt, self.surface)
             self.lap_time += self.dt
@@ -237,9 +288,15 @@ class RaceEnv:
                 ke_at_wall = max(ke_at_wall, v.speed * v.speed)
             if not v.on_track:
                 self.off_steps += 1
+                self.lap_off_steps += 1
                 self.off_time += self.dt
                 off_secs += self.dt
                 off_dist_speed += v.speed
+                off_signed = float(np.dot(v.pos - self.line.center[i],
+                                          self.line.normal[i]))
+                edge = float(self.track.w_right[i] if off_signed > 0.0
+                             else self.track.w_left[i])
+                off_depth_speed += max(abs(off_signed) - edge, 0.0) * v.speed
                 # Progress off the asphalt earns nothing, discrete or not. The
                 # discrete run used to credit it, and the policy learned the
                 # runoff was free speed -- it would send a corner wide and take
@@ -264,11 +321,30 @@ class RaceEnv:
 
         i = self._index()
         n = self.track.count
+        lap_bonus = 0.0
         if 0.4 * n <= i <= 0.6 * n:
             self._armed = True
         elif self._armed and i < 0.1 * n and ds_total > 0:
             self._armed = False
             self.laps += 1
+            # v17: a completed lap. The first crossing of the episode only
+            # starts the clock (the run into it is a partial lap); every
+            # crossing after that closes a real, whole lap.
+            if self.lap_start_time > 0.0:
+                lap_s = self.lap_time - self.lap_start_time
+                self.last_lap_time = lap_s
+                clean = (self.lap_off_steps <= config.RL_RL_LAP_OFF_TOL
+                         and self.recoveries == self._lap_rec0)
+                if clean:
+                    if self.best_lap_time == 0.0 or lap_s < self.best_lap_time:
+                        self.best_lap_time = lap_s
+                    if getattr(config, "RL_TASK", "linesight") == "raceline":
+                        lap_bonus = max(
+                            0.0, config.RL_RL_LAP_BASE
+                            - config.RL_RL_LAP_W * lap_s)
+            self.lap_start_time = self.lap_time
+            self.lap_off_steps = 0
+            self._lap_rec0 = self.recoveries
         if hit_wall:
             self.wall_steps += 1
 
@@ -281,6 +357,35 @@ class RaceEnv:
         reward = config.RL_PROGRESS_W * ds_total
         if not self.continuous:
             reward -= config.RL_TIME_W * (ACTION_REPEAT * self.dt)
+        else:
+            reward -= config.RL_SAC_TIME_W * (ACTION_REPEAT * self.dt)
+
+        # ---- raceline task: dense speed reward + clean-lap bonus.
+        # v25b: measurement killed the two-sided bell. v_ref (speed_profile on
+        # the precomputed raceline, with 0.62x brake force, a 28 m min-radius
+        # window and a chicane-swing cut) is NOT a real limit -- the fast v18
+        # policy drives ABOVE it on 51% of the lap and at ~1.3x (p90 2.6x) in
+        # corners, all perfectly clean. A bell that DROPS above v_ref was
+        # therefore penalising v18-competitive cornering -- the reason every
+        # bell version (v19, v24) topped out ~10-25 km/h under v18.
+        #  (1) ONE-SIDED-BELOW bell: full dense "you are under the profile,
+        #      get up to it" signal below v_ref (this is the convergence-speed
+        #      part), FLAT above it -- never a penalty for legit speed.
+        #  (2) small PURE-LINEAR pull normalised by a FIXED speed (MAX_SPEED),
+        #      not v_ref -- so it has no per-corner shape, just "a bit faster
+        #      is a bit better, everywhere, equally". The actual corner
+        #      discipline is the off-track / recovery penalty below (v18's
+        #      mechanism, proven).
+        if getattr(config, "RL_TASK", "linesight") == "raceline" \
+                and not self.continuous:
+            vtgt = max(float(self.v_ref[i]), 1.0)
+            spd_err = min(0.0, (self.vehicle.speed - vtgt)
+                          / config.RL_RL_SPEED_SIG)
+            reward += config.RL_RL_SPEED * math.exp(-spd_err * spd_err)
+            reward += config.RL_RL_SPEED_LIN * min(
+                self.vehicle.speed / config.MAX_SPEED,
+                config.RL_RL_SPEED_LIN_CAP)
+            reward += lap_bonus
 
         # ---- off-course penalty, per second of a wheel off the asphalt,
         #      scaled by speed. GT Sophy's off_course_penalty. Now on for the
@@ -289,9 +394,24 @@ class RaceEnv:
         #      un-rewarded into a net loss, so the policy stops using the
         #      runoff as line and keeps all four wheels inside the white.
         if off_secs > 0.0:
-            cost_w = (config.RL_OFF_COURSE_COST if self.continuous
-                      else config.RL_OFF_TRACK_COST)
-            reward -= cost_w * off_dist_speed * self.dt
+            if self.continuous:
+                # v15: a flat per-second-off fee plus one that grows with how
+                # far past the white line the car is. Near the line it is
+                # almost free (the racing line uses every centimetre); a real
+                # excursion is a steep, escalating loss. This is the term that
+                # has to make PERFECT beat fast-but-wide for the SAC run.
+                reward -= (config.RL_SAC_OFF_BASE * off_dist_speed
+                           + config.RL_SAC_OFF_DEPTH * off_depth_speed) * self.dt
+            else:
+                reward -= (config.RL_OFF_TRACK_COST * off_cost_scale
+                           * off_dist_speed * self.dt)
+
+        # ---- action-smoothness penalty (continuous only): ||a_t - a_{t-1}||^2.
+        # Without it the SAC actor chatters the steering -- a fast oscillation
+        # that averages to the right angle but unsettles the car and reads as a
+        # nervous driver. GT Sophy carries the same term.
+        if self.continuous:
+            reward -= config.RL_SAC_ACT_SMOOTH * act_jerk
 
         # ---- a mistake is recovered, not terminal, but it is charged for.
         # The discrete run drove clean at its peak but drifted back to ~2 wall
@@ -311,13 +431,21 @@ class RaceEnv:
             reason = "stalled"
         elif back:
             reason = "wrong way"
-        if reason:
-            # Charge for the *reckless* recoveries -- into a wall, off the
-            # track, turned around. A stall is the opposite mistake (too
-            # timid) and charging it as well drove the first attempt into a
-            # brake-stall-recover doom loop, so it is only recovered, not
-            # fined, and it gets more speed back so it does not re-stall on
-            # the spot.
+        terminal = False
+        if reason and self.continuous:
+            # v15c: a mistake ENDS the episode for the continuous run -- no
+            # teleport. The recover mechanism buried the twin-Q critic under
+            # non-Markovian "action -> teleport -> random state" transitions
+            # and it flatlined. A clean terminal with a speed-scaled charge is
+            # standard RL and SAC handles it. The policy learns to not crash,
+            # not to crash-and-carry-on -- which is what a PERFECT lap needs.
+            entry = math.sqrt(ke_at_wall) if hit_wall else self.vehicle.speed
+            reward -= (config.RL_SAC_CRASH_COST
+                       + config.RL_SAC_CRASH_SPEED_COST
+                       * min(entry / config.MAX_SPEED, 1.0))
+            terminal = True
+        elif reason:
+            # Discrete run: recovered, not terminal, but charged for.
             if reason == "stalled":
                 self._place(i, 0.45)
                 self.recoveries += 1
@@ -332,7 +460,8 @@ class RaceEnv:
         #      onto the line is not itself a reward -----------------------
         reward += 0.0 if reason else (self._potential(i) - phi0)
 
-        done = self.lap_time >= EPISODE_SECONDS
+        truncated = self.lap_time >= EPISODE_SECONDS
+        done = truncated or terminal
         return self.observe(), float(reward), done, {
-            "reason": reason or ("time" if done else ""),
-            "ds": ds_total, "truncated": done}
+            "reason": reason or ("time" if truncated else ""),
+            "ds": ds_total, "truncated": truncated, "terminal": terminal}

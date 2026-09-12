@@ -50,12 +50,25 @@ def _interp(sched, x):
 
 # GT-Sport SAC used gamma ~0.98 at 10 Hz (a ~5 s horizon) and leaned on the
 # wall term for the "brake for the corner" signal. At our 20 Hz decision rate
-# 0.99 is the same ~5 s; nudge it up later once the critic is stable.
-GAMMA_SCHED = [(0, 0.99), (400_000, 0.99), (1_500_000, 0.997)]
+# 0.99 is the same ~5 s; it rises to 0.997 (~16 s) once the critic is stable.
+# Never higher -- the discrete IQN runs all diverged with gamma pinned at the
+# ceiling under a near-1 discount, and SAC's bootstrap has the same failure.
+GAMMA_SCHED = [(0, 0.995), (400_000, 0.995), (1_200_000, 0.997)]
 LR_SCHED = [(0, 3e-4), (5_000_000, 1e-4)]
-#: Exploration temperature is auto-tuned, but a floor on the action noise the
-#: workers inject keeps the buffer fresh early.
-EXPL_SCHED = [(0, 0.15), (100_000, 0.08), (800_000, 0.03)]
+#: Floor on the Gaussian action noise the workers inject, on top of the
+#: policy's own std -- keeps the buffer fresh through the collapse-prone
+#: early phase.
+EXPL_SCHED = [(0, 0.15), (100_000, 0.10), (1_000_000, 0.05)]
+
+#: Temperature. Fixed at 0.2 through the phase where the first two SAC attempts
+#: collapsed (do-nothing, and auto-alpha eating the entropy before the policy
+#: found the throttle), then auto-tuned toward a target entropy with a floor so
+#: it cannot die again.
+ALPHA_FIXED = 0.20
+ALPHA_AUTO_AFTER = 1_500_000       # decisions
+ALPHA_TARGET_ENTROPY = -1.0        # per the 2-D action; less negative = more explore
+ALPHA_FLOOR = 0.03
+ALPHA_LR = 1e-4
 
 
 # --------------------------------------------------------------------------
@@ -94,13 +107,17 @@ def _rollout(job):
         act = np.tanh(u)
         for k, e in enumerate(envs):
             nobs, rew, done, info = e.step(act[k])
+            # A crash ends the episode with a true terminal (no bootstrap off
+            # the post-crash state); the 130 s time limit is a truncation
+            # (bootstrap Q(s') as usual).
+            term = 1.0 if info.get("terminal") else 0.0
             hist[k].append((obs[k].copy(), act[k].copy(), float(rew)))
             if len(hist[k]) == n_step:
                 o0, a0, _ = hist[k][0]
                 ret = sum(gamma ** j * hist[k][j][2] for j in range(n_step))
                 o_b.append(o0); a_b.append(a0); r_b.append(ret)
                 no_b.append(nobs.copy()); g_b.append(gamma ** n_step)
-                d_b.append(0.0)
+                d_b.append(term)
             if done:
                 for j in range(1, len(hist[k])):
                     oj, aj, _ = hist[k][j]
@@ -108,8 +125,11 @@ def _rollout(job):
                     ret = sum(gamma ** t * tail[t] for t in range(len(tail)))
                     o_b.append(oj); a_b.append(aj); r_b.append(ret)
                     no_b.append(nobs.copy()); g_b.append(gamma ** len(tail))
-                    d_b.append(0.0)
-                stats.append((e.progress, e.recoveries, e.laps,
+                    d_b.append(term)
+                # col 2 is now the crash rate (1.0 = ended on a wall/stall/
+                # wrong-way, 0.0 = survived to the time limit), not a recovery
+                # count -- the continuous run has no teleport-recover.
+                stats.append((e.progress, term, e.laps,
                               e.speed_sum / max(e.steps * 3, 1),
                               e.off_steps / max(e.steps * 3, 1)))
                 hist[k].clear()
@@ -140,6 +160,8 @@ def main():
     ap.add_argument("--start-at-line", type=float, default=0.25)
     ap.add_argument("--out-name", default=None)
     ap.add_argument("--eval-every", type=int, default=25)
+    ap.add_argument("--init-from", default=None,
+                    help="warm-start the actor + obs stats from this policy npz")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -198,7 +220,11 @@ def main():
     # policy, instead of having to discover from a standstill that throttle is
     # good while the entropy term is already shrinking.
     with torch.no_grad():
-        actor.mu.bias[:] = torch.tensor([0.0, 1.2])
+        # Start the actor *on the throttle*: mean pedal ~1.0, near-zero steer,
+        # tiny weights so it begins by driving straight and SAC refines from a
+        # real policy instead of discovering throttle from a standstill while
+        # the entropy term is already shrinking.
+        actor.mu.bias[:] = torch.tensor([0.0, 1.3])
         actor.mu.weight.mul_(0.1)
     q1, q2 = Q(), Q()
     q1t, q2t = Q(), Q()
@@ -210,10 +236,10 @@ def main():
     pi_opt = torch.optim.Adam(actor.parameters(), lr=LR_SCHED[0][1])
     q_opt = torch.optim.Adam(list(q1.parameters()) + list(q2.parameters()),
                              lr=LR_SCHED[0][1])
-    # Fixed temperature. Auto-tuning drove alpha from 1.0 to 0.5 in five
-    # minutes -- entropy gone before the policy had found the throttle. A held
-    # 0.2 keeps exploration alive through the early collapse-prone phase.
-    ALPHA = 0.2
+    # Temperature: fixed ALPHA_FIXED until ALPHA_AUTO_AFTER decisions, then
+    # gradient-tuned toward ALPHA_TARGET_ENTROPY but clamped at ALPHA_FLOOR.
+    log_alpha = torch.tensor(math.log(ALPHA_FIXED), requires_grad=True)
+    alpha_opt = torch.optim.Adam([log_alpha], lr=ALPHA_LR)
 
     def export():
         s = actor.state_dict()
@@ -238,6 +264,25 @@ def main():
     obs_var = np.ones(O, np.float64)
     obs_n = 1e-4
 
+    if args.init_from:
+        ip = Path(args.init_from)
+        if not ip.exists():
+            ip = config.RL_POLICY / f"{args.init_from}.npz"
+        d0 = np.load(ip, allow_pickle=False)
+        amap = {"body.0": "pi0", "body.2": "pi1", "mu": "pi_mu", "ls": "pi_ls"}
+        asd = actor.state_dict()
+        for tk, nk in amap.items():
+            asd[f"{tk}.weight"] = torch.as_tensor(
+                np.ascontiguousarray(d0[f"{nk}.w"].T), dtype=torch.float32)
+            asd[f"{tk}.bias"] = torch.as_tensor(
+                np.ascontiguousarray(d0[f"{nk}.b"]), dtype=torch.float32)
+        actor.load_state_dict(asd)
+        if "obs_mean" in d0.files and len(d0["obs_mean"]) == O:
+            obs_mean[:] = d0["obs_mean"]
+            obs_var[:] = np.square(d0["obs_std"].astype(np.float64))
+            obs_n = 1e5
+        print(f"warm-started actor from {ip.name}", flush=True)
+
     n_env = args.workers * args.envs_per_worker
     per_iter = args.rollout * n_env
     iters = max(1, args.steps // per_iter)
@@ -253,19 +298,43 @@ def main():
     eval_env = RaceEnv(args.circuit, seed=99_991, randomise_start=False,
                        continuous=True)
 
-    def greedy_eval(weights, mean, std, episodes=2):
-        tot = 0.0
-        for _ in range(episodes):
-            o = eval_env.reset()
+    # Deterministic grid launches, mean action, no noise -- exactly what the
+    # game deploys. Tier 0 (PERFECT) never puts a wheel off across all seven;
+    # tier 1 tolerates an off-track excursion but no recovery; tier 2 hit a
+    # wall or had to be teleported back. The *_best checkpoint tracks tier
+    # first, distance only to break a tie -- ported from train_iqn.
+    EVAL_LAUNCHES = (0.0, 0.15, 0.30, 0.45, 0.60, 0.75, 0.90)
+    OFF_PERFECT_TOL = 2
+
+    def greedy_eval(weights, mean, std):
+        total = 0.0
+        tier = 0
+        per_launch = []
+        for sf in EVAL_LAUNCHES:
+            o = eval_env.reset_grid(sf)
+            info = {"reason": "time"}
             while True:
                 m, _ = sac_forward(weights, normalise(o[None], mean, std))
-                o, _, d, _ = eval_env.step(np.tanh(m[0]))
+                o, _, d, info = eval_env.step(np.tanh(m[0]))
                 if d:
                     break
-            tot += eval_env.progress
-        return tot / episodes
+            total += eval_env.progress
+            reason = info.get("reason", "")
+            # No teleport-recover in the continuous run, so the tier comes from
+            # how the episode *ended*: a wall / stall / wrong-way is tier 2, an
+            # off-track excursion is tier 1, and surviving the full time limit
+            # is tier 0 -- unless it grazed the white line on the way (off_steps
+            # over the tolerance), which is also tier 1.
+            if reason in ("wall", "stalled", "wrong way"):
+                tier = max(tier, 2)
+            elif reason == "off track" or eval_env.off_steps > OFF_PERFECT_TOL:
+                tier = max(tier, 1)
+            per_launch.append((sf, eval_env.progress, reason,
+                               eval_env.off_steps))
+        return total / len(EVAL_LAUNCHES), tier, per_launch
 
     best_eval = 0.0
+    best_tier = 3
 
     pool = Pool(args.workers, initializer=_init_worker,
                 initargs=(args.circuit, args.envs_per_worker, args.seed,
@@ -324,6 +393,7 @@ def main():
 
             reach = max([s[0] for s in stats] + live + [0.0])
 
+            auto_alpha = seen >= ALPHA_AUTO_AFTER
             q_loss_acc = pi_loss_acc = alpha_acc = 0.0
             if b_fill >= args.warmup:
                 mt = torch.as_tensor(obs_mean, dtype=torch.float32)
@@ -336,7 +406,11 @@ def main():
                     sr = torch.as_tensor(b_r[sel])
                     sg = torch.as_tensor(b_g[sel])
                     sd = torch.as_tensor(b_d[sel])
-                    alpha = ALPHA
+                    if auto_alpha:
+                        alpha = float(log_alpha.detach().exp().clamp(
+                            min=ALPHA_FLOOR))
+                    else:
+                        alpha = ALPHA_FIXED
 
                     with torch.no_grad():
                         na, nlogp = actor.sample(sn)
@@ -359,6 +433,13 @@ def main():
                     torch.nn.utils.clip_grad_norm_(actor.parameters(), 10.0)
                     pi_opt.step()
 
+                    if auto_alpha:
+                        alpha_loss = -(log_alpha
+                                       * (logp.detach() + ALPHA_TARGET_ENTROPY)
+                                       ).mean()
+                        alpha_opt.zero_grad(set_to_none=True)
+                        alpha_loss.backward()
+                        alpha_opt.step()
 
                     with torch.no_grad():
                         for p, pt in zip(q1.parameters(), q1t.parameters()):
@@ -368,7 +449,7 @@ def main():
 
                     q_loss_acc += float(q1l.detach())
                     pi_loss_acc += float(pil.detach())
-                    alpha_acc += ALPHA
+                    alpha_acc += alpha
 
             w_now = export()
             np.savez(out_path, **w_now, obs_mean=obs_mean.astype(np.float32),
@@ -376,27 +457,36 @@ def main():
 
             eval_note = ""
             if b_fill >= args.warmup and (it + 1) % args.eval_every == 0:
-                ev = greedy_eval(w_now, obs_mean.astype(np.float32),
-                                 std.astype(np.float32))
-                if ev > best_eval:
-                    best_eval = ev
+                ev, tier, per_launch = greedy_eval(
+                    w_now, obs_mean.astype(np.float32),
+                    std.astype(np.float32))
+                better = tier < best_tier or (tier == best_tier
+                                              and ev > best_eval)
+                TIER_TAG = {0: "PERFECT", 1: "off-track", 2: "wall/stall"}
+                bad = ",".join(
+                    f"{sf:.2f}({rs or 'off'})" for sf, _, rs, os_ in per_launch
+                    if (rs and rs != "time") or os_ > OFF_PERFECT_TOL)
+                tag = TIER_TAG[tier] + (f"@{bad}" if tier and bad else "")
+                if better:
+                    best_eval, best_tier = ev, tier
                     np.savez(best_path, **w_now,
                              obs_mean=obs_mean.astype(np.float32),
                              obs_std=std.astype(np.float32),
                              circuit=args.circuit)
-                    eval_note = f"  eval {ev:5.0f}m *BEST*"
+                    eval_note = f"  eval {ev:5.0f}m {tag} *BEST*"
                 else:
-                    eval_note = f"  eval {ev:5.0f}m (best {best_eval:.0f})"
+                    eval_note = (f"  eval {ev:5.0f}m {tag} "
+                                 f"(best {best_eval:.0f}T{best_tier})")
 
             recent.extend(stats)
             mins = (time.perf_counter() - t0) / 60.0
             gs = max(args.grad_steps, 1)
             if recent:
                 r = np.asarray([s[:5] for s in recent], dtype=float)
-                dist, rc, _, sp, of = r.mean(0)
+                dist, cr, _, sp, of = r.mean(0)
                 print(f"  it {it+1:4d}/{iters}  {seen+per_iter:>9,}  "
                       f"buf {b_fill:>7,}  reach {reach:5.0f} m  "
-                      f"dist {dist:5.0f}  spd {sp*3.6:5.1f}  rec {rc:4.1f}  "
+                      f"dist {dist:5.0f}  spd {sp*3.6:5.1f}  crash {cr*100:3.0f}%  "
                       f"off {of*100:4.1f}%  g {gamma:.4f}  a {alpha_acc/gs:.3f}  "
                       f"qL {q_loss_acc/gs:6.2f}  piL {pi_loss_acc/gs:+6.2f}  "
                       f"n{len(recent):2d}+{len(stats):d}  {mins:5.1f}m"

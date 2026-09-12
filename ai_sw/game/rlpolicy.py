@@ -35,10 +35,16 @@ from .vehicle import Controls
 # at every corner. Five steer levels and a light-brake level give it the
 # in-between positions to modulate with. Steering is still fed with
 # ``analog_steer=False`` so a held level ramps the way a key press does.
-STEER_LEVELS = (-1.0, -0.5, 0.0, 0.5, 1.0)
+#
+# v13: back to five levels (the v5 action set), on request -- testing whether
+# Seven levels: the half-steps between 0 and 0.5 are where the policy kept
+# nicking the white line -- it had to average two coarse levels across the
+# ACTION_REPEAT window to hold a shallow angle. v17 trains from scratch, so it
+# is not locked to a 20-action checkpoint.
+STEER_LEVELS = (-1.0, -0.6, -0.3, 0.0, 0.3, 0.6, 1.0)
 PEDAL_LEVELS = (1.0, 0.0, -0.4, -1.0)    # throttle / coast / light brake / brake
 ACTIONS = [(s, p) for p in PEDAL_LEVELS for s in STEER_LEVELS]
-N_ACTIONS = len(ACTIONS)                 # 20
+N_ACTIONS = len(ACTIONS)                 # 28  (7 steer x 4 pedal)
 #: The action a fresh history is padded with -- straight and on the throttle.
 DEFAULT_ACTION = ACTIONS.index((0.0, 1.0))
 
@@ -55,20 +61,48 @@ ACTION_REPEAT = 3
 #: handed to the network as points in the car's own frame. Dense near the car
 #: (line precision), sparse far away (seeing a corner coming). This raw
 #: geometry is Linesight's "zone centers" -- the network plans against the
-#: shape of the road rather than against a scalar curvature.
+#: shape of the road rather than against a scalar curvature. Used by the
+#: "lookahead" observation.
 LOOKAHEAD_M = (6.0, 13.0, 22.0, 33.0, 47.0, 64.0, 85.0, 112.0, 146.0, 188.0,
                240.0, 305.0, 385.0, 485.0, 610.0, 765.0)
 N_LOOK = len(LOOKAHEAD_M)
 
-#: 2 lap-phase + 5 car state + N_PREV_ACTIONS + 1 finish + 3*N_LOOK
-OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + 3 * N_LOOK
+#: Rangefinder fan for the "rangefinder" observation: rays cast from the car,
+#: each returning distance to the *white line* in that direction -- the direct
+#: "how much room do I have, and where does it run out" signal the lookahead
+#: points only imply. Shared with observe_sac.
+RANGE_ANGLES = tuple(np.linspace(-1.9, 1.9, 13).tolist())
+N_RANGE = len(RANGE_ANGLES)
+RANGE_MAX = 100.0
+#: Curvature samples ahead, in seconds at the current speed (so a fast car
+#: looks further down the road), for both the rangefinder obs and SAC.
+CURV_AHEAD_S = (0.4, 0.8, 1.2, 1.7, 2.3, 3.0, 4.0, 5.2)
+N_CURV = len(CURV_AHEAD_S)
+#: Reference-speed samples ahead, same time-scaling -- "how fast should I be
+#: going a second / two / four from now", the brake-for-the-corner cue that
+#: the SAC obs leaves to curvature alone.
+VREF_AHEAD_S = (0.6, 1.4, 2.6, 4.2)
+N_VREF = len(VREF_AHEAD_S)
+
+#: Which observation the discrete IQN uses. "rangefinder" -> white-line
+#: rangefinders + curvature + reference speed ahead (36-dim). "lookahead" ->
+#: the original centreline points in car frame + their speeds (59-dim).
+RL_OBS = getattr(config, "RL_OBS", "lookahead")
+_RANGEFINDER_OBS = RL_OBS == "rangefinder"
+
+if _RANGEFINDER_OBS:
+    #: 2 phase + 5 car + N_PREV_ACTIONS + 1 finish + N_RANGE + N_CURV + N_VREF
+    OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + N_RANGE + N_CURV + N_VREF
+else:
+    #: 2 phase + 5 car + N_PREV_ACTIONS + 1 finish + 3*N_LOOK
+    OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + 3 * N_LOOK
 ACT_DIM = N_ACTIONS
 
 #: IQN network sizes, mirroring Linesight scaled down (no image head).
 FLOAT_HIDDEN = 256
 HEAD_HIDDEN = 256
 IQN_EMBED = 64
-IQN_K = 8                               # quantiles averaged at inference
+IQN_K = 32                              # quantiles averaged at inference (Linesight)
 
 
 def controls_for(action_idx: int) -> Controls:
@@ -79,12 +113,31 @@ def controls_for(action_idx: int) -> Controls:
 
 # --------------------------------------------------------------------------
 def reference_line(track):
-    """The centreline, sampled and lightly smoothed. Linesight rewards and
-    describes progress along the plain centre of the track and lets the policy
-    find its own line; the potential-based line term only discourages straying
-    far from centre, it does not prescribe a racing line."""
+    """The centreline, sampled and lightly smoothed. Progress and the
+    observation geometry are measured against this -- the plain centre of the
+    track -- regardless of RL_SHAPE_TO_RACELINE."""
     return raceline.Line(track, np.zeros(track.count),
                          smooth=config.RL_CURVATURE_SMOOTH)
+
+
+def shaping_line(track):
+    """The attractor for the potential term and the source of the reference
+    speed profile. This project's own optimised raceline
+    (assets/racelines/<Circuit>.npy) pulled inward by RL_RACELINE_SAFETY so the
+    whole car body stays inside the white line, or the centreline if none is
+    saved or RL_SHAPE_TO_RACELINE is off. The edge/limit terms still read the
+    centreline, so a raceline that grazes a kerb cannot license an off-track
+    step here."""
+    if getattr(config, "RL_SHAPE_TO_RACELINE", False):
+        saved = raceline.load(track)
+        if saved is not None and len(saved.offset) == track.count:
+            off = np.asarray(saved.offset, dtype=float)
+            edge = np.where(off > 0.0, track.w_right, track.w_left)
+            room = np.maximum(
+                edge - config.BODY_HALF_WIDTH - config.RL_RACELINE_SAFETY, 0.0)
+            off = np.clip(off, -room, room)
+            return raceline.Line(track, off, smooth=config.RL_CURVATURE_SMOOTH)
+    return reference_line(track)
 
 
 def _lookahead_indices(line):
@@ -96,8 +149,14 @@ def _lookahead_indices(line):
     return np.searchsorted(arc, tgt).clip(0, n - 1)
 
 
+def _ahead_index(line, i: int, metres: float) -> int:
+    arc = line.arclen
+    return int(np.searchsorted(arc, (arc[i] + metres) % line.length)
+               % len(line.center))
+
+
 def observe(vehicle, track, line, v_ref, i: int, prev_actions,
-            look_idx=None) -> np.ndarray:
+            look_idx=None, surface=None) -> np.ndarray:
     """Track-relative view of the world, plus lap phase and recent inputs.
 
     Everything is in the car's frame or measured against the line, so the
@@ -105,6 +164,11 @@ def observe(vehicle, track, line, v_ref, i: int, prev_actions,
     deliberate exception: the brief is to master *this* circuit, and a network
     that knows where it is can brake "here, at this corner" instead of
     re-deriving it from geometry every lap.
+
+    The tail of the vector is one of two shapes (see ``RL_OBS``):
+    "rangefinder" -- white-line distances in a fan of directions, curvature
+    ahead, reference speed ahead; "lookahead" -- centreline points in the car
+    frame and their speeds.
     """
     fwd = np.array([math.sin(vehicle.yaw), math.cos(vehicle.yaw)])
     right = np.array([math.cos(vehicle.yaw), -math.sin(vehicle.yaw)])
@@ -125,16 +189,27 @@ def observe(vehicle, track, line, v_ref, i: int, prev_actions,
     ]
     for a in prev_actions:
         obs.append((a - (N_ACTIONS - 1) / 2.0) / ((N_ACTIONS - 1) / 2.0))
-    remain = (line.length - line.arclen[i]) / line.length
-    obs.append(remain)
+    obs.append((line.length - line.arclen[i]) / line.length)
 
-    if look_idx is None:
-        look_idx = _lookahead_indices(line)
-    js = look_idx[i]
-    d = line.center[js] - vehicle.pos                       # (N_LOOK, 2)
-    obs.extend((d @ right / 60.0).tolist())                 # lateral, car frame
-    obs.extend((d @ fwd / 120.0).tolist())                  # forward, car frame
-    obs.extend((v_ref[js] / config.MAX_SPEED).tolist())     # target speed there
+    if _RANGEFINDER_OBS:
+        rng = surface.rangefinders(vehicle.pos, vehicle.yaw, RANGE_ANGLES,
+                                   RANGE_MAX) / RANGE_MAX
+        obs.extend(rng.tolist())
+        speed = max(float(vehicle.speed), 1.0)
+        for sec in CURV_AHEAD_S:
+            j = _ahead_index(line, i, float(np.clip(sec * speed, 5.0, 350.0)))
+            obs.append(float(line.curvature[j]) * 60.0)
+        for sec in VREF_AHEAD_S:
+            j = _ahead_index(line, i, float(np.clip(sec * speed, 5.0, 400.0)))
+            obs.append(float(v_ref[j]) / config.MAX_SPEED)
+    else:
+        if look_idx is None:
+            look_idx = _lookahead_indices(line)
+        js = look_idx[i]
+        d = line.center[js] - vehicle.pos                   # (N_LOOK, 2)
+        obs.extend((d @ right / 60.0).tolist())             # lateral, car frame
+        obs.extend((d @ fwd / 120.0).tolist())              # forward, car frame
+        obs.extend((v_ref[js] / config.MAX_SPEED).tolist())  # target speed there
     return np.asarray(obs, dtype=np.float32)
 
 
@@ -204,7 +279,7 @@ class RLDriver:
         if self._ticks % ACTION_REPEAT == 0:
             i, _ = self.surface.progress(vehicle.pos)
             obs = observe(vehicle, self.track, self.line, self.v_ref, i,
-                          self.prev, self.look_idx)
+                          self.prev, self.look_idx, self.surface)
             q = iqn_q(self.w, normalise(obs[None], self.mean, self.std))[0]
             self._held = int(np.argmax(q))
             self.prev = self.prev[1:] + [self._held]
@@ -222,25 +297,41 @@ class RLDriver:
 # temperature rather than baked into the objective, and the actor can put the
 # pedal exactly where it wants it.
 #
-# The observation follows that paper: car-frame velocity, the angle to the
-# centreline, a fan of rangefinders to the track edge (the piece the IQN
-# observation was missing -- the most direct "am I about to run out of road"
-# signal), the previous action, a wall-contact flag, and curvature sampled
-# ahead by time.
+# The v15 observation (48-dim). Three things IQN's lookahead-points obs and
+# the first SAC obs each half-had, together:
+#  * rangefinders to the WHITE LINE -- "how much room, and where does it run
+#    out" -- fanned denser ahead than to the sides;
+#  * the line SHAPE ahead as points in the car frame (a lean 3, not IQN's 16)
+#    -- planning, the piece the pure-rangefinder IQN run (v14) lost and drove
+#    170 km/h for it;
+#  * the friction-circle state -- slip angle, real steer angle, and both
+#    accelerations -- so the actor can feel the limit rather than infer it
+#    from a single lateral-velocity number (GT Sophy carries all of these).
+# Plus reference speed ahead as an explicit brake cue, which the paper leaves
+# to curvature alone.
 # ==========================================================================
 
-#: Rangefinder directions, car-relative radians, fanned across the front.
-RANGE_ANGLES = tuple(np.linspace(-1.9, 1.9, 13).tolist())
-N_RANGE = len(RANGE_ANGLES)
-RANGE_MAX = 100.0
+#: Rangefinder fan for the SAC obs: denser straight ahead (line precision),
+#: sparser to the sides (just "is the edge close"). Radians, car-relative.
+SAC_RANGE_ANGLES = (-1.50, -1.00, -0.65, -0.40, -0.22, -0.10, 0.0,
+                    0.10, 0.22, 0.40, 0.65, 1.00, 1.50)
+N_SAC_RANGE = len(SAC_RANGE_ANGLES)
+SAC_RANGE_MAX = 110.0
+#: Curvature look-ahead, seconds at the current speed.
+SAC_CURV_S = (0.5, 1.0, 1.7, 2.5, 3.4, 4.4, 5.5)
+N_SAC_CURV = len(SAC_CURV_S)
+#: Reference-speed look-ahead, seconds -- the brake-for-the-corner cue.
+SAC_VREF_S = (0.4, 1.0, 1.8, 2.8, 4.0)
+N_SAC_VREF = len(SAC_VREF_S)
+#: Line-shape look-ahead: a few centreline points, seconds ahead, handed to
+#: the net as (lateral, forward) in the car frame.
+SAC_SHAPE_S = (1.2, 2.8, 5.0)
+N_SAC_SHAPE = len(SAC_SHAPE_S)
 
-#: Look-ahead points on the centreline, in *seconds* at the current speed
-#: (clamped to a sane metre range), for the curvature samples.
-CURV_AHEAD_S = (0.4, 0.8, 1.2, 1.7, 2.3, 3.0, 4.0, 5.2)
-N_CURV = len(CURV_AHEAD_S)
-
-#: 2 phase + 5 car + 2 prev-action + 1 wall + N_RANGE + N_CURV + 1 finish
-OBS_DIM_SAC = 2 + 5 + 2 + 1 + N_RANGE + N_CURV + 1
+#: 2 phase + 4 vel/rot + 2 accel + 2 line-err + 2 prev-act + 2 status
+#: + N_SAC_RANGE + N_SAC_CURV + N_SAC_VREF + 2*N_SAC_SHAPE
+OBS_DIM_SAC = (2 + 4 + 2 + 2 + 2 + 2
+               + N_SAC_RANGE + N_SAC_CURV + N_SAC_VREF + 2 * N_SAC_SHAPE)
 SAC_ACT_DIM = 2
 SAC_HIDDEN = 256
 
@@ -254,30 +345,41 @@ def observe_sac(vehicle, track, line, v_ref, i, prev_action, surface):
     half = float(track.w_right[i] if cross > 0 else track.w_left[i])
     phase = 2.0 * math.pi * line.arclen[i] / max(line.length, 1e-6)
 
-    rng = surface.rangefinders(vehicle.pos, vehicle.yaw, RANGE_ANGLES,
-                               RANGE_MAX) / RANGE_MAX
+    rng = (surface.rangefinders(vehicle.pos, vehicle.yaw, SAC_RANGE_ANGLES,
+                                SAC_RANGE_MAX) / SAC_RANGE_MAX)
 
-    speed = max(vehicle.speed, 1.0)
-    arc = line.arclen
-    cur = []
-    for sec in CURV_AHEAD_S:
-        m = float(np.clip(sec * speed, 5.0, 350.0))
-        j = int(np.searchsorted(arc, (arc[i] + m) % line.length)
-                % len(line.center))
-        cur.append(line.curvature[j] * 60.0)
+    speed = max(float(vehicle.speed), 1.0)
+
+    cur = [float(line.curvature[_ahead_index(line, i,
+           float(np.clip(s * speed, 5.0, 350.0)))]) * 60.0
+           for s in SAC_CURV_S]
+    vrf = [float(v_ref[_ahead_index(line, i,
+           float(np.clip(s * speed, 5.0, 420.0)))]) / config.MAX_SPEED
+           for s in SAC_VREF_S]
+    shape = []
+    for s in SAC_SHAPE_S:
+        j = _ahead_index(line, i, float(np.clip(s * speed, 6.0, 500.0)))
+        d = line.center[j] - vehicle.pos
+        shape.append(float(d @ right) / 60.0)
+        shape.append(float(d @ fwd) / 120.0)
 
     obs = [
         math.sin(phase), math.cos(phase),
         float(np.dot(vehicle.vel, fwd)) / config.MAX_SPEED,
         float(np.dot(vehicle.vel, right)) / 20.0,
         vehicle.yaw_rate / 3.0,
+        vehicle.slip_angle / 0.5,
+        vehicle.long_accel / 30.0,
+        vehicle.lat_accel / 30.0,
         cross / max(half, 1e-3),
         heading_err / 0.6,
         float(prev_action[0]), float(prev_action[1]),
         1.0 if vehicle.hit_wall else 0.0,
+        (line.length - line.arclen[i]) / line.length,
         *rng.tolist(),
         *cur,
-        (line.length - arc[i]) / line.length,
+        *vrf,
+        *shape,
     ]
     return np.asarray(obs, dtype=np.float32)
 

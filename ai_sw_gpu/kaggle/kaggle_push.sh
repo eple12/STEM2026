@@ -2,7 +2,7 @@
 # Build the code bundle, publish it as a Kaggle dataset, and push the kernel
 # that trains on it.
 #
-#   bash kaggle_push.sh <KAGGLE_USER> [CIRCUIT] [OUT_NAME] [RESUME_FROM]
+#   bash kaggle_push.sh <KAGGLE_USER> [CIRCUIT] [OUT_NAME] [RESUME_FROM] [EXTRA_FLAGS]
 #
 #   KAGGLE_USER   your Kaggle username (the owner slug)
 #   CIRCUIT       Spa (default), Monza, ...
@@ -10,14 +10,20 @@
 #   RESUME_FROM   a previous kernel slug to continue from, e.g.
 #                 <user>/aisw-spa-v26d -- its output is attached as an input
 #                 so the run picks up the weights AND the replay buffer
+#   EXTRA_FLAGS   trainer flags beyond the fixed v26 recipe, e.g.
+#                 "--ddqn --revive-after 300 --revive-boost 0.12". Omit to
+#                 use kernel_run.py's own default rather than repeating it
+#                 here -- a hardcoded value in this script silently
+#                 overrode kernel_run.py's default once already.
 #
 # Needs ~/.kaggle/kaggle.json (Kaggle > Settings > API > Create New Token).
 set -eu
 
-USER_SLUG="${1:?usage: kaggle_push.sh <KAGGLE_USER> [CIRCUIT] [OUT_NAME] [RESUME_FROM]}"
+USER_SLUG="${1:?usage: kaggle_push.sh <KAGGLE_USER> [CIRCUIT] [OUT_NAME] [RESUME_FROM] [EXTRA_FLAGS]}"
 CIRCUIT="${2:-Spa}"
 OUT_NAME="${3:-${CIRCUIT}_v26d}"
 RESUME_FROM="${4:-}"
+EXTRA_FLAGS="${5:-}"
 
 REPO="${AISW_REPO:-/mnt/c/Users/user/Desktop/WorkSpace/Dongari/STEM2026}"
 STAGE="$HOME/aisw_kaggle"
@@ -71,7 +77,7 @@ echo "=== writing the kernel ==="
   echo "import os"
   echo "os.environ['AISW_CIRCUIT'] = '$CIRCUIT'"
   echo "os.environ['AISW_OUT'] = '$OUT_NAME'"
-  echo "os.environ['AISW_EXTRA'] = '--ddqn --stop-after-stale 600'"
+  [ -n "$EXTRA_FLAGS" ] && echo "os.environ['AISW_EXTRA'] = '$EXTRA_FLAGS'"
   cat "$REPO/ai_sw_gpu/kaggle/kernel_run.py"
 } > "$STAGE/kernel/aisw_train.py"
 
@@ -100,8 +106,10 @@ cat "$STAGE/kernel/kernel-metadata.json"
 echo "=== pushing (this starts the run) ==="
 # --accelerator as well as the metadata: a push that set only enable_gpu in
 # kernel-metadata.json came back on a CPU image (torch 2.10.0+cpu), even
-# though the stored metadata read enable_gpu true.
-kaggle kernels push -p "$STAGE/kernel" --accelerator "${ACCEL:-nvidiaTeslaT4}"
+# though the stored metadata read enable_gpu true. The value is
+# case-sensitive server-side -- "nvidiaTeslaT4" silently downgrades to the
+# generic "Gpu" shape (verified by pulling the metadata back after a push).
+kaggle kernels push -p "$STAGE/kernel" --accelerator "${ACCEL:-NvidiaTeslaT4}"
 
 echo
 echo "kernel: $USER_SLUG/$K_SLUG"

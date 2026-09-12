@@ -216,6 +216,22 @@ def main():
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available()
                     else "cpu")
+    ap.add_argument("--revive-after", type=int, default=0,
+                    help="if *_best (tier 0) has gone this many iterations "
+                         "without improving, bump eps_boltz by --revive-boost "
+                         "and let it decay over --revive-decay iterations. "
+                         "Re-fires every --revive-after iterations for as "
+                         "long as the plateau continues. Boltzmann noise, "
+                         "not raw epsilon: it perturbs Q before argmax rather "
+                         "than picking a uniformly random action, so a badly "
+                         "timed sample nudges the policy off its current "
+                         "line instead of a near-certain crash -- the risk "
+                         "that ruled out reviving raw epsilon in this "
+                         "high-speed domain. 0 disables.")
+    ap.add_argument("--revive-boost", type=float, default=0.12,
+                    help="peak addition to eps_boltz on a revival")
+    ap.add_argument("--revive-decay", type=int, default=150,
+                    help="iterations for a revival's boost to decay to 0")
     ap.add_argument("--stop-after-stale", type=int, default=0,
                     help="stop once *_best has not improved for this many "
                          "iterations, counted only after the first tier-0 "
@@ -536,6 +552,7 @@ def main():
     # shutdown eval, rather than dropping the run wherever it happened to be.
     stop = {"asked": False}
     stale = {"since": resume_stale_since}  # iteration of the last *_best win
+    revive = {"at": None}          # iteration the current boost started, or None
 
     def _on_signal(_sig, _frame):
         if stop["asked"]:                          # second one: go now
@@ -564,6 +581,30 @@ def main():
         gamma = _interp(GAMMA_SCHED, seen)
         eps = _interp(eps_sched, seen)
         eps_b = _interp(EPS_BOLTZ_SCHED, seen)
+
+        # Plateau-gated Boltzmann revival: only once the policy has ALREADY
+        # reached a clean (tier-0) checkpoint and then gone stale on it, so
+        # this cannot fire during the ordinary early climb the way a
+        # decision-count-gated revival did on an earlier run (it landed
+        # mid-learning, before a clean lap existed to explore around, and
+        # just slowed the initial climb). Re-fires every --revive-after
+        # iterations of continued staleness, so a plateau that outlasts one
+        # decay window gets boosted again rather than being left to decay
+        # to nothing and simply wait out the rest of --stop-after-stale.
+        if args.revive_after and best_tier == 0 and stale["since"]:
+            gap = (it + 1) - stale["since"]
+            if gap > 0 and gap % args.revive_after == 0:
+                revive["at"] = it + 1
+                print(f"  [reviving eps_boltz: {gap} iterations stale, "
+                      f"+{args.revive_boost:.2f} decaying over "
+                      f"{args.revive_decay} iterations]", flush=True)
+        if revive["at"] is not None:
+            age = (it + 1) - revive["at"]
+            if age < args.revive_decay:
+                eps_b += args.revive_boost * (1.0 - age / args.revive_decay)
+            else:
+                revive["at"] = None
+
         lr = _interp(lr_sched, seen)
         off_scale = _interp(OFF_COST_SCHED, seen)
         pace_mult = _interp(PACE_SCHED, seen)

@@ -14,14 +14,15 @@ a claim about the real circuit.
 from __future__ import annotations
 
 import numpy as np
-from ursina import Entity, Mesh, Text, Vec3, camera, destroy
+from ursina import Entity, Mesh, Text, Vec3, camera
 
 from . import config
 from . import palette as pal
 from .trackdata import Track, load_track
 
-from .ui import (CIRCUITS, GREY, GREY_DIM, INK, PANEL, PANEL_HI, RED, WHITE,
-                 caption, pick_font, skew_quad, spaced)
+from .ui import destroy_tree
+from .ui import (CIRCUITS, GREY, GREY_DIM, INK, PANEL, PANEL_HI, PURPLE, RED,
+                 WHITE, caption, lap_time, pick_font, skew_quad, spaced)
 
 ROWS = 9                          # circuits visible at once
 
@@ -66,14 +67,139 @@ def circuit_stats(track: Track, thresh: float = 400.0, min_run: int = 3):
     return turns, best
 
 
+QUALI, GRAND_PRIX = "quali", "gp"
+
+#: (key, title, description lines, detail) per session mode, in menu order.
+MODES = (
+    (QUALI, "QUALIFYING",
+     ("Hot laps against the AI's fastest clean lap,",
+      "replayed as a ghost from the line every lap.",
+      "Leave the track and the lap is deleted."),
+     "OUT LAP  ·  UNLIMITED FLYING LAPS"),
+    (GRAND_PRIX, "GRAND PRIX",
+     ("Race the AI from lights out over a set distance.",
+      "First to the flag wins, penalties included.",
+      "Every trip off the track costs time."),
+     "{laps} LAPS  ·  {pen:.0f} S TRACK LIMITS PENALTY"),
+)
+
+
+def _base_screen(menu, subtitle: str):
+    """Ground, wordmark and footer rule shared by both menu screens."""
+    Entity(parent=menu.root, model="quad", color=INK,
+           scale=(4.0, 1.4), position=(0, 0, 0.5))
+    Entity(parent=menu.root, model=skew_quad(0.045, 0.115),
+           color=RED, position=(-0.80, 0.395, 0.2))
+    menu._txt("FORMULA-AI", size=3.4, pos=(-0.755, 0.395))
+    menu._txt(spaced(subtitle), size=0.85, col=GREY, pos=(-0.752, 0.315))
+    Entity(parent=menu.root, model="quad", color=PANEL_HI,
+           scale=(1.78, 0.0035), position=(0, -0.452, 0.2))
+
+
+class ModeMenu:
+    """The main menu: qualifying or grand prix. Calls ``on_pick(mode)``."""
+
+    CARD_W, CARD_H = 0.78, 0.50
+
+    def __init__(self, on_pick, on_quit, laps: int = config.TOTAL_LAPS,
+                 initial: str | None = None):
+        self.on_pick = on_pick
+        self.on_quit = on_quit
+        self.font = pick_font()
+        keys = [m[0] for m in MODES]
+        self.sel = keys.index(initial) if initial in keys else 0
+        self.root = Entity(parent=camera.ui)
+        _base_screen(self, "racing")
+
+        Entity(parent=self.root, model="quad", color=PANEL_HI,
+               scale=(1.60, 0.0035), position=(0, 0.255, 0.2))
+        Entity(parent=self.root, model="quad", color=RED,
+               scale=(0.30, 0.006), position=(-0.65, 0.255, 0.15))
+        self._txt(spaced("main menu"), size=0.8, col=GREY, pos=(-0.80, 0.212))
+
+        self.cards = []
+        for k, (_key, title, lines, detail) in enumerate(MODES):
+            cx = -0.40 + k * 0.82
+            c = Entity(parent=self.root, position=(cx, -0.06, 0.1))
+            bg = Entity(parent=c, model="quad", color=PANEL,
+                        scale=(self.CARD_W, self.CARD_H), position=(0, 0, 0.08))
+            band = Entity(parent=c, model="quad", color=RED,
+                          scale=(self.CARD_W, 0.010),
+                          position=(0, self.CARD_H / 2 - 0.005, 0.06))
+            tag = Entity(parent=c, model=skew_quad(0.075, 0.040), color=PANEL_HI,
+                         position=(-self.CARD_W / 2 + 0.070, 0.180, 0.05))
+            x0 = -self.CARD_W / 2 + 0.040
+            idx = Text(f"{k + 1:02d}", parent=c, font=self.font, scale=0.9,
+                       color=GREY, origin=(0, 0),
+                       position=(-self.CARD_W / 2 + 0.070, 0.180, -0.1))
+            name = Text(title, parent=c, font=self.font, scale=2.6, color=WHITE,
+                        origin=(-0.5, 0), position=(x0, 0.095, -0.1))
+            desc = [Text(line, parent=c, font=self.font, scale=0.95, color=GREY,
+                         origin=(-0.5, 0), position=(x0, 0.005 - j * 0.045, -0.1))
+                    for j, line in enumerate(lines)]
+            # INK, not PANEL_HI: the selected card's ground *is* PANEL_HI.
+            Entity(parent=c, model="quad", color=INK,
+                   scale=(self.CARD_W - 0.080, 0.0025),
+                   position=(0, -0.160, 0.05))
+            info = Text(detail.format(laps=laps, pen=config.GP_OFFTRACK_PENALTY),
+                        parent=c, font=self.font, scale=0.72, color=GREY_DIM,
+                        origin=(-0.5, 0), position=(x0, -0.200, -0.1))
+            self.cards.append(dict(bg=bg, band=band, tag=tag, idx=idx,
+                                   name=name, desc=desc, info=info))
+
+        self._txt("A / D   or   LEFT / RIGHT      SELECT          ENTER   CONTINUE"
+                  "          ESC   QUIT",
+                  size=0.72, col=GREY, pos=(-0.80, -0.482))
+        self._refresh()
+
+    def _txt(self, s, *, size=1.0, col=WHITE, pos=(0, 0), origin=(-0.5, 0), z=-0.1):
+        return Text(s, parent=self.root, font=self.font, scale=size, color=col,
+                    origin=origin, position=(pos[0], pos[1], z))
+
+    def _refresh(self):
+        for k, c in enumerate(self.cards):
+            on = k == self.sel
+            c["bg"].color = PANEL_HI if on else PANEL
+            c["band"].enabled = on
+            c["tag"].color = RED if on else PANEL_HI
+            c["idx"].color = WHITE if on else GREY_DIM
+            c["name"].color = WHITE if on else GREY
+            for d in c["desc"]:
+                d.color = GREY if on else GREY_DIM
+            c["info"].color = RED if on else GREY_DIM
+
+    def on_key(self, key: str):
+        n = len(MODES)
+        if key in ("right arrow", "d", "down arrow", "s"):
+            self.sel = (self.sel + 1) % n
+            self._refresh()
+        elif key in ("left arrow", "a", "up arrow", "w"):
+            self.sel = (self.sel - 1) % n
+            self._refresh()
+        elif key in ("enter", "space"):
+            self.on_pick(MODES[self.sel][0])
+        elif key == "escape":
+            self.on_quit()
+
+    def destroy(self):
+        destroy_tree(self.root)
+        self.root = None
+
+
 # --- the menu ------------------------------------------------------------
 class StartMenu:
     """Title card plus circuit list. Calls ``on_start(name)`` when chosen."""
 
-    def __init__(self, names: list[str], on_start, on_quit, initial: str | None = None):
+    def __init__(self, names: list[str], on_start, on_quit, initial: str | None = None,
+                 on_back=None, mode: str | None = None,
+                 laps: int = config.TOTAL_LAPS):
         self.names = names
         self.on_start = on_start
         self.on_quit = on_quit
+        # ESC goes back to the main menu when there is one to go back to.
+        self.on_back = on_back
+        self.mode = mode
+        self.laps = laps
         self.font = pick_font()
         self.sel = names.index(initial) if initial in names else 0
         self.top = 0                      # first visible row
@@ -125,8 +251,10 @@ class StartMenu:
                scale=(0.79, 0.0035), position=(-0.435, 0.255, 0.2))
         Entity(parent=self.root, model="quad", color=RED,
                scale=(0.30, 0.006), position=(-0.74, 0.255, 0.15))
-        self._txt(spaced("circuit select"), size=0.8, col=GREY,
-                  pos=(-0.80, 0.212))
+        title = dict((m[0], m[1]) for m in MODES).get(self.mode)
+        self._txt(spaced("circuit select")
+                  + ("" if title is None else "   ·   " + spaced(title)),
+                  size=0.8, col=GREY, pos=(-0.80, 0.212))
         self._count = self._txt("", size=0.8, col=GREY_DIM,
                                 pos=(-0.055, 0.212), origin=(0.5, 0))
 
@@ -176,6 +304,10 @@ class StartMenu:
                            origin=(-0.5, 0), position=(-0.302, 0.255, -0.1))
         self.p_full = Text("", parent=p, font=self.font, scale=0.72, color=GREY,
                            origin=(-0.5, 0), position=(-0.300, 0.212, -0.1))
+        # What this session holds on this circuit: the ghost lap to beat in
+        # qualifying (or that there is none yet), the distance in a race.
+        self.p_mode = Text("", parent=p, font=self.font, scale=0.72, color=GREY,
+                           origin=(0.5, 0), position=(0.300, 0.305, -0.1))
 
         # Where the track outline gets drawn each time the selection moves.
         self.map_anchor = Entity(parent=p, position=(0, -0.02, -0.05))
@@ -194,7 +326,7 @@ class StartMenu:
         Entity(parent=self.root, model="quad", color=PANEL_HI,
                scale=(1.78, 0.0035), position=(0, -0.452, 0.2))
         self._txt("W / S   or   UP / DOWN      SELECT          ENTER   START"
-                  "          ESC   QUIT",
+                  "          ESC   " + ("BACK" if self.on_back else "QUIT"),
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
 
     # -- state ----------------------------------------------------------
@@ -253,10 +385,21 @@ class StartMenu:
         self.p_name.text = label
         # Suppress the subtitle when it only restates the label.
         self.p_full.text = "" if full.upper() == label else full
+        if self.mode == QUALI:
+            from .replay import lap_time as ghost_lap_time
+            t = ghost_lap_time(key)
+            self.p_mode.text = (f"GHOST LAP   {lap_time(t)}" if t is not None
+                                else "NO GHOST LAP  ·  SOLO RUNS")
+            self.p_mode.color = PURPLE if t is not None else GREY_DIM
+        elif self.mode == GRAND_PRIX:
+            self.p_mode.text = f"{self.laps} LAPS  ·  VS AI"
+            self.p_mode.color = GREY
+        else:
+            self.p_mode.text = ""
 
         track = self._track(key)
         if self._outline is not None:
-            destroy(self._outline)
+            destroy_tree(self._outline)
             self._outline = None
         if track is None:
             for v in self.stat_val:
@@ -302,11 +445,11 @@ class StartMenu:
         elif key in ("enter", "space"):
             self.on_start(self.names[self.sel])
         elif key == "escape":
-            self.on_quit()
+            (self.on_back or self.on_quit)()
 
     def destroy(self):
         if self._outline is not None:
-            destroy(self._outline)
+            destroy_tree(self._outline)
             self._outline = None
-        destroy(self.root)
+        destroy_tree(self.root)
         self.root = None

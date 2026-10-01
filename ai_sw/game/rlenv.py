@@ -58,11 +58,63 @@ EPISODE_SECONDS = 130.0
 #: ~12 % can, which quietly halves the reward the v26 recipe is built on.
 #: Sized at ~1.38x the DRIVEN lap, estimated as 0.78x the modelled lap from
 #: ``speed_profile`` (the ratio measured at Monza: 94 s driven vs 120.8 s
-#: modelled). Monza stays at exactly 130 s so every earlier run remains
-#: comparable.
+#: modelled) -- i.e. ~1.076x the modelled lap. Monza stays at exactly 130 s
+#: so every earlier run remains comparable, and Spa keeps the value it was
+#: actually trained and evaluated at (160 vs the 160.3 the formula below
+#: would now give it -- close enough that this is about not disturbing
+#: history, not a correction).
+#:
+#: 2026-09-13: found the hard way on Silverstone (no entry here, so it fell
+#: back to the flat EPISODE_SECONDS -- 130 s, silently Monza-shaped): a
+#: window sized for barely ONE driven lap plus closing margin means a grid
+#: start reaches the final sector with only ~12-19 s left in the episode --
+#: nowhere near enough exposure to "already at race pace, arriving at this
+#: corner mid-lap" for the network to actually learn it. The trainer's own
+#: eval, run in that same short window, reported PERFECT because it never
+#: got far enough to test the part that was undertrained -- a genuine flying
+#: lap attempt (a full, uninterrupted loop) then goes off exactly there.
+#: RaceEnv/VecRaceEnv's fallback for a circuit missing here (any new one --
+#: Silverstone, say, no manual step needed) is now sized for TWO full driven
+#: laps plus the same closing margin as before, not one: (2 + 0.38) x 0.78 =
+#: ~1.856x that circuit's own model_lap. A cleanly-driving policy gets a full
+#: second lap, at pace, run in from every corner it just took -- not just
+#: enough room to limp across the line once. Spa and Monza are left at their
+#: historical 1-lap-sized values below (already trained and deployed at
+#: those numbers; retraining either at the new size is a separate decision,
+#: not implied by fixing the fallback new circuits get).
 EPISODE_SECONDS_BY_CIRCUIT = {
     "Spa": 160.0,          # modelled 149.0 s -> driven ~116 s
+    "Monza": 130.0,        # pinned to EPISODE_SECONDS's own historical value
 }
+
+#: The POST-PERFECT episode length, as a ratio of model_lap: (2 driven laps +
+#: the same closing margin as the 1-lap ratio above) x 0.78 = ~1.856. Not
+#: applied at construction -- the training loop sets
+#: ``env.episode_seconds = LONG_EPISODE_RATIO * env.model_lap`` itself, once,
+#: the first time an eval comes back tier-0 (PERFECT). See the long comment
+#: where RaceEnv.__init__ sets the initial (short) episode_seconds for why
+#: this has to be conditional on actually reaching PERFECT rather than a
+#: flat multiplier from the start: applied unconditionally it halves how
+#: often ANY reset happens (grid or scattered) for the entire run, since
+#: termination here is truncation-only, which undertrains exactly the
+#: reset-frequency-dependent behaviours (standing starts, corner-exposure
+#: diversity) a still-converging policy needs most.
+LONG_EPISODE_RATIO = 1.856
+
+#: train_iqn_gpu.py climbs through these one entry at a time (widen_stage in
+#: harvest()), each unlocked by a fresh PERFECT at the current one, ending
+#: at LONG_EPISODE_RATIO. 2026-09-15: tried staged -- (1.3, 1.6,
+#: LONG_EPISODE_RATIO), a 3-step climb instead of one jump -- on the theory
+#: that a smaller per-step difficulty increase would make each individual
+#: re-clear more likely. Result (Monza) read as a small, possibly-noise
+#: improvement over the one-shot jump, not clearly worth the extra
+#: complexity -- reverted to a single entry (one jump, same as before
+#: staging existed) so the curriculum surface stays at just "widen" while a
+#: reward-side fix (RL_RL_LAP_OFF_TOL, config.py) and a robustness gate on
+#: the trigger itself (--widen-after-perfects, train_iqn_gpu.py) are tried
+#: instead. Multi-entry still works if revisited -- nothing else needed
+#: changing to go back to staged, just this tuple.
+EPISODE_WIDEN_STAGES = (LONG_EPISODE_RATIO,)
 
 #: Seconds continuously off the track before the car is recovered onto the
 #: line. Zero tolerance (tried once) converged too slowly and never drove
@@ -87,14 +139,18 @@ class RaceEnv:
 
     def __init__(self, circuit: str, dt: float = 1.0 / 60.0,
                  seed: int = 0, randomise_start: bool = True,
-                 start_at_line: float = 0.15, continuous: bool = False):
+                 start_at_line: float = 0.15, continuous: bool = False,
+                 focus_window: tuple[float, float] | None = None,
+                 adaptive_reset: bool = False):
         #: Continuous mode swaps the discrete IQN action/observation for the
         #: SAC pair -- a [steer, pedal] vector and the rangefinder-based
         #: observation from the Gran Turismo Sport SAC paper.
         self.continuous = continuous
         self.track: Track = load_track(circuit)
         #: Per-env so a longer circuit gets a longer window; the trace tools
-        #: raise it on the instance to watch several laps.
+        #: raise it on the instance to watch several laps. Set for real once
+        #: model_lap is known, below -- this placeholder only matters if
+        #: something reads it before then, which nothing does.
         self.episode_seconds = EPISODE_SECONDS_BY_CIRCUIT.get(
             circuit, EPISODE_SECONDS)
         self.surface = Surface(self.track)
@@ -108,6 +164,31 @@ class RaceEnv:
         #: needs to have seen the far side of a corner to know it is worth
         #: braking for.
         self.start_at_line = start_at_line
+        #: Multiplier on config.RL_OFF_EVENT_COST (the trainer's ramp); 1.0 in the game.
+        self.off_event_scale = 1.0
+        #: Restricts the SCATTERED (non-grid) reset index to a fraction-of-
+        #: lap window (lo, hi), lo/hi wrapping past 1.0 for a window that
+        #: crosses the finish line. None = anywhere on the lap (default).
+        #: For sector-focused training: bias the buffer toward one hard
+        #: sector without special-casing any one circuit -- fractions carry
+        #: over to any track, unlike a hardcoded index range. Give the
+        #: window some margin past the sector's own boundary on each side
+        #: (the caller's job) so the policy sees a realistic spread of
+        #: arrival states at the seam rather than only the sector's own
+        #: interior -- training a sector on a single fixed entry state and
+        #: splicing it to a neighbour trained the same way is where the
+        #: seam mismatch this is meant to avoid actually comes from.
+        #: Grid starts (start_at_line) are untouched, so full-lap coherence
+        #: (the clean-lap bonus, whole-lap credit assignment) keeps getting
+        #: *some* signal even while most resets concentrate on the sector.
+        self.focus_window = focus_window
+        #: See config.RL_ADAPTIVE_* -- mirrors VecRaceEnv.adaptive_reset.
+        #: Mutually exclusive with focus_window (the caller's job).
+        self.adaptive_reset = adaptive_reset
+        if adaptive_reset:
+            nb = config.RL_ADAPTIVE_BUCKETS
+            self.n_buckets = nb
+            self.bucket_fail_ema = np.zeros(nb, dtype=np.float64)
 
         self.line = rlpolicy.reference_line(self.track)
         # Progress and the lookahead geometry stay on the centreline. The
@@ -131,8 +212,38 @@ class RaceEnv:
         # long comment above RL_RL_LAP_W in config.py for why this has to be
         # per-circuit rather than a flat constant.
         v_seg = np.maximum(0.5 * (self.v_ref + np.roll(self.v_ref, -1)), 1e-3)
-        model_lap = float(np.sum(self.shape_line.seg_len / v_seg))
-        self.lap_base = config.RL_RL_LAP_W * model_lap
+        self.model_lap = float(np.sum(self.shape_line.seg_len / v_seg))
+        self.lap_base = config.RL_RL_LAP_W * self.model_lap
+        # EPISODE_SECONDS_BY_CIRCUIT was a hand-tuned override per circuit --
+        # exactly the silent single-track calibration RL_RL_LAP_W's own
+        # comment already flags for lap_base, just for this constant instead.
+        # A circuit that never gets an entry falls back to EPISODE_SECONDS
+        # (130 s, Monza-shaped), which is too short for a longer lap.
+        if circuit not in EPISODE_SECONDS_BY_CIRCUIT:
+            self.episode_seconds = 1.076 * self.model_lap
+        # 2026-09-13, Silverstone: widening the window UNCONDITIONALLY to
+        # ~1.856x model_lap (2 driven laps + closing margin, instead of 1)
+        # so a clean policy could prove a full second lap fixed the flying-
+        # lap-goes-off-track symptom, but broke standing-start and early-
+        # straight throttle commitment: termination here is truncation-only
+        # (a recovery doesn't end an episode), so doubling episode_seconds
+        # exactly halves how often ANY reset happens -- including the
+        # RL_LAUNCH_STOP_FRAC-biased grid starts standing-start behaviour is
+        # learned from, and the scattered starts that spread corner exposure
+        # around the lap. Over the same fixed decision budget that is half
+        # as much exposure to both, for a benefit (proving a full clean
+        # second lap) that only a policy good enough to attempt doesn't need
+        # yet -- for most of training it is pure downside.
+        #
+        # Fix: keep episode_seconds at the SHORT (1-lap) value set above for
+        # exposure diversity through the exploration/convergence phase, and
+        # only widen it once the policy has actually proven it deserves the
+        # harder test -- the training loop flips a RaceEnv's/VecRaceEnv's
+        # episode_seconds to LONG_EPISODE_RATIO * model_lap itself, the
+        # first time an eval comes back genuinely PERFECT (tier 0), not on a
+        # decision-count schedule. Exposed as a ratio, not inlined in the
+        # trainer, so it stays in one place next to the short-side formula
+        # above it.
         self._pace_mult = 1.0
         self.look_idx = rlpolicy._lookahead_indices(self.line)
 
@@ -155,6 +266,7 @@ class RaceEnv:
         self.start_s = 0.0
         self.laps = 0
         self.off_steps = 0
+        self._prev_off = False
         self.wall_steps = 0
         self.recoveries = 0
         self.speed_sum = 0.0
@@ -231,7 +343,26 @@ class RaceEnv:
         self._reset_counters()
         if (self.randomise_start
                 and self.rng.random() >= self.start_at_line):
-            i = int(self.rng.integers(self.track.count))
+            n = self.track.count
+            if self.adaptive_reset:
+                nb = self.n_buckets
+                fe = self.bucket_fail_ema
+                total = fe.sum()
+                norm = fe / total if total > 1e-8 else np.full(nb, 1.0 / nb)
+                weights = (config.RL_ADAPTIVE_FLOOR / nb
+                          + (1.0 - config.RL_ADAPTIVE_FLOOR) * norm)
+                weights /= weights.sum()
+                bkt = int(self.rng.choice(nb, p=weights))
+                per_bucket = max(n // nb, 1)
+                lo_idx = bkt * per_bucket
+                span_idx = n - lo_idx if bkt == nb - 1 else per_bucket
+                i = min(lo_idx + int(self.rng.random() * span_idx), n - 1)
+            elif self.focus_window is not None:
+                lo, hi = self.focus_window
+                span = (hi - lo) % 1.0 or 1.0
+                i = int((lo + self.rng.random() * span) % 1.0 * n)
+            else:
+                i = int(self.rng.integers(n))
             speed_frac = float(self.rng.uniform(0.55, 0.95))
         else:
             i = 0
@@ -279,7 +410,7 @@ class RaceEnv:
         self.recoveries += 1
 
     def step(self, action, off_cost_scale: float = 1.0,
-             pace_mult: float = 1.0
+             pace_mult: float = 1.0, lap_w_mult: float = 1.0
              ) -> tuple[np.ndarray, float, bool, dict]:
         # ``off_cost_scale`` is the training curriculum's multiplier on the
         # per-second off-track fee (config.RL_OFF_TRACK_COST_RAMP). 1.0 for the
@@ -310,6 +441,11 @@ class RaceEnv:
         off_secs = 0.0
         off_dist_speed = 0.0
         off_depth_speed = 0.0        # sum of (metres past the white line) * speed
+        wall_dist_speed = 0.0        # soft-barrier accumulator (RL_EDGE_WALL_*)
+        off_events = 0               # excursions started this decision (RL_OFF_EVENT_COST)
+        if self.adaptive_reset:
+            bucket_off = np.zeros(self.n_buckets)
+            bucket_visit = np.zeros(self.n_buckets)
         for _ in range(ACTION_REPEAT):
             v.step(ctl, self.dt, self.surface)
             self.lap_time += self.dt
@@ -322,10 +458,27 @@ class RaceEnv:
                 % self.line.length - self.line.length * 0.5
             self._last_s = s
             self.speed_sum += v.speed
+            if self.adaptive_reset:
+                bkt = min(i * self.n_buckets // self.track.count,
+                         self.n_buckets - 1)
+                bucket_visit[bkt] += 1.0
+                if not v.on_track:
+                    bucket_off[bkt] += 1.0
             if v.hit_wall:
                 hit_wall = True
                 ke_at_wall = max(ke_at_wall, v.speed * v.speed)
+            if config.RL_EDGE_WALL_COST > 0.0:
+                ws = float(np.dot(v.pos - self.line.center[i],
+                                  self.line.normal[i]))
+                we = float(self.track.w_right[i] if ws > 0.0
+                           else self.track.w_left[i])
+                wd = max((abs(ws) - we) - config.RL_EDGE_WALL_START, 0.0)
+                wall_dist_speed += min(wd / config.RL_EDGE_WALL_WIDTH,
+                                       config.RL_EDGE_WALL_CAP) ** 2 * v.speed
             if not v.on_track:
+                if not self._prev_off:
+                    off_events += 1
+                self._prev_off = True
                 self.off_steps += 1
                 self.lap_off_steps += 1
                 self.off_time += self.dt
@@ -341,12 +494,22 @@ class RaceEnv:
                 # runoff was free speed -- it would send a corner wide and take
                 # the metres. Now a wide line is a metre-for-metre loss.
             else:
+                self._prev_off = False
                 self.off_time = 0.0
                 ds_total += step_ds
             if v.speed < STALL_SPEED:
                 self.stall_time += self.dt
             else:
                 self.stall_time = 0.0
+
+        if self.adaptive_reset:
+            visited = bucket_visit > 0
+            rate = np.where(visited, bucket_off / np.maximum(bucket_visit, 1.0),
+                            self.bucket_fail_ema)
+            decay = config.RL_ADAPTIVE_EMA
+            self.bucket_fail_ema = np.where(
+                visited, self.bucket_fail_ema * decay + rate * (1.0 - decay),
+                self.bucket_fail_ema)
 
         self.steps += 1
         self.progress += ds_total
@@ -372,14 +535,32 @@ class RaceEnv:
             if self.lap_start_time > 0.0:
                 lap_s = self.lap_time - self.lap_start_time
                 self.last_lap_time = lap_s
+                # 2026-09-15: tried replacing this binary threshold with a
+                # continuous off_decay (RL_LAP_OFF_DECAY_CAP), on the theory
+                # that a hard cutoff anywhere creates the same all-or-
+                # nothing-bet problem the threshold itself was already
+                # flagged for once (see RL_RL_LAP_OFF_TOL's own history).
+                # Reverted the same day: two Monza runs (binary 0-tolerance
+                # vs continuous decay) produced near-identical training
+                # trajectories (eval reach within 100 m of each other at
+                # matching iterations) -- the lap bonus fires once per lap,
+                # sparse next to the dense per-step progress/off-track
+                # terms, so reshaping it alone was not reaching the policy's
+                # moment-to-moment decisions either way. A dense per-step
+                # alternative (RL_DIRTY_LAP_PROGRESS_MULT) was tried next
+                # and diverged worse, not better. No confirmed replacement
+                # for this simple version exists, so back to it -- this is
+                # the exact mechanism behind the current Monza record
+                # (91.30 s, Monza_v26k_scratch), confirmed working.
                 clean = (self.lap_off_steps <= config.RL_RL_LAP_OFF_TOL
                          and self.recoveries == self._lap_rec0)
                 if clean:
                     if self.best_lap_time == 0.0 or lap_s < self.best_lap_time:
                         self.best_lap_time = lap_s
                     if getattr(config, "RL_TASK", "linesight") == "raceline":
+                        w_eff = config.RL_RL_LAP_W * lap_w_mult
                         lap_bonus = max(
-                            0.0, self.lap_base - config.RL_RL_LAP_W * lap_s)
+                            0.0, w_eff * (self.model_lap - lap_s))
             self.lap_start_time = self.lap_time
             self.lap_off_steps = 0
             self._lap_rec0 = self.recoveries
@@ -392,6 +573,14 @@ class RaceEnv:
         # penalty made every step negative and flattened the throttle gradient
         # into a do-nothing collapse. Discrete (IQN) keeps it: its near-1
         # discount needs the explicit "faster is better".
+        # 2026-09-15: tried multiplying this by RL_DIRTY_LAP_PROGRESS_MULT
+        # once a lap had gone off-track even once (a dense, every-decision
+        # version of the sparse lap-bonus reshaping above, on the theory
+        # that the dense signal actually reaches the policy) -- reverted
+        # the same day, it diverged worse rather than better. Reverting to
+        # the exact reward this project's Monza record (91.30 s,
+        # Monza_v26k_scratch) was produced under, pending a confirmed
+        # replacement rather than another guess.
         reward = config.RL_PROGRESS_W * ds_total
         if not self.continuous:
             reward -= config.RL_TIME_W * (ACTION_REPEAT * self.dt)
@@ -443,6 +632,12 @@ class RaceEnv:
             else:
                 reward -= (config.RL_OFF_TRACK_COST * off_cost_scale
                            * off_dist_speed * self.dt)
+
+        if config.RL_EDGE_WALL_COST > 0.0:
+            reward -= config.RL_EDGE_WALL_COST * wall_dist_speed * self.dt
+        if config.RL_OFF_EVENT_COST > 0.0 and off_events:
+            reward -= (config.RL_OFF_EVENT_COST * self.off_event_scale
+                       * off_events)
 
         # ---- action-smoothness penalty (continuous only): ||a_t - a_{t-1}||^2.
         # Without it the SAC actor chatters the steering -- a fast oscillation

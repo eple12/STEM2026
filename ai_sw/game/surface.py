@@ -35,6 +35,53 @@ class Surface:
             # straights no barrier segment was ever in range and the car
             # stopped up to 26 m early, against nothing.
             self._barrier.append((segs, track.arclen[near]))
+        # Per centreline sample and side: the chords within query range, with
+        # their outward normals already oriented, plus a conservative bound
+        # used to skip the test outright. Everything here depended only on
+        # (sample, side), yet was rebuilt for every corner of both cars at
+        # every physics step -- the single largest cost in a frame. Kept on the
+        # track, so the player's and the AI's Surface share one build.
+        cand = getattr(track, "_barrier_candidates", None)
+        if cand is None:
+            cand = [self._candidates(k, s) for k, s in ((0, 1), (1, -1))]
+            track._barrier_candidates = cand
+        self._cand = cand
+
+    def _candidates(self, k: int, side: int):
+        """(chord table per sample, clear distance per sample) for one side.
+
+        The clear distance is the least, over the candidate chords, of how far
+        the sample sits inside each chord's outward face. A point closer than
+        that (less the rail's half depth) to the sample is inside every one of
+        those faces, so it cannot be touching any of them -- an exact early
+        out, not an approximation.
+        """
+        t = self.track
+        segs, near = self._barrier[k]
+        n = t.count
+        table = [None] * n
+        clear = np.full(n, np.inf)
+        if len(segs) == 0:
+            return table, clear
+        lap = max(t.length, 1e-6)
+        a_all = segs[:, 0]
+        d_all = segs[:, 1] - a_all
+        for i in range(n):
+            gap = np.abs(near - t.arclen[i])
+            gap = np.minimum(gap, lap - gap)
+            sel = np.nonzero(gap <= config.BARRIER_QUERY_RANGE)[0]
+            if len(sel) == 0:
+                continue
+            a = a_all[sel]
+            d = d_all[sel]
+            L2 = np.maximum((d * d).sum(axis=1), 1e-12)
+            m = np.stack([d[:, 1], -d[:, 0]], axis=1)
+            m /= np.maximum(np.hypot(m[:, 0], m[:, 1]), 1e-9)[:, None]
+            flip = (m @ (t.normal[i] * side)) < 0.0
+            m[flip] = -m[flip]
+            table[i] = (a, d, L2, m)
+            clear[i] = float(((a - t.center[i]) * m).sum(axis=1).min())
+        return table, clear
 
     def _local(self, pos_xz):
         t = self.track
@@ -63,6 +110,9 @@ class Surface:
         """
         t = self.track
         i, offset, _edge = self._local(pos_xz)
+        if not config.BANKING_ENABLED:
+            # A flat circuit: surface_y is exactly zero everywhere.
+            return 0.0, t.normal[i], 0.0
         return (float(t.bank()[i]), t.normal[i],
                 float(t.surface_y(i, offset)))
 
@@ -120,28 +170,14 @@ class Surface:
         pass clean through the barrier between two frames and end up in the
         scenery.
         """
-        segs, near = self._barrier[0 if side > 0 else 1]
-        if len(segs) == 0:
+        # Chords within query range, with outward normals oriented away from
+        # the track -- precomputed per sample, see _candidates.
+        entry = self._cand[0 if side > 0 else 1][0][i]
+        if entry is None:
             return -1e9, None
-        lap = max(self.track.length, 1e-6)
-        gap = np.abs(near - self.track.arclen[i])
-        gap = np.minimum(gap, lap - gap)
-        sel = np.nonzero(gap <= config.BARRIER_QUERY_RANGE)[0]
-        if len(sel) == 0:
-            return -1e9, None
-
-        a = segs[sel, 0]
-        b = segs[sel, 1]
-        d = b - a
-        L2 = np.maximum((d * d).sum(axis=1), 1e-12)
+        a, d, L2, m = entry
         t = np.clip(((p - a) * d).sum(axis=1) / L2, 0.0, 1.0)
         q = a + d * t[:, None]
-
-        # Outward normals, oriented away from the track.
-        m = np.stack([d[:, 1], -d[:, 0]], axis=1)
-        m /= np.maximum(np.hypot(m[:, 0], m[:, 1]), 1e-9)[:, None]
-        flip = (m @ (self.track.normal[i] * side)) < 0.0
-        m[flip] = -m[flip]
 
         # Signed distance past each chord's centre line, plus the half
         # thickness that puts the contact on the face the eye sees rather than
@@ -204,9 +240,16 @@ class Surface:
 
         deep, hit_m = 0.0, None
         touching = []
+        hd = config.BARRIER_HALF_DEPTH
         for p in corners:
             i = t.nearest_index(p, self.hint)
-            side = 1 if float(np.dot(p - t.center[i], t.normal[i])) > 0 else -1
+            rel = p - t.center[i]
+            side = 1 if float(np.dot(rel, t.normal[i])) > 0 else -1
+            # Inside every candidate chord's face by more than the rail's half
+            # depth: no contact is possible, so skip the chord test.
+            clear = self._cand[0 if side > 0 else 1][1][i]
+            if math.hypot(rel[0], rel[1]) + hd < clear - 1e-6:
+                continue
             pen, m = self._barrier_hit(p, i, side)
             if m is None or pen <= 0.0:
                 continue

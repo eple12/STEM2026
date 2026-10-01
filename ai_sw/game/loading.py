@@ -13,10 +13,11 @@ instead of the game, and input is swallowed.
 """
 from __future__ import annotations
 
-from ursina import Entity, Text, camera, destroy, time
+from ursina import Entity, Text, camera, time
 
 from . import palette as pal
-from .ui import GREY, INK, RED, WHITE, pick_font, skew_quad, spaced
+from .ui import (GREY, INK, RED, WHITE, destroy_tree, pick_font, skew_quad,
+                 spaced)
 
 
 class Loading:
@@ -119,5 +120,5 @@ class Loading:
                 self.done = True
 
     def destroy(self):
-        destroy(self.root)
+        destroy_tree(self.root)
         self.root = None

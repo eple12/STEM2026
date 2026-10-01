@@ -84,8 +84,8 @@ class TrackGPU:
         # per-environment, quantity. See the long comment above RL_RL_LAP_W
         # in config.py -- a flat BASE was silently calibrated to Monza only.
         v_seg = np.maximum(0.5 * (v_ref + np.roll(v_ref, -1)), 1e-3)
-        model_lap = float(np.sum(shape.seg_len / v_seg))
-        self.lap_base = config.RL_RL_LAP_W * model_lap
+        self.model_lap = float(np.sum(shape.seg_len / v_seg))
+        self.lap_base = config.RL_RL_LAP_W * self.model_lap
 
         self._build_barriers(track, dev)
 

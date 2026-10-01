@@ -41,10 +41,40 @@ from .vehicle import Controls
 # nicking the white line -- it had to average two coarse levels across the
 # ACTION_REPEAT window to hold a shallow angle. v17 trains from scratch, so it
 # is not locked to a 20-action checkpoint.
+#
+# 2026-09-13: added a THIRD brake gradation (-0.7, "medium"). The v26 family
+# (EDGE_MARGIN=0, several off-track/lap-bonus reward variants) all converged
+# to PERFECT in the 9250-9275 m / ~122.6-123.0 s range regardless of the
+# reward tuning tried, but every one of them showed the SAME four braking-
+# zone speed deficits versus the older, narrower-line v26d run (60-110 km/h
+# slower entering the same corners) -- the reward experiments moved other
+# things but never touched that. This is the same failure this file's own
+# comment above already names for a BINARY brake ("slams full, overshoots
+# slow, releases, carries too much, slams again") -- two brake levels
+# (light/full) still leaves a real gap between "barely slowing" and "hard
+# stop" for trail-braking into a corner. Testing whether a third rung closes
+# it. Changes N_ACTIONS (28->35), so this is a from-scratch run, not a
+# warm-start -- the network's action head is a different size.
+#
+# 2026-09-13: the 3-brake run (v26g) DID fix corner entry -- 20-50 km/h
+# faster into all four problem braking zones, closing most of the gap to
+# v26d -- but lost it straight back out on the exit of those same corners
+# (27-50 km/h slower), for a wash on lap time. Checked whether that exit
+# loss was the same caution relocating (the pattern seen when EDGE_MARGIN
+# went to 0): it is NOT -- cross-track offset on the slow exits was 5.1 m
+# (v26g) vs 0.5 m (v26e4), i.e. v26g ran WIDER there, not more central, so
+# it isn't fear of the edge. More likely: throttle is still binary (0 or
+# 1.0) same as it was before the brake fix, so there is no way to roll
+# progressively back onto the power while steering angle is still bleeding
+# off through the exit arc -- exactly the "binary pedal can't trail into an
+# apex" failure this file already diagnosed for brake, just on the other
+# pedal. Added a half-throttle rung to test the same fix on exit that
+# worked on entry. Changes N_ACTIONS again (35->42): another from-scratch
+# run.
 STEER_LEVELS = (-1.0, -0.6, -0.3, 0.0, 0.3, 0.6, 1.0)
-PEDAL_LEVELS = (1.0, 0.0, -0.4, -1.0)    # throttle / coast / light brake / brake
+PEDAL_LEVELS = (1.0, 0.5, 0.0, -0.4, -0.7, -1.0)  # full/half throttle, coast, light/medium/full brake
 ACTIONS = [(s, p) for p in PEDAL_LEVELS for s in STEER_LEVELS]
-N_ACTIONS = len(ACTIONS)                 # 28  (7 steer x 4 pedal)
+N_ACTIONS = len(ACTIONS)                 # 42  (7 steer x 6 pedal)
 #: The action a fresh history is padded with -- straight and on the throttle.
 DEFAULT_ACTION = ACTIONS.index((0.0, 1.0))
 
@@ -86,7 +116,7 @@ N_VREF = len(VREF_AHEAD_S)
 
 #: Which observation the discrete IQN uses. "rangefinder" -> white-line
 #: rangefinders + curvature + reference speed ahead (36-dim). "lookahead" ->
-#: the original centreline points in car frame + their speeds (59-dim).
+#: centreline points in car frame, geometry only (43-dim).
 RL_OBS = getattr(config, "RL_OBS", "lookahead")
 _RANGEFINDER_OBS = RL_OBS == "rangefinder"
 
@@ -94,8 +124,17 @@ if _RANGEFINDER_OBS:
     #: 2 phase + 5 car + N_PREV_ACTIONS + 1 finish + N_RANGE + N_CURV + N_VREF
     OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + N_RANGE + N_CURV + N_VREF
 else:
-    #: 2 phase + 5 car + N_PREV_ACTIONS + 1 finish + 3*N_LOOK
-    OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + 3 * N_LOOK
+    # 2026-09-14: dropped the per-lookahead-point target speed (was a 3rd
+    # N_LOOK block here, v_ref[js]/MAX_SPEED) -- with RL_SHAPE_TO_RACELINE
+    # off (see its own comment in config.py) v_ref is honest again, but
+    # handing its value to the network as an INPUT is still telling it how
+    # fast to go rather than letting lap-time reward alone decide that --
+    # exactly the crutch a line/pace-discovery run should not have. What is
+    # left is pure track shape: where the road goes, not how fast to take
+    # it. Changes OBS_DIM (59 -> 43), so this is a from-scratch run, not a
+    # warm-start -- the network's input layer is a different size.
+    #: 2 phase + 5 car + N_PREV_ACTIONS + 1 finish + 2*N_LOOK
+    OBS_DIM = 2 + 5 + N_PREV_ACTIONS + 1 + 2 * N_LOOK
 ACT_DIM = N_ACTIONS
 
 #: IQN network sizes, mirroring Linesight scaled down (no image head).
@@ -168,7 +207,9 @@ def observe(vehicle, track, line, v_ref, i: int, prev_actions,
     The tail of the vector is one of two shapes (see ``RL_OBS``):
     "rangefinder" -- white-line distances in a fan of directions, curvature
     ahead, reference speed ahead; "lookahead" -- centreline points in the car
-    frame and their speeds.
+    frame only, no speed -- track shape is the only hint given about how
+    fast to go, so the pace itself is the policy's own to find (see the
+    long comment where N_LOOK's slice of OBS_DIM is defined).
     """
     fwd = np.array([math.sin(vehicle.yaw), math.cos(vehicle.yaw)])
     right = np.array([math.cos(vehicle.yaw), -math.sin(vehicle.yaw)])
@@ -209,7 +250,6 @@ def observe(vehicle, track, line, v_ref, i: int, prev_actions,
         d = line.center[js] - vehicle.pos                   # (N_LOOK, 2)
         obs.extend((d @ right / 60.0).tolist())             # lateral, car frame
         obs.extend((d @ fwd / 120.0).tolist())              # forward, car frame
-        obs.extend((v_ref[js] / config.MAX_SPEED).tolist())  # target speed there
     return np.asarray(obs, dtype=np.float32)
 
 
@@ -218,21 +258,40 @@ def _leaky(x, s=0.01):
     return np.where(x > 0.0, x, x * s)
 
 
-def iqn_q(w, obs_norm, k: int = IQN_K):
+def iqn_embedding(w, k: int = IQN_K):
+    """The quantile embedding. Inference uses fixed quantiles, so this is a
+    constant of the weights -- worth computing once rather than per decision."""
+    tau = (np.linspace(0.5 / k, 1.0 - 0.5 / k, k)).astype(np.float32)  # (k,)
+    ar = np.arange(1, IQN_EMBED + 1, dtype=np.float32)
+    phi = np.cos(ar[None, :] * math.pi * tau[:, None])    # (k, IQN_EMBED)
+    return _leaky(phi @ w["iqn.w"] + w["iqn.b"])          # (k, FLOAT_HIDDEN)
+
+
+def iqn_q(w, obs_norm, k: int = IQN_K, qemb=None):
     """Mean Q-value per action for a batch of normalised observations.
 
     ``obs_norm`` is (B, OBS_DIM). Returns (B, N_ACTIONS). Mirrors the torch
     IQN_Network forward: float features, a per-quantile cosine embedding
-    mixed in by Hadamard product, then a duelling V/A split.
+    mixed in by Hadamard product, then a duelling V/A split. Pass ``qemb``
+    from ``iqn_embedding`` to skip rebuilding it.
     """
     b = obs_norm.shape[0]
     h = _leaky(obs_norm @ w["ff0.w"] + w["ff0.b"])
     h = _leaky(h @ w["ff1.w"] + w["ff1.b"])               # (B, FLOAT_HIDDEN)
 
-    tau = (np.linspace(0.5 / k, 1.0 - 0.5 / k, k)).astype(np.float32)  # (k,)
-    ar = np.arange(1, IQN_EMBED + 1, dtype=np.float32)
-    phi = np.cos(ar[None, :] * math.pi * tau[:, None])    # (k, IQN_EMBED)
-    qemb = _leaky(phi @ w["iqn.w"] + w["iqn.b"])          # (k, FLOAT_HIDDEN)
+    if qemb is None:
+        qemb = iqn_embedding(w, k)
+
+    if b == 1:
+        # The game's case. Kept 2-D so every product is a plain BLAS call
+        # rather than numpy's stacked-matmul loop.
+        mixed = h[0][None, :] * qemb                      # (k, FLOAT_HIDDEN)
+        a = _leaky(mixed @ w["A0.w"] + w["A0.b"])
+        a = a @ w["A1.w"] + w["A1.b"]                     # (k, N_ACTIONS)
+        v = _leaky(mixed @ w["V0.w"] + w["V0.b"])
+        v = v @ w["V1.w"] + w["V1.b"]                     # (k, 1)
+        q = v + a - a.mean(axis=-1, keepdims=True)
+        return q.mean(axis=0)[None, :]
 
     mixed = h[:, None, :] * qemb[None, :, :]              # (B, k, FLOAT_HIDDEN)
     a = _leaky(mixed @ w["A0.w"] + w["A0.b"])
@@ -255,6 +314,10 @@ def available(circuit: str) -> bool:
     return policy_path(circuit).exists()
 
 
+#: m/s below which the AI's grid launch is scripted rather than learned.
+GRID_LAUNCH_SPEED = 8.0
+
+
 class RLDriver:
     """A trained IQN policy wrapped to look like ``Autopilot`` -- same
     ``controls(vehicle)`` call, so the ghost does not care who is driving."""
@@ -269,18 +332,47 @@ class RLDriver:
         self.v_ref = v_ref
         self.surface = surface
         self.look_idx = _lookahead_indices(line)
+        self.qemb = iqn_embedding(self.w)
         self.prev = [DEFAULT_ACTION] * N_PREV_ACTIONS
         self._held = DEFAULT_ACTION
         self._ticks = 0
+        self._on_grid = True
 
     def controls(self, vehicle) -> Controls:
         # Hold each decision for ACTION_REPEAT frames, the way training did --
         # the network never saw itself choosing at 60 Hz.
         if self._ticks % ACTION_REPEAT == 0:
             i, _ = self.surface.progress(vehicle.pos)
+            # The game's grid sits ~6 m BEHIND the line, i.e. at the last
+            # centreline samples, where the "lap remaining" observation reads
+            # ~0 -- but training only ever launched from index 0 (reading
+            # 1.0). Standing still in that never-seen state, some policies
+            # (BrandsHatch) brake-and-steer into a permanent stall. Until the
+            # car is properly into the lap, report the grid as the start line.
+            #
+            # The grand prix grid also puts the AI car 3.2 m to the side of
+            # the centreline (Ghost.__init__), another state training never
+            # launched from: BrandsHatch's policy read it as "stand still" and
+            # sat on the grass with no throttle. So the launch itself is
+            # scripted -- full throttle, straight -- until the car is rolling
+            # at a speed the policy has seen from every kind of start.
+            n = self.track.count
+            launching = False
+            if self._on_grid:
+                if i > 0.9 * n:
+                    i = 0
+                elif i >= 0.05 * n:
+                    self._on_grid = False
+                launching = (self._on_grid
+                             and float(vehicle.speed) < GRID_LAUNCH_SPEED)
+            if launching:
+                self._held = DEFAULT_ACTION
+                self._ticks += 1
+                return controls_for(self._held)
             obs = observe(vehicle, self.track, self.line, self.v_ref, i,
                           self.prev, self.look_idx, self.surface)
-            q = iqn_q(self.w, normalise(obs[None], self.mean, self.std))[0]
+            q = iqn_q(self.w, normalise(obs[None], self.mean, self.std),
+                      qemb=self.qemb)[0]
             self._held = int(np.argmax(q))
             self.prev = self.prev[1:] + [self._held]
         self._ticks += 1

@@ -38,7 +38,9 @@ MODEL_DIR = config.ASSET_DIR / "models" / "kenney"
 F1_DIR = config.ASSET_DIR / "models" / "f1"
 DEFAULT_MODEL = config.PLAYER_MODEL
 
-SQUAT_MAX = 0.07              # metres of ride-height drop at full downforce
+#: Ride-height drop at full downforce -- config.BODY_SQUAT_MAX, kept as a
+#: module constant for the previews that import it directly.
+SQUAT_MAX = config.BODY_SQUAT_MAX
 # Named nodes inside the asset; the value says whether that wheel steers.
 WHEEL_NODES = {
     "wheelFrontLeft": True, "wheelFrontRight": True,
@@ -297,7 +299,10 @@ class Car(Entity):
         cap = config.BODY_ROLL_MAX
         self._roll += (max(-cap, min(cap, -t.lat_accel * config.BODY_ROLL_GAIN))
                        - self._roll) * k
-        self._pitch += (max(-3.5, min(3.5, -t.long_accel * 0.20)) - self._pitch) * k
+        pcap = config.BODY_PITCH_MAX
+        self._pitch += (max(-pcap, min(pcap, -t.long_accel
+                                       * config.BODY_PITCH_GAIN))
+                        - self._pitch) * k
         self.hull.rotation_z = self._roll
         self.hull.rotation_x = self._pitch
 

@@ -23,16 +23,17 @@ from __future__ import annotations
 
 import math
 
-from ursina import Circle, Entity, Mesh, Text, Vec3, camera, destroy, window
+from ursina import Circle, Entity, Mesh, Text, Vec3, camera, window
 
 from . import config
 from . import palette as pal
 from .trackdata import Track
+from .ui import destroy_tree
 from .ui import (AMBER, GLASS, GLASS_HI, GREEN, GREY, GREY_DIM, INK, KEYCAP,
                  LAMP_OFF, LAMP_ON, LED_BLUE, LED_GREEN, LED_OFF, LED_RED,
                  PANEL_HI, PURPLE, RED, SLANT_DEG, TEAM_AI, TEAM_YOU, WHITE,
-                 YELLOW, caption, gear_of, lap_time, pick_font, skew_quad,
-                 spaced)
+                 YELLOW, caption, delta_time, gear_of, lap_time, pick_font,
+                 skew_quad, spaced)
 
 #: Sector-light colour by status. "live" is the sector being driven now.
 SECTOR_COL = {"purple": PURPLE, "green": GREEN, "yellow": YELLOW,
@@ -41,9 +42,19 @@ SECTOR_COL = {"purple": PURPLE, "green": GREEN, "yellow": YELLOW,
 #: The key legend along the bottom edge, as (key, what it does).
 KEYS = (("W", "THROTTLE"), ("S", "BRAKE"), ("A/D", "STEER"),
         ("SPACE", "HANDBRAKE"), ("R", "RESET"), ("C", "CAMERA"),
-        ("G", "WATCH AI"), ("T", "AIDS"), ("M", "MUTE"), ("ESC", "PAUSE"))
+        ("G", "WATCH AI"), ("T", "AIDS"), ("M", "MUTE"), ("H", "HUD"),
+        ("ESC", "PAUSE"))
 
 N_LEDS = 12
+
+#: Flag plate and text colour, by what the flag is saying.
+FLAG_COL = {"warn": (YELLOW, INK), "red": (RED, WHITE), "pen": (AMBER, INK)}
+
+
+def pen_tag(seconds: float) -> str:
+    """A penalty as a tower tag: seconds, with a decimal while it is small
+    enough for one to matter."""
+    return f"+{seconds:.1f}S" if seconds < 20 else f"+{seconds:.0f}S"
 
 
 class _QuadBatch:
@@ -84,16 +95,111 @@ class _QuadBatch:
         return e
 
 
+class _QuadRef:
+    """One block inside a ``_DynQuads``, recoloured through ``.color`` just
+    as the Entity it stands in for was."""
+
+    __slots__ = ("_owner", "_index", "_color")
+
+    def __init__(self, owner, index: int, col):
+        self._owner, self._index, self._color = owner, index, col
+
+    @property
+    def color(self):
+        return self._color
+
+    @color.setter
+    def color(self, col):
+        self._color = col
+        self._owner.recolor(self._index, col)
+
+
+class _DynQuads:
+    """Opaque blocks whose colour changes at runtime, merged into one mesh.
+
+    The shift lights and sector lights were an Entity each: fifteen draw
+    calls, each with its own shader bind, for rectangles that never move.
+    Here each is four vertices in one mesh, and a colour change rewrites
+    those four vertex colours in place -- no new node and no new render
+    state. Opaque colours only: the mesh stays in the opaque bin, where the
+    entities it replaces were drawn.
+    """
+
+    def __init__(self):
+        self.v: list = []
+        self.t: list = []
+        self.c: list = []
+        self.entity = None
+
+    def add(self, x, y, z, w, h, col) -> _QuadRef:
+        n = len(self.v)
+        # Corner order and winding of Ursina's own "quad" model.
+        for px, py in ((-w / 2, -h / 2), (w / 2, -h / 2),
+                       (w / 2, h / 2), (-w / 2, h / 2)):
+            self.v.append((x + px, y + py, z))
+            self.c.append(col)
+        self.t += [n, n + 1, n + 2, n + 2, n + 3, n]
+        return _QuadRef(self, n // 4, col)
+
+    def build(self, parent):
+        if not self.v:
+            return None
+        self.entity = Entity(parent=parent,
+                             model=Mesh(vertices=self.v, triangles=self.t,
+                                        colors=self.c, mode="triangle",
+                                        static=False))
+        return self.entity
+
+    def recolor(self, i: int, col):
+        if self.entity is None:
+            self.c[4 * i:4 * i + 4] = [col] * 4
+            return
+        from panda3d.core import GeomVertexWriter
+        vdata = self.entity.model.geomNode.modifyGeom(0).modifyVertexData()
+        w = GeomVertexWriter(vdata, "color")
+        w.setRow(4 * i)
+        r, g, b, a = (float(col[0]), float(col[1]), float(col[2]),
+                      float(col[3]))
+        for _ in range(4):
+            w.setData4f(r, g, b, a)
+
+
+#: The outline of a 28-sided disc, taken off one ``Circle`` and reused.
+_DISC_VERTS = None
+
+
+def _disc() -> Mesh:
+    """A lamp disc -- a fresh mesh each time, since each lamp is recoloured on
+    its own node. Only the first is built through ``Circle``: that class spins
+    a helper Entity to find its points and leaves the inner one behind in
+    ``scene.entities`` every time, which is ten stray entities a race."""
+    global _DISC_VERTS
+    if _DISC_VERTS is None:
+        _DISC_VERTS = [Vec3(v) for v in
+                       Circle(resolution=28, mode="ngon").vertices]
+    return Mesh(vertices=list(_DISC_VERTS), mode="ngon")
+
+
 class HUD:
     # Tower geometry, shared with the result card so the two tables read as
     # the same table.
     ROW_H = 0.058
-    TOWER_W = 0.400
+    TOWER_W = 0.470
     COL_POS, COL_BAR, COL_NAME, COL_GAP, COL_BEST = 0.026, 0.0555, 0.072, 0.275, 0.388
+    #: A time penalty rides beside the best lap as its own tag. Amber and
+    #: slim, not a full-height red block: on a broadcast tower a pending
+    #: penalty is a small marker against the driver, and the red of this
+    #: overlay already belongs to the wordmark and the section rules -- a
+    #: solid red box beside every lap time fought all of it.
+    COL_PEN = 0.428
+    PEN_W, PEN_H = 0.066, 0.024
 
-    def __init__(self, track: Track, total_laps: int):
+    def __init__(self, track: Track, total_laps: int, mode: str = "gp"):
         self.track = track
         self.total_laps = total_laps
+        #: Qualifying has no race distance and no result card; its lap
+        #: counter counts up, and the lap block carries a live delta.
+        self.quali = mode == "quali"
         # The UI plane spans x in [-aspect/2, +aspect/2], so a panel pinned at a
         # fixed x is only in the right place at one aspect ratio. Panels are
         # placed relative to the edge they belong to, and the whole HUD is
@@ -115,6 +221,7 @@ class HUD:
         self._static_txt: list = []
 
         self._batch = _QuadBatch()
+        self._dyn = _DynQuads()
         # Collect static text only from the widgets that are on screen for the
         # whole race. The flag, spectator strip and the two end cards are
         # toggled and mostly hidden, so their labels cost nothing where they
@@ -130,6 +237,7 @@ class HUD:
         if config.SHOW_KEY_HINTS:
             self._build_keys()
         self._batch.build(self.root)
+        self._dyn.build(self.root)
         self._freeze_static_text()
         self._build_lights()
         self._build_spectator()
@@ -157,7 +265,6 @@ class HUD:
         Geom. Nothing about what is drawn changes.
         """
         from panda3d.core import TransparencyAttrib
-        from ursina import destroy
         from ursina.shaders.text_shader import text_shader
 
         holder = Entity(parent=self.root, name="hud_static_text")
@@ -176,7 +283,7 @@ class HUD:
                     continue
                 np = holder.attachNewNode(geom)
                 np.setMat(tnp.getMat(self.root))
-            destroy(t)
+            destroy_tree(t)
         self._static_txt = []
         holder.flattenStrong()
 
@@ -208,6 +315,11 @@ class HUD:
         px, py = self._root_xy(parent)
         self._batch.add(px - self._batch.ox + pos[0],
                         py - self._batch.oy + pos[1], z, w, h, 0.0, col)
+
+    def _dyn_quad(self, parent, w, h, pos, col, z=0.03):
+        """A block that only ever changes colour, merged into ``_dyn``."""
+        px, py = self._root_xy(parent)
+        return self._dyn.add(px + pos[0], py + pos[1], z, w, h, col)
 
     @staticmethod
     def _quad(parent, w, h, pos, col, z=0.03, origin=(0, 0)):
@@ -302,8 +414,14 @@ class HUD:
                             origin=(0.5, 0), parent=row, static=False)
             best = self._txt("", size=0.78, pos=(self.COL_BEST, -0.001),
                              origin=(0.5, 0), parent=row, static=False)
+            pen = Entity(parent=row, position=(self.COL_PEN, 0, 0),
+                         enabled=False)
+            self._quad(pen, self.PEN_W, self.PEN_H, (0, 0), AMBER, z=0.04)
+            pen_txt = self._txt("", size=0.58, pos=(0, -0.0005), origin=(0, 0),
+                                col=INK, parent=pen, static=False)
             self.rows.append(dict(row=row, bg=bg, pos=pos, bar=bar, tla=tla,
-                                  name=name, gap=gap, best=best))
+                                  name=name, gap=gap, best=best, pen=pen,
+                                  pen_txt=pen_txt))
 
     # -- lap-time block (top-right) ---------------------------------------
     def _build_laptime(self):
@@ -318,6 +436,10 @@ class HUD:
         self._rect(r, 0.118, 0.026, (0.059, -0.013), RED, z=0.07)
         self._txt(spaced("lap time"), size=0.50, pos=(0.059, -0.013),
                   origin=(0, 0), parent=r)
+        # Qualifying: the live gap to the ghost lap at this point on the lap,
+        # green when ahead of it.
+        self.delta = self._txt("", size=0.62, pos=(W - 0.016, -0.013),
+                               origin=(0.5, 0), parent=r, static=False)
         # Current, big and amber, the sector lights beneath it.
         self._txt(spaced("current"), size=0.52, col=GREY, pos=(0.016, -0.059),
                   parent=r)
@@ -328,8 +450,8 @@ class HUD:
         bw = (W - 0.032 - 0.016) / 3
         for k in range(3):
             cx = 0.016 + bw / 2 + k * (bw + 0.008)
-            self.sectors.append(self._quad(r, bw, 0.011, (cx, -0.104),
-                                           SECTOR_COL["off"], z=0.05))
+            self.sectors.append(self._dyn_quad(r, bw, 0.011, (cx, -0.104),
+                                               SECTOR_COL["off"], z=0.05))
             self._txt(f"S{k + 1}", size=0.40, col=GREY_DIM,
                       pos=(cx - bw / 2, -0.118), parent=r)
         self._rect(r, W - 0.032, 0.0015, (W / 2, -0.127), GLASS_HI, z=0.07)
@@ -357,7 +479,8 @@ class HUD:
         pitch = 0.019
         for k in range(N_LEDS):
             x = (k - (N_LEDS - 1) / 2) * pitch
-            self.leds.append(self._quad(s, 0.015, 0.008, (x, 0.058), LED_OFF, z=0.04))
+            self.leds.append(self._dyn_quad(s, 0.015, 0.008, (x, 0.058), LED_OFF,
+                                            z=0.04))
         self._led_col = ([LED_GREEN] * 4 + [LED_RED] * 4 + [LED_BLUE] * 4)
 
         # Speed: one Text per digit on a fixed pitch. Bahnschrift's figures are
@@ -449,12 +572,13 @@ class HUD:
 
     # -- flags, lower-third, start lights, keys ----------------------------
     def _build_flag(self):
-        """A marshal's flag: OFF TRACK on yellow, WRONG WAY on red."""
+        """A marshal's flag: OFF TRACK on yellow; WRONG WAY, LAP INVALID and
+        penalties on red."""
         f = Entity(parent=self.root,
-                   position=(-self.edge + self.margin + 0.130, -0.410, 0),
+                   position=(-self.edge + self.margin + 0.160, -0.410, 0),
                    enabled=False)
         self.flag = f
-        self.flag_plate = Entity(parent=f, model=skew_quad(0.240, 0.050),
+        self.flag_plate = Entity(parent=f, model=skew_quad(0.320, 0.050),
                                  color=YELLOW, position=(0, 0, 0.05))
         self.flag_txt = self._txt("", size=0.86, col=INK, pos=(0.004, 0),
                                   origin=(0, 0), parent=f)
@@ -469,7 +593,8 @@ class HUD:
         self._txt("AI", size=1.35, pos=(0.035, -0.002), origin=(0, 0), parent=c)
         self._plate(c, 0.330, 0.072, (0.070 + 0.165, 0, 0.1))
         self._txt("AI DRIVER", size=1.1, pos=(0.086, 0.011), parent=c)
-        self._txt(spaced("onboard") + "   ·   " + spaced("trained policy"),
+        self._txt(spaced("onboard") + "   ·   "
+                  + spaced("ghost lap" if self.quali else "trained policy"),
                   size=0.46, col=GREY, pos=(0.086, -0.017), parent=c)
         Entity(parent=c, model="circle", scale=0.011, color=RED,
                position=(0.382, 0.011, -0.02))
@@ -498,10 +623,10 @@ class HUD:
         self.lamps = []
         for k in range(5):
             x = (k - 2) * 0.088
-            Entity(parent=g, model=Circle(resolution=28, mode="ngon"),
-                   color=pal.rgb(34, 34, 42), scale=0.088, position=(x, 0, 0.01))
-            lamp = Entity(parent=g, model=Circle(resolution=28, mode="ngon"),
-                          scale=0.070, position=(x, 0, 0.0))
+            Entity(parent=g, model=_disc(), color=pal.rgb(34, 34, 42),
+                   scale=0.088, position=(x, 0, 0.01))
+            lamp = Entity(parent=g, model=_disc(), scale=0.070,
+                          position=(x, 0, 0.0))
             self._lamp(lamp, LAMP_OFF)
             self.lamps.append(lamp)
 
@@ -575,8 +700,14 @@ class HUD:
                              origin=(0.5, 0), parent=row)
             gap = self._txt("", size=0.90, pos=(cols["gap"], -0.001),
                             origin=(0.5, 0), parent=row)
+            pen = Entity(parent=row, position=(cols["best"] + 0.086, 0, 0),
+                         enabled=False)
+            self._quad(pen, 0.078, 0.028, (0, 0), AMBER, z=0.04)
+            pen_txt = self._txt("", size=0.66, pos=(0, -0.0005), origin=(0, 0),
+                                col=INK, parent=pen)
             self.fin_rows.append(dict(bg=bg, pos=pos, bar=bar, tla=tla, name=name,
-                                      best=best, gap=gap))
+                                      best=best, gap=gap, pen=pen,
+                                      pen_txt=pen_txt))
         self._rect(f, W - 0.060, 0.0015, (0, -H / 2 + 0.058), PANEL_HI, z=0.05)
         self._txt(spaced("enter") + "   or   " + spaced("esc")
                   + "        BACK TO MENU", size=0.60, col=GREY,
@@ -585,34 +716,97 @@ class HUD:
         self._batch = _QuadBatch()
 
     def _build_pause(self):
+        """The pause card: a short menu, picked with W/S and ENTER.
+
+        A grand prix can be restarted from here -- the same race again from
+        the grid, without going back through the menus. Qualifying has
+        nothing to restart: every lap is already a fresh attempt.
+        """
+        self.pause_items = (("resume", "RESUME"),
+                            *(() if self.quali else (("restart", "RESTART RACE"),)),
+                            ("exit", "EXIT TO MENU"))
+        n = len(self.pause_items)
+        W = 0.560
+        H = 0.221 + 0.036 * n + 0.032
+        top = H / 2
         p = Entity(parent=self.root, position=(0, 0.03, -0.25), enabled=False)
         self.pause = p
-        W, H = 0.560, 0.250
         self._batch = _QuadBatch(p.x, p.y)
         self._plate(p, W, H, (0, 0, 0.1), col=INK)
-        self._rect(p, W, 0.030, (0, H / 2 - 0.015), pal.rgb(12, 12, 18), z=0.08)
-        self._rect(p, 0.120, 0.030, (-W / 2 + 0.060, H / 2 - 0.015), RED, z=0.07)
-        self._txt(spaced("paused"), size=0.52, pos=(-W / 2 + 0.060, H / 2 - 0.015),
+        self._rect(p, W, 0.030, (0, top - 0.015), pal.rgb(12, 12, 18), z=0.08)
+        self._rect(p, 0.120, 0.030, (-W / 2 + 0.060, top - 0.015), RED, z=0.07)
+        self._txt(spaced("paused"), size=0.52, pos=(-W / 2 + 0.060, top - 0.015),
                   origin=(0, 0), parent=p)
-        self._txt(self.circuit, size=1.7, pos=(-W / 2 + 0.030, 0.040), parent=p)
-        self._txt(f"{self.country}  ·  {self.total_laps} LAPS", size=0.52, col=GREY,
-                  pos=(-W / 2 + 0.030, 0.004), parent=p)
-        self._rect(p, W - 0.060, 0.0015, (0, -0.030), PANEL_HI, z=0.05)
-        self._txt(spaced("esc") + "        RESUME", size=0.70,
-                  pos=(-W / 2 + 0.030, -0.060), parent=p)
-        self._txt(spaced("enter") + "      EXIT TO MENU", size=0.70, col=GREY,
-                  pos=(-W / 2 + 0.030, -0.098), parent=p)
+        self._txt(self.circuit, size=1.7, pos=(-W / 2 + 0.030, top - 0.085),
+                  parent=p)
+        session = ("QUALIFYING" if self.quali
+                   else f"GRAND PRIX  ·  {self.total_laps} LAPS")
+        self._txt(f"{self.country}  ·  {session}", size=0.52, col=GREY,
+                  pos=(-W / 2 + 0.030, top - 0.121), parent=p)
+        self._rect(p, W - 0.060, 0.0015, (0, top - 0.155), PANEL_HI, z=0.05)
+        self._pause_y = []
+        self.pause_rows = []
+        for k, (_, label) in enumerate(self.pause_items):
+            y = top - 0.185 - 0.036 * k
+            self._pause_y.append(y)
+            self.pause_rows.append(self._txt(label, size=0.70, col=GREY,
+                                             pos=(-W / 2 + 0.042, y), parent=p))
+        hint_y = top - 0.185 - 0.036 * n - 0.004
+        self._txt(spaced("w/s") + "   SELECT      " + spaced("enter")
+                  + "   CONFIRM      " + spaced("esc") + "   RESUME      "
+                  + "P   HIDE",
+                  size=0.44, col=GREY_DIM, pos=(-W / 2 + 0.030, hint_y),
+                  parent=p)
         self._batch.build(p)
         self._batch = _QuadBatch()
+        # The cursor: a red tab beside the row, the menu's own marker.
+        self._pause_cursor = Entity(parent=p, model="quad", color=RED,
+                                    scale=(0.005, 0.022),
+                                    position=(-W / 2 + 0.028, self._pause_y[0],
+                                              -0.05))
+        self._pause_sel = -1
+
+    def _set_pause_sel(self, sel: int):
+        if sel == self._pause_sel:
+            return
+        self._pause_sel = sel
+        self._pause_cursor.y = self._pause_y[sel]
+        for k, row in enumerate(self.pause_rows):
+            self._col(row, WHITE if k == sel else GREY)
 
     # -- per-frame update ------------------------------------------
     @staticmethod
     def _set(entity, value: str):
         """Assigning Text.text rebuilds the glyph mesh, which costs about as
         much as the whole physics step. Most of these strings are identical
-        frame to frame, so only write the ones that actually changed."""
-        if entity.text != value:
-            entity.text = value
+        frame to frame, so only write the ones that actually changed.
+
+        The ones that do change -- the running lap time and the speed, every
+        frame -- are not rebuilt either. Ursina's setter throws the whole text
+        away: three fresh TextNodes (tag parsing leaves two empty ones in
+        front), a shader and its inputs bound on each, and every one of those
+        a new render state for Panda to compose and later garbage-collect.
+        For a single line with no tags, all that changes is the string and the
+        horizontal offset ``Text.align`` derives from its width, so the
+        existing node is handed the new string and moved, which draws exactly
+        what the rebuild would.
+        """
+        if entity.text == value:
+            return
+        nodes = entity.text_nodes
+        if (nodes and "\n" not in value and entity.start_tag not in value
+                and entity.end_tag not in value and not entity.images):
+            node = nodes[-1].node()
+            node.setText(value)
+            w = node.calcWidth(value)
+            # Text.align, for one line: every node of the text is shifted by
+            # the first line's width times (half + origin_x), in node scale.
+            k = w * (0.5 + entity.origin[0])
+            for tn in nodes:
+                tn.setX(-k * tn.getScale()[0])
+            entity.raw_text = value
+            return
+        entity.text = value
 
     @staticmethod
     def _col(entity, col):
@@ -640,6 +834,12 @@ class HUD:
         self._col(row["best"], PURPLE if entry.get("purple") else WHITE)
         self._set(row["gap"], entry["gap"])
         self._col(row["gap"], WHITE if leader else GREY)
+        pen = entry.get("pen") or 0.0
+        show_pen = pen > 0.05
+        if row["pen"].enabled != show_pen:
+            row["pen"].enabled = show_pen
+        if show_pen:
+            self._set(row["pen_txt"], pen_tag(pen))
         if opaque:
             self._col(row["bg"], pal.rgb(48, 48, 64) if leader else PANEL_HI)
         else:
@@ -659,12 +859,14 @@ class HUD:
                flag="", spectating=False, car_xz=None, ghost_xz=None,
                throttle=0.0, brake=0.0, steer=0.0, slip=0.0, tc_cut=0.0,
                esc_cut=0.0, tc_off=False, dt=1.0 / 60.0, finished=False,
-               paused=False):
+               paused=False, pause_sel=0, delta=None, cur_invalid=False,
+               last_invalid=False, flag_style="warn"):
         # -- session bar ---------------------------------------------
         # Past the last lap the car is on an in-lap, not on lap 4 of 3, and
         # clamping to "3/3" made a car still circulating look like it was on
-        # its final tour for ever.
+        # its final tour for ever. Qualifying has no distance to count to.
         self._set(self.lap, "OUT" if lap == 0
+                  else str(lap) if self.quali
                   else "FIN" if lap > self.total_laps
                   else f"{lap}/{self.total_laps}")
         m, s = divmod(int(session_t), 60)
@@ -676,8 +878,17 @@ class HUD:
         self._set(self.best, lap_time(best_t))
         # Green when the lap just completed *is* the best -- the timing-tower
         # cue for a personal best that has not yet been beaten.
-        self._col(self.last, GREEN if last_t is not None and best_t is not None
+        # Red for a deleted lap, the running one included: the time is still
+        # shown, so the driver can see what the off cost them.
+        self._col(self.cur, RED if cur_invalid else AMBER)
+        self._col(self.last, RED if last_invalid
+                  else GREEN if last_t is not None and best_t is not None
                   and abs(last_t - best_t) < 1e-6 else WHITE)
+        if delta is None:
+            self._set(self.delta, "")
+        else:
+            self._set(self.delta, delta_time(delta))
+            self._col(self.delta, GREEN if delta < 0 else RED)
         for block, (_, status) in zip(self.sectors, sectors):
             self._col(block, SECTOR_COL.get(status, SECTOR_COL["off"]))
 
@@ -758,9 +969,12 @@ class HUD:
             self.flag.enabled = show_flag
         if show_flag:
             self._set(self.flag_txt, flag)
-            red = flag == "WRONG WAY"
-            self._col(self.flag_plate, RED if red else YELLOW)
-            self._col(self.flag_txt, WHITE if red else INK)
+            # A penalty is amber, a rule broken outright is red, a warning is
+            # the marshal's yellow -- the same three the tower and the sector
+            # lights already use.
+            plate, ink = FLAG_COL.get(flag_style, FLAG_COL["warn"])
+            self._col(self.flag_plate, plate)
+            self._col(self.flag_txt, ink)
 
         # -- cards ----------------------------------------------------
         if self.finish.enabled != finished:
@@ -771,7 +985,9 @@ class HUD:
                     self._set_row(row, standings[k], leader=k == 0, opaque=True)
         if self.pause.enabled != paused:
             self.pause.enabled = paused
+        if paused:
+            self._set_pause_sel(pause_sel)
 
     def destroy(self):
-        destroy(self.root)
+        destroy_tree(self.root)
         self.root = None

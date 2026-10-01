@@ -573,13 +573,23 @@ class Track:
         """
         n = self.count
         px, pz = float(pos_xz[0]), float(pos_xz[1])
-        idx = (hint + np.arange(-window, window + 1)) % n
-        pts = self.center[idx]
-        dx = pts[:, 0] - px
-        dz = pts[:, 1] - pz
-        k = int(np.argmin(dx * dx + dz * dz))
+        # Plain Python over a list: twenty-one points is far below the size
+        # where numpy's per-call overhead pays for itself, and this runs a
+        # dozen times per car per physics step.
+        cl = getattr(self, "_center_list", None)
+        if cl is None or len(cl) != n:
+            cl = self._center_list = self.center.tolist()
+        lo = hint - window
+        best, k = math.inf, 0
+        for j in range(2 * window + 1):
+            cx, cz = cl[(lo + j) % n]
+            dx = cx - px
+            dz = cz - pz
+            d = dx * dx + dz * dz
+            if d < best:
+                best, k = d, j
         if 0 < k < 2 * window:
-            return int(idx[k])
+            return (lo + k) % n
 
         dx = self.center[:, 0] - px
         dz = self.center[:, 1] - pz
@@ -847,6 +857,11 @@ class Track:
         p = np.atleast_2d(np.asarray(pts, dtype=float))
         n = self.count
         i = self.nearest_indices(p)
+        if not config.BANKING_ENABLED:
+            # Flat circuit: height and camber are exactly zero everywhere, and
+            # this is called for every car and the camera every frame.
+            z = np.zeros(len(p))
+            return z, z.copy(), self.normal[i]
         d = p - self.center[i]
         # Blended along the lap between the two samples the point lies
         # between. Snapping to the nearest one makes the surface a staircase

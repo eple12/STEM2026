@@ -35,10 +35,63 @@ def rl_line(track):
     return rlpolicy.reference_line(track)
 
 
+def make_driver(track: Track, surface: Surface, pace: float | None = None):
+    """(driver, planner, line, pace) -- the AI as the ghost drives it.
+
+    Shared with tools/record_ghost.py, so the lap replayed in qualifying is
+    driven by exactly the driver the grand prix races against.
+    """
+    # The learned line and the constants it was learned with. They come as
+    # a pair: on Monza the line alone, driven with the hand-picked
+    # constants, laps 141.2 s against the centreline's 126.0, while the
+    # two together lap 108.3.
+    line = raceline.load(track)
+    learned_pace, tuning = raceline.load_tuning(track)
+    if learned_pace is None:
+        pace = config.GHOST_PACE if pace is None else pace
+    else:
+        # Difficulty scales the learned pace rather than replacing it, so
+        # an easier ghost is the same driver committing less -- not a
+        # different driver on a line that no longer suits it.
+        scale = 1.0 if pace is None else pace / config.GHOST_PACE
+        pace = learned_pace * scale
+    pilot = Autopilot(track, surface, line=line, pace=pace, tuning=tuning,
+                      speed_scale=raceline.load_speed(track))
+    # A trained policy drives instead, where the circuit has one. It is
+    # handed the same reference line the training environment used -- the
+    # imported f1tenth trajectory -- because the observation is measured
+    # against it, and a policy shown a different line than it learned on
+    # is reading the road wrong.
+    driver = pilot
+    if config.GHOST_DRIVER == "rl" and rlpolicy.available(track.name):
+        env_line = rl_line(track)
+        driver = rlpolicy.RLDriver(
+            track, env_line,
+            raceline.speed_profile(env_line.seg_len, env_line.curvature,
+                                   env_line.curv_radius, 1.0),
+            surface)
+    return driver, pilot, line, pace
+
+
+def ghost_car(vehicle: Vehicle) -> Car:
+    """The ghost's translucent body, for a live AI or a replayed lap."""
+    car = Car(vehicle, model=config.GHOST_MODEL)
+    # Translucent. The shader passes the albedo's alpha straight through,
+    # and the albedo picks up p3d_ColorScale, so a colour scale is all it
+    # takes -- no second material and no separate shader.
+    car.set_transparency(TransparencyAttrib.M_alpha)
+    car.set_color_scale(1.0, 1.0, 1.0, config.GHOST_ALPHA)
+    return car
+
+
 class Ghost:
     """A second car, driven by the autopilot, with per-sample lap splits."""
 
-    def __init__(self, track: Track, pace: float | None = None):
+    #: Always on screen; a replayed lap (replay.ReplayGhost) is not.
+    visible = True
+
+    def __init__(self, track: Track, pace: float | None = None,
+                 out_lap: bool = True):
         self.track = track
         # Its own Surface: the class carries a nearest-sample hint from call to
         # call, and two cars in different parts of the lap sharing one would
@@ -54,42 +107,9 @@ class Ghost:
                - track.tangent[0] * config.GHOST_GRID_BACK)
         self.vehicle.place(pos, yaw)
 
-        # The learned line and the constants it was learned with. They come as
-        # a pair: on Monza the line alone, driven with the hand-picked
-        # constants, laps 141.2 s against the centreline's 126.0, while the
-        # two together lap 108.3.
-        self.line = raceline.load(track)
-        learned_pace, tuning = raceline.load_tuning(track)
-        if learned_pace is None:
-            self.pace = config.GHOST_PACE if pace is None else pace
-        else:
-            # Difficulty scales the learned pace rather than replacing it, so
-            # an easier ghost is the same driver committing less -- not a
-            # different driver on a line that no longer suits it.
-            scale = 1.0 if pace is None else pace / config.GHOST_PACE
-            self.pace = learned_pace * scale
-        self.pilot = Autopilot(track, self.surface, line=self.line,
-                               pace=self.pace, tuning=tuning,
-                               speed_scale=raceline.load_speed(track))
-        # A trained policy drives instead, where the circuit has one. It is
-        # handed the same reference line the training environment used -- the
-        # imported f1tenth trajectory -- because the observation is measured
-        # against it, and a policy shown a different line than it learned on
-        # is reading the road wrong.
-        self.driver = self.pilot
-        if config.GHOST_DRIVER == "rl" and rlpolicy.available(track.name):
-            env_line = rl_line(track)
-            self.driver = rlpolicy.RLDriver(
-                track, env_line,
-                raceline.speed_profile(env_line.seg_len, env_line.curvature,
-                                       env_line.curv_radius, 1.0),
-                self.surface)
-        self.car = Car(self.vehicle, model=config.GHOST_MODEL)
-        # Translucent. The shader passes the albedo's alpha straight through,
-        # and the albedo picks up p3d_ColorScale, so a colour scale is all it
-        # takes -- no second material and no separate shader.
-        self.car.set_transparency(TransparencyAttrib.M_alpha)
-        self.car.set_color_scale(1.0, 1.0, 1.0, config.GHOST_ALPHA)
+        self.driver, self.pilot, self.line, self.pace = make_driver(
+            track, self.surface, pace)
+        self.car = ghost_car(self.vehicle)
 
         #: Seconds into the current lap when the ghost passed each centreline
         #: sample, and the same for the lap before it. Two laps because the
@@ -100,7 +120,14 @@ class Ghost:
         self.prev_splits = np.full(track.count, np.nan)
 
         self.lap_time = 0.0
-        self.lap_num = 0                 # 0 while it is on its out lap
+        # 0 while it is on its out lap. A grand prix has none: lap 1 is timed
+        # from the lights, the same as the player's.
+        self.lap_num = 0 if out_lap else 1
+        #: Seconds driven since the lights, on the physics clock, and the value
+        #: it had at the chequered flag. Set by the race, which knows the
+        #: distance; the ghost only knows laps.
+        self.race_t = 0.0
+        self.finish_t: float | None = None
         self.last_t: float | None = None
         self.best_t: float | None = None
         #: Best time through each third of the lap, read off the splits when
@@ -130,6 +157,7 @@ class Ghost:
         self.controls = self.driver.controls(self.vehicle)
         self.vehicle.step(self.controls, dt, self.surface)
         self.lap_time += dt
+        self.race_t += dt
 
         i, _ = self.surface.progress(self.vehicle.pos)
         n = self.track.count
@@ -225,6 +253,6 @@ class Ghost:
         self.vehicle.frozen = True
 
     def destroy(self):
-        from ursina import destroy as _destroy
+        from .ui import destroy_tree
 
-        _destroy(self.car)
+        destroy_tree(self.car)

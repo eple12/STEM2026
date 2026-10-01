@@ -34,15 +34,68 @@ class VecRaceEnv:
     def __init__(self, circuit: str, n_env: int, dt: float = 1.0 / 60.0,
                  seed: int = 0, randomise_start: bool = True,
                  start_at_line: float = 0.15, device="cpu",
-                 track: TrackGPU | None = None):
+                 track: TrackGPU | None = None,
+                 focus_window: tuple[float, float] | None = None,
+                 adaptive_reset: bool = False,
+                 lap_tol: int | None = None,
+                 hard_bank: int = 0, hard_lookback: int = 40,
+                 hard_horizon: int = 120):
         self.t = track if track is not None else TrackGPU(circuit, device)
+        #: Off-track steps a lap may have and still count as a clean lap for
+        #: best_lap_time. None = config.RL_RL_LAP_OFF_TOL, the training reward's
+        #: (lenient) tolerance; the eval env passes the strict PERFECT one so
+        #: its reported lap time means a genuinely clean lap.
+        self.lap_tol = config.RL_RL_LAP_OFF_TOL if lap_tol is None else lap_tol
+        #: Failure-state replay (config.RL_HARD_*): a ring of the last
+        #: hard_lookback+1 decision-start states of every env, and a bank of
+        #: the states that preceded a failure. Off unless hard_bank > 0; the
+        #: trainer flips hard_active once the policy is nearly clean.
+        self._hard_cap = int(hard_bank)
+        self.hard_active = False
+        self.hard_lookback = int(hard_lookback)
+        #: Decisions a banked-state episode runs before it is truncated: the
+        #: lookback (approach) plus the corner itself plus a little exit.
+        self.hard_horizon = int(hard_horizon)
+        self._hard_slot = torch.zeros(n_env, dtype=torch.bool, device=self.t.device)
+        self._short = torch.zeros(n_env, dtype=torch.bool, device=self.t.device)
+        self.hard_resets = 0
+        #: Multiplier on config.RL_OFF_EVENT_COST, set each iteration by the
+        #: trainer's ramp (1.0 when unused, as in eval and the CPU game env).
+        self.off_event_scale = 1.0
+        self._bank_n = 0
+        self._bank_ptr = 0
         self.device = self.t.device
         self.n = n_env
         self.dt = dt
         self.randomise_start = randomise_start
         self.start_at_line = start_at_line
+        #: See RaceEnv.focus_window (rlenv.py) -- same fraction-of-lap
+        #: window, restricting scattered resets for sector-focused training.
+        #: Mutually exclusive with adaptive_reset (below); the caller's job
+        #: to only set one.
+        self.focus_window = focus_window
+        #: Adaptive difficulty-weighted resets (config.RL_ADAPTIVE_*): scattered
+        #: resets are drawn from config.RL_ADAPTIVE_BUCKETS equal-arclength
+        #: bins, weighted toward whichever bins the policy is currently
+        #: failing (going off-track) in most, tracked live from real
+        #: telemetry in step(). See the long comment in config.py.
+        self.adaptive_reset = adaptive_reset
+        if adaptive_reset:
+            nb = config.RL_ADAPTIVE_BUCKETS
+            self.n_buckets = nb
+            self.bucket_fail_ema = torch.zeros(nb, dtype=torch.float64,
+                                               device=self.device)
+            self._bucket_of_sample = (
+                torch.arange(self.t.n, device=self.device) * nb
+                // max(self.t.n, 1)).clamp(max=nb - 1)
+        # See RaceEnv's mirror of this in rlenv.py for why a circuit missing
+        # from EPISODE_SECONDS_BY_CIRCUIT is auto-sized from its OWN
+        # model_lap (already computed on TrackGPU) rather than falling back
+        # to EPISODE_SECONDS ("sized for Monza"), and why this starts at the
+        # SHORT (~1.076x, one lap) ratio rather than LONG_EPISODE_RATIO --
+        # the training loop widens it itself, once, on first PERFECT.
         self.episode_seconds = EPISODE_SECONDS_BY_CIRCUIT.get(
-            circuit, EPISODE_SECONDS)
+            circuit, 1.076 * self.t.model_lap)
         self.gen = torch.Generator(device=self.device)
         self.gen.manual_seed(seed)
 
@@ -57,6 +110,14 @@ class VecRaceEnv:
         self.obs_dim = OBS_DIM
         self.act_dim = N_ACTIONS
         self.frontier = torch.zeros(n_env, device=self.device)
+        if self._hard_cap > 0:
+            D = 16 + N_PREV_ACTIONS
+            R = self.hard_lookback + 1
+            self._hist = torch.zeros(R, n_env, D, device=self.device)
+            self._hist_ptr = 0
+            self._hard_cool = torch.zeros(n_env, dtype=torch.long,
+                                          device=self.device)
+            self._bank = torch.zeros(self._hard_cap, D, device=self.device)
         self._reset_counters(torch.ones(n_env, dtype=torch.bool,
                                         device=self.device))
 
@@ -83,6 +144,7 @@ class VecRaceEnv:
             self.prev_actions = torch.full((n, N_PREV_ACTIONS), DEFAULT_ACTION,
                                            dtype=torch.long, device=dev)
             self.lap_off_steps = torch.zeros(n, dtype=torch.long, device=dev)
+            self._prev_off = torch.zeros(n, dtype=torch.bool, device=dev)
             self.lap_start_time = self._f()
             self.last_lap_time = self._f()
             self.best_lap_time = self._f()
@@ -99,6 +161,7 @@ class VecRaceEnv:
                      "last_lap_time", "best_lap_time"):
             setattr(self, name, torch.where(m, zf, getattr(self, name)))
         self._armed = self._armed & ~m
+        self._prev_off = self._prev_off & ~m
         self.prev_actions = torch.where(
             m[:, None], torch.full_like(self.prev_actions, DEFAULT_ACTION),
             self.prev_actions)
@@ -154,10 +217,50 @@ class VecRaceEnv:
         d = t.l_center[js] - v.pos[:, None, :]              # (B, N_LOOK, 2)
         lat = (d * right[:, None, :]).sum(-1) / 60.0
         lon = (d * fwd[:, None, :]).sum(-1) / 120.0
-        vtg = t.v_ref[js] / config.MAX_SPEED
+        # No target-speed tail here -- see rlpolicy.observe()'s matching
+        # 2026-09-14 comment (OBS_DIM 59 -> 43): must stay byte-for-byte the
+        # same shape as the CPU observation or parity.py fails immediately.
 
         return torch.cat([torch.stack(head, -1), mid, remain,
-                          lat, lon, vtg], dim=-1)
+                          lat, lon], dim=-1)
+
+    # -- failure-state replay -------------------------------------------
+    def _snapshot(self, i):
+        v = self.vehicle
+        cols = [v.pos, v.vel] + [x[:, None] for x in (
+            v.yaw, v.yaw_rate, v.steer_input, v.steer_angle, v._long_accel,
+            v._lat_accel, v._f_long_front, v._f_long_rear, v.slip_front,
+            v.slip_rear, v.grip_scale)]
+        cols += [i.to(v.yaw.dtype)[:, None], self.prev_actions.to(v.yaw.dtype)]
+        return torch.cat(cols, -1)
+
+    def set_hard(self, frac: float):
+        """Dedicate the last ``frac`` of the env slots to failure-state
+        episodes and switch failure-state replay on."""
+        n_hard = int(round(frac * self.n))
+        self._hard_slot = torch.arange(self.n, device=self.device)             >= (self.n - n_hard)
+        self.hard_active = True
+
+    def _restore(self, m, S):
+        """Put the masked rows back into the saved states S (n, D)."""
+        v, t = self.vehicle, self.t
+        mm = m[:, None]
+        v.pos = torch.where(mm, S[:, 0:2], v.pos)
+        v.vel = torch.where(mm, S[:, 2:4], v.vel)
+        for k, name in enumerate(("yaw", "yaw_rate", "steer_input",
+                                  "steer_angle", "_long_accel", "_lat_accel",
+                                  "_f_long_front", "_f_long_rear",
+                                  "slip_front", "slip_rear", "grip_scale")):
+            setattr(v, name, torch.where(m, S[:, 4 + k], getattr(v, name)))
+        v.on_track = v.on_track | m
+        v.hit_wall = v.hit_wall & ~m
+        idx = S[:, 15].long().clamp(0, t.n - 1)
+        self.surface.hint = torch.where(m, idx, self.surface.hint)
+        self._last_s = torch.where(m, t.l_arclen[idx], self._last_s)
+        self.prev_actions = torch.where(mm, S[:, 16:].long(), self.prev_actions)
+        zf = torch.zeros_like(self.off_time)
+        self.off_time = torch.where(m, zf, self.off_time)
+        self.stall_time = torch.where(m, zf, self.stall_time)
 
     # -- placement ------------------------------------------------------
     def _place(self, m, i, speed_frac):
@@ -184,8 +287,32 @@ class VecRaceEnv:
         self._reset_counters(m)
         r = torch.rand(self.n, generator=self.gen, device=self.device)
         scatter = r >= self.start_at_line
-        i_rand = torch.randint(self.t.n, (self.n,), generator=self.gen,
-                               device=self.device)
+        if self.adaptive_reset:
+            nb = self.n_buckets
+            fe = self.bucket_fail_ema
+            total = fe.sum()
+            norm = torch.where(total > 1e-8, fe / total.clamp(min=1e-8),
+                               torch.full_like(fe, 1.0 / nb))
+            weights = config.RL_ADAPTIVE_FLOOR / nb \
+                + (1.0 - config.RL_ADAPTIVE_FLOOR) * norm
+            bkt = torch.multinomial(weights, self.n, replacement=True,
+                                    generator=self.gen)
+            per_bucket = max(self.t.n // nb, 1)
+            lo_idx = bkt * per_bucket
+            span_idx = torch.where(bkt == nb - 1,
+                                   self.t.n - lo_idx,
+                                   torch.full_like(lo_idx, per_bucket))
+            uw = torch.rand(self.n, generator=self.gen, device=self.device)
+            i_rand = (lo_idx + (uw * span_idx.to(uw.dtype)).long()) \
+                .clamp(max=self.t.n - 1)
+        elif self.focus_window is not None:
+            lo, hi = self.focus_window
+            span = (hi - lo) % 1.0 or 1.0
+            uw = torch.rand(self.n, generator=self.gen, device=self.device)
+            i_rand = ((lo + uw * span) % 1.0 * self.t.n).long()
+        else:
+            i_rand = torch.randint(self.t.n, (self.n,), generator=self.gen,
+                                   device=self.device)
         i = torch.where(scatter, i_rand, torch.zeros_like(i_rand))
         u = torch.rand(self.n, generator=self.gen, device=self.device)
         # Scattered starts roll in at speed; a grid start covers the launch
@@ -201,6 +328,17 @@ class VecRaceEnv:
         frac = torch.where(scatter, 0.55 + 0.40 * u, grid_frac)
         self._place(m, i, frac)
         self.start_s = torch.where(m, self._last_s, self.start_s)
+        self._short = self._short & ~m
+        if (self._hard_cap > 0 and self.hard_active
+                and self._bank_n >= config.RL_HARD_MIN):
+            hm = m & self._hard_slot
+            if bool(hm.any()):
+                kk = torch.randint(0, self._bank_n, (self.n,),
+                                   generator=self.gen, device=self.device)
+                self._restore(hm, self._bank[kk])
+                self.start_s = torch.where(hm, self._last_s, self.start_s)
+                self._short = self._short | hm
+                self.hard_resets += int(hm.sum())
         return self.observe()
 
     def reset_grid(self, speed_frac):
@@ -216,21 +354,34 @@ class VecRaceEnv:
         return self.observe()
 
     # -- the loop -------------------------------------------------------
-    def step(self, action, off_cost_scale: float = 1.0, pace_mult: float = 1.0):
+    def step(self, action, off_cost_scale: float = 1.0, pace_mult: float = 1.0,
+             lap_w_mult: float = 1.0):
         t, v = self.t, self.vehicle
         dt = self.dt
         steer = self.a_steer[action]
         throttle = self.a_throttle[action]
         brake = self.a_brake[action]
 
-        phi0 = self._potential(self._index())
+        i0 = self._index()
+        phi0 = self._potential(i0)
+        if self._hard_cap > 0:
+            R = self.hard_lookback + 1
+            self._hist[self._hist_ptr % R] = self._snapshot(i0)
+            self._hist_ptr += 1
 
         zf = self._f()
         ds_total = zf.clone()
         hit_wall = torch.zeros(self.n, dtype=torch.bool, device=self.device)
         ke_at_wall = zf.clone()
         off_secs = zf.clone()
+        off_events = zf.clone()
         off_dist_speed = zf.clone()
+        wall_dist_speed = zf.clone()
+        if self.adaptive_reset:
+            bucket_off_sum = torch.zeros(self.n_buckets, dtype=torch.float64,
+                                         device=self.device)
+            bucket_visit_sum = torch.zeros(self.n_buckets, dtype=torch.float64,
+                                           device=self.device)
 
         for _ in range(ACTION_REPEAT):
             v.step(steer, throttle, brake, dt, self.surface)
@@ -247,12 +398,27 @@ class VecRaceEnv:
             ke_at_wall = torch.maximum(
                 ke_at_wall, torch.where(v.hit_wall, speed * speed, zf))
 
+            if config.RL_EDGE_WALL_COST > 0.0:
+                ws = ((v.pos - t.l_center[i]) * t.l_normal[i]).sum(-1)
+                we = torch.where(ws > 0.0, t.w_right[i], t.w_left[i])
+                wd = ((ws.abs() - we) - config.RL_EDGE_WALL_START).clamp(min=0.0)
+                wall_dist_speed = wall_dist_speed + (
+                    wd / config.RL_EDGE_WALL_WIDTH).clamp(
+                        max=config.RL_EDGE_WALL_CAP) ** 2 * speed
             off = ~v.on_track
+            off_events = off_events + (off & ~self._prev_off).to(off_events.dtype)
+            self._prev_off = off
             self.off_steps = self.off_steps + off.long()
             self.lap_off_steps = self.lap_off_steps + off.long()
             self.off_time = torch.where(off, self.off_time + dt, zf)
             off_secs = off_secs + torch.where(off, torch.full_like(zf, dt), zf)
             off_dist_speed = off_dist_speed + torch.where(off, speed, zf)
+            if self.adaptive_reset:
+                bkt = self._bucket_of_sample[i]
+                bucket_visit_sum.scatter_add_(
+                    0, bkt, torch.ones(self.n, dtype=torch.float64,
+                                       device=self.device))
+                bucket_off_sum.scatter_add_(0, bkt, off.to(torch.float64))
             # Progress off the asphalt earns nothing: a wide line is a
             # metre-for-metre loss, not free speed.
             ds_total = ds_total + torch.where(off, zf, step_ds)
@@ -260,7 +426,43 @@ class VecRaceEnv:
             self.stall_time = torch.where(speed < STALL_SPEED,
                                           self.stall_time + dt, zf)
 
+        if self.adaptive_reset:
+            visited = bucket_visit_sum > 0
+            rate = torch.where(visited, bucket_off_sum / bucket_visit_sum.clamp(min=1.0),
+                               self.bucket_fail_ema)
+            decay = config.RL_ADAPTIVE_EMA
+            self.bucket_fail_ema = torch.where(
+                visited, self.bucket_fail_ema * decay + rate * (1.0 - decay),
+                self.bucket_fail_ema)
+
         self.steps = self.steps + 1
+        if self._hard_cap > 0:
+            K = self.hard_lookback
+            self._hard_cool = (self._hard_cool - 1).clamp(min=0)
+            if self.hard_active:
+                # Only NORMAL slots feed the bank: a hard slot fails at the
+                # very states it was handed (and under exploration noise), and
+                # banking those would turn the bank into a loop of its own
+                # failures instead of the policy's natural ones.
+                ev = (((off_secs > 0.0) | hit_wall) & (self.steps > K)
+                      & (self._hard_cool == 0) & ~self._hard_slot)
+                sel = ev.nonzero(as_tuple=True)[0]
+                if sel.numel() > 0:
+                    # the slot about to be overwritten holds the state K
+                    # decisions ago -- the approach, before the mistake
+                    old = self._hist[self._hist_ptr % (K + 1)][sel]
+                    slots = (self._bank_ptr + torch.arange(
+                        sel.numel(), device=self.device)) % self._hard_cap
+                    self._bank[slots] = old
+                    self._bank_ptr = (self._bank_ptr + sel.numel())                         % self._hard_cap
+                    was = self._bank_n
+                    self._bank_n = min(self._hard_cap,
+                                       self._bank_n + sel.numel())
+                    if was < config.RL_HARD_MIN <= self._bank_n:
+                        # the bank just became usable: cut the hard slots'
+                        # current (long) episodes so they restart from it
+                        self._short = self._short | self._hard_slot
+                    self._hard_cool[sel] = K
         self.progress = self.progress + ds_total
         self.frontier = torch.minimum(
             torch.maximum(self.frontier, self.start_s + self.progress),
@@ -276,14 +478,15 @@ class VecRaceEnv:
         cross = (~in_arm) & self._armed & (i < 0.1 * n) & (ds_total > 0)
         lap_s = self.lap_time - self.lap_start_time
         closed = cross & (self.lap_start_time > 0.0)
-        clean = closed & (self.lap_off_steps <= config.RL_RL_LAP_OFF_TOL) \
+        clean = closed & (self.lap_off_steps <= self.lap_tol) \
             & (self.recoveries == self._lap_rec0)
 
         lap_bonus = zf
         if _RACELINE_TASK:
+            w_eff = config.RL_RL_LAP_W * lap_w_mult
             lap_bonus = torch.where(
                 clean,
-                (t.lap_base - config.RL_RL_LAP_W * lap_s).clamp(min=0.0), zf)
+                (w_eff * (t.model_lap - lap_s)).clamp(min=0.0), zf)
         better = clean & ((self.best_lap_time == 0.0)
                           | (lap_s < self.best_lap_time))
         self.best_lap_time = torch.where(better, lap_s, self.best_lap_time)
@@ -314,6 +517,11 @@ class VecRaceEnv:
         # -- off-course fee, per second of a wheel off the asphalt ------
         reward = reward - (config.RL_OFF_TRACK_COST * off_cost_scale
                            * off_dist_speed * dt)
+        if config.RL_OFF_EVENT_COST > 0.0:
+            reward = reward - (config.RL_OFF_EVENT_COST * self.off_event_scale
+                               * off_events)
+        if config.RL_EDGE_WALL_COST > 0.0:
+            reward = reward - config.RL_EDGE_WALL_COST * wall_dist_speed * dt
 
         # -- a mistake is recovered, not terminal, but it is charged for -
         back = ds_total < -2.0
@@ -343,7 +551,12 @@ class VecRaceEnv:
             self._place(reason, i, frac)
 
         diverged = ~torch.isfinite(v.pos).all(dim=-1)
-        truncated = self.lap_time >= self.episode_seconds
+        limit = torch.where(
+            self._short,
+            torch.full_like(self.lap_time,
+                            self.hard_horizon * ACTION_REPEAT * self.dt),
+            torch.full_like(self.lap_time, float(self.episode_seconds)))
+        truncated = self.lap_time >= limit
         done = truncated | diverged
         reward = torch.where(diverged, zf, reward)
         return self.observe(), reward, done, {"truncated": truncated,

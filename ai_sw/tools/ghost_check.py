@@ -59,7 +59,7 @@ def main():
     apart = float(np.hypot(*(game.ghost.vehicle.pos - game.vehicle.pos)))
     print(f"{args.circuit}: grid separation {apart:.2f} m")
     assert apart > config.CAR_BODY_LENGTH, "the two cars start inside each other"
-    assert game.lap_num == 0, "the race did not start on an out lap"
+    assert game.lap_num == 1, "a grand prix must be timed from the lights"
 
     pilot = Autopilot(game.track, game.surface, pace=args.player_pace)
     game.read_controls = lambda: pilot.controls(game.vehicle)
@@ -67,7 +67,6 @@ def main():
     game.vehicle.frozen = False
     game.ghost.start()
 
-    out_lap_timed = False
     deltas = []
     laps_seen = []
     watch = []                 # (label, distance from camera to each car)
@@ -91,8 +90,6 @@ def main():
                 game.on_key("g")
             else:
                 watch.append(("after", _cam_gap(game)))
-        if game.lap_num == 0 and game.last_t is not None:
-            out_lap_timed = True
         i, _ = game.surface.progress(game.vehicle.pos)
         d = game.ghost.delta(i, game.session_time - game.lap_start)
         if d is not None:
@@ -107,8 +104,7 @@ def main():
     print(f"gap samples {len(deltas)}   range "
           f"{min(deltas):+.3f} .. {max(deltas):+.3f} s")
 
-    assert not out_lap_timed, "the out lap was recorded as a lap time"
-    assert laps_seen[:2] == [0, 1], f"lap numbering started at {laps_seen[:2]}"
+    assert laps_seen[:2] == [1, 2], f"lap numbering started at {laps_seen[:2]}"
     assert game.state == 2, "the race never finished"
     assert game.best_t is not None and game.ghost.best_t is not None
     # The gap is a lap-relative delta, so it resets every lap rather than

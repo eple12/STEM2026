@@ -15,6 +15,23 @@ from ursina import Mesh, Vec3
 from . import config
 from . import palette as pal
 
+def destroy_tree(entity):
+    """``ursina.destroy`` for an entity *and everything parented under it*.
+
+    Ursina's own ``destroy`` does not recurse. It removes the node, which takes
+    the children off the screen with it, but every child Entity stays in
+    ``scene.entities`` -- still walked every frame, still holding its model and
+    its text. One HUD is a couple of hundred of them, so going race -> menu ->
+    race piled them up and each new session ran slower than the last.
+    """
+    from ursina import destroy
+    if entity is None:
+        return
+    for child in list(getattr(entity, "_children", ())):
+        destroy_tree(child)
+    destroy(entity)
+
+
 # --- brand ---------------------------------------------------------------
 RED = pal.rgb(225, 6, 0)          # F1 red
 INK = pal.rgb(21, 21, 30)         # near-black ground
@@ -85,7 +102,7 @@ CIRCUITS = {
     "Hockenheim": ("HOCKENHEIM", "Hockenheimring", "GER"),
     "IMS": ("INDIANAPOLIS", "Indianapolis Motor Speedway", "USA"),
     "Melbourne": ("MELBOURNE", "Albert Park Circuit", "AUS"),
-    "Mexico City": ("MEXICO CITY", "Autodromo Hermanos Rodriguez", "MEX"),
+    "MexicoCity": ("MEXICO CITY", "Autodromo Hermanos Rodriguez", "MEX"),
     "Montreal": ("MONTREAL", "Circuit Gilles Villeneuve", "CAN"),
     "Monza": ("MONZA", "Autodromo Nazionale Monza", "ITA"),
     "MoscowRaceway": ("MOSCOW", "Moscow Raceway", "RUS"),
@@ -119,6 +136,7 @@ def pick_font() -> str | None:
     """
     from ursina import application
 
+    install_font_cache()
     # A bundled font wins, so dropping Titillium Web (SIL OFL, the face the
     # real F1 typeface derives from) into assets/fonts upgrades the look
     # without touching this file. Nothing is bundled by default -- the system
@@ -135,6 +153,60 @@ def pick_font() -> str | None:
                 application.fonts_folder = folder
                 return name
     return None
+
+
+#: Fonts already loaded by name, for ``install_font_cache``.
+_FONTS: dict = {}
+
+
+def install_font_cache():
+    """Make building a ``Text`` cheap: load each font once, then reuse it.
+
+    Ursina's font setter runs for every Text it creates, and each time it
+    appends the font's folder to Panda's model path again -- one more entry
+    for every model and texture lookup to walk, for the rest of the process --
+    and calls ``font.clear()``, which throws away every glyph already
+    rasterised so the next string renders them all over again. A HUD is
+    around 80 Texts, the menu more, and it was a second and a half of every
+    race's loading time, growing a little each visit. The first Text per font
+    goes through Ursina's own setter; every later one just takes the font.
+    """
+    from ursina import Text
+
+    if getattr(Text, "_font_cache_installed", False):
+        return
+    stock = Text.font_setter
+
+    def font_setter(self, value):
+        font = _FONTS.get(value)
+        if font is None:
+            stock(self, value)
+            if self._font is not None:
+                _FONTS[value] = self._font
+            return
+        self._font = font
+        if font.getLineHeight() != self.line_height:
+            font.setLineHeight(self.line_height)
+        if self.text:
+            self.text = self.raw_text
+
+    stock_res = Text.resolution_setter
+
+    def resolution_setter(self, value):
+        # Panda refuses a new pixel density once a font has glyphs on its
+        # pages -- which is why the stock setter cleared it first. The same
+        # density is not a change, so leave the pages alone.
+        if self.font is not None and self._font.getPixelsPerUnit() == value:
+            return
+        if self.font is not None:
+            self._font.clear()
+        stock_res(self, value)
+
+    Text.font_setter = font_setter
+    Text.font = property(Text.font_getter, font_setter)
+    Text.resolution_setter = resolution_setter
+    Text.resolution = property(Text.resolution_getter, resolution_setter)
+    Text._font_cache_installed = True
 
 
 def spaced(s: str, gap: str = " ") -> str:

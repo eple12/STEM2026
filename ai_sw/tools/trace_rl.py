@@ -10,6 +10,12 @@ Run it whenever, including mid-training. It reads the checkpoint and touches
 nothing, so it cannot disturb the run.
 
     python -m tools.trace_rl --circuit Monza --out trace.png
+
+Pass --policy to trace an arbitrary checkpoint file instead of the deployed
+<circuit>.npz -- a freshly-fetched Kaggle output, say, before deciding
+whether to deploy it. The episode window is widened to a few laps (not just
+the deployed policy's normal single-attempt length) so a genuine clean lap
+has room to close and ``best_lap_time`` means something.
 """
 from __future__ import annotations
 
@@ -63,10 +69,24 @@ def main():
     ap.add_argument("--noise", type=float, default=0.0,
                     help="exploration noise; 0 is the policy as it will drive")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--policy", default=None,
+                    help="trace this checkpoint file instead of the "
+                         "deployed assets/policies/<circuit>.npz")
+    ap.add_argument("--lap-time-file", default=None,
+                    help="write the best lap time (seconds, or empty if no "
+                         "clean lap closed) to this file -- lets a calling "
+                         "script (train_track.bat) pick it up without "
+                         "parsing the printed summary line")
     args = ap.parse_args()
 
+    # The reported best lap must be a genuinely clean one: the training
+    # reward tolerates a few off-track steps per lap (RL_RL_LAP_OFF_TOL), which
+    # is not what "clean" means for a ghost lap or a record.
+    config.RL_RL_LAP_OFF_TOL = config.RL_OFF_PERFECT_TOL
     env = RaceEnv(args.circuit, seed=args.seed, randomise_start=False)
-    d = np.load(rlpolicy.policy_path(args.circuit), allow_pickle=False)
+    env.episode_seconds = 300.0  # room for a couple of clean laps to close
+    policy_path = args.policy or rlpolicy.policy_path(args.circuit)
+    d = np.load(policy_path, allow_pickle=False)
     w = {k: d[k] for k in d.files if "." in k}
     path, speed, want, cross, info, dist = run(
         env, w, d["obs_mean"], d["obs_std"], args.noise, args.seed)
@@ -143,9 +163,14 @@ def main():
     a.set_xlabel("distance driven (m)", color="#8a90a0", fontsize=9)
 
     fig.savefig(args.out, dpi=115, facecolor=fig.get_facecolor())
+    lap_note = (f", best lap {env.best_lap_time:.2f}s"
+                if env.best_lap_time > 0.0 else ", no clean lap closed")
     print(f"{args.circuit}: {dist:.0f} m, ended {info['reason']!r}, "
           f"mean {speed.mean():.1f} km/h, "
-          f"mean line error {np.abs(cross).mean():.2f} m -> {args.out}")
+          f"mean line error {np.abs(cross).mean():.2f} m{lap_note} -> {args.out}")
+    if args.lap_time_file:
+        with open(args.lap_time_file, "w", encoding="utf-8") as f:
+            f.write(f"{env.best_lap_time:.2f}" if env.best_lap_time > 0.0 else "")
 
 
 if __name__ == "__main__":

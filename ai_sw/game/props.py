@@ -18,12 +18,191 @@ from __future__ import annotations
 import math
 from pathlib import Path
 
+import numpy as np
 from ursina import Entity, scene
 
 from . import config
 from .car import WHEEL_NODES, _bake_material_colors
 
 MODEL_DIR = config.ASSET_DIR / "models"
+
+
+# -- stamping ---------------------------------------------------------------
+# ``copy_to`` a few thousand times and ``flatten_strong`` the lot was most of
+# the scenery's loading time -- over four seconds of Monza's -- nearly all of
+# it Panda composing each copy's transform into its vertices one node at a
+# time. The same merge done directly is a handful of array operations: read
+# each template's vertices once, transform them for every placement at once,
+# and write one Geom per render state. It draws the same thing in the same
+# number of draw calls. Anything it does not recognise -- a vertex layout or a
+# primitive it has not been taught -- falls back to the old route.
+
+#: Per template: its geoms, read out as arrays. Keyed by id; templates live
+#: as long as the library, which outlives every batch built from them.
+_GEOMS: dict[int, list | None] = {}
+
+
+def _read_template(tmpl):
+    """[(fmt, state, arrays, columns, index)] for every Geom in a template, or
+    None if any of them is something ``_stamp`` cannot reproduce."""
+    from panda3d.core import GeomEnums, GeomTriangles
+
+    key = id(tmpl)
+    if key in _GEOMS:
+        return _GEOMS[key]
+    out = []
+    for gnp in tmpl.find_all_matches("**/+GeomNode"):
+        gn = gnp.node()
+        if not gnp.get_mat(tmpl).is_identity():
+            _GEOMS[key] = None
+            return None
+        net = gnp.get_net_state()
+        for i in range(gn.get_num_geoms()):
+            geom = gn.get_geom(i)
+            vd = geom.get_vertex_data()
+            fmt = vd.get_format()
+            cols = []
+            for k in range(fmt.get_num_arrays()):
+                af = fmt.get_array(k)
+                for c in range(af.get_num_columns()):
+                    col = af.get_column(c)
+                    cont = col.get_contents()
+                    if cont in (GeomEnums.C_point, GeomEnums.C_normal,
+                                GeomEnums.C_vector):
+                        if (col.get_numeric_type() != GeomEnums.NT_float32
+                                or col.get_num_components() < 3):
+                            _GEOMS[key] = None
+                            return None
+                        kind = "point" if cont == GeomEnums.C_point else "dir"
+                        cols.append((k, col.get_start(), kind))
+            arrays = [np.frombuffer(memoryview(vd.get_array(k)).cast("B"),
+                                    np.uint8)
+                      .reshape(vd.get_num_rows(), fmt.get_array(k).get_stride())
+                      .copy() for k in range(fmt.get_num_arrays())]
+            idx = []
+            for k in range(geom.get_num_primitives()):
+                prim = geom.get_primitive(k).decompose()
+                if not isinstance(prim, GeomTriangles):
+                    _GEOMS[key] = None
+                    return None
+                if not prim.is_indexed():
+                    prim = GeomTriangles(prim)
+                    prim.make_indexed()
+                dt = {GeomEnums.NT_uint8: np.uint8,
+                      GeomEnums.NT_uint16: np.uint16,
+                      GeomEnums.NT_uint32: np.uint32}[prim.get_index_type()]
+                idx.append(np.frombuffer(
+                    memoryview(prim.get_vertices()).cast("B"), dt)
+                    .astype(np.int64))
+            if not idx:
+                continue
+            idx = np.concatenate(idx)
+            # Only the vertices this Geom uses: glTF geoms share one vertex
+            # table between materials, and stamping all of it for each would
+            # multiply the batch's memory by the material count.
+            used, idx = np.unique(idx, return_inverse=True)
+            arrays = [a[used] for a in arrays]
+            out.append((fmt, net.compose(gn.get_geom_state(i)), arrays, cols,
+                        idx.reshape(-1).astype(np.int64)))
+    _GEOMS[key] = out
+    return out
+
+
+def _placement_mats(items):
+    """(n, 4, 4) row-vector matrices, posed exactly as ``copy_to`` + set_pos,
+    set_scale, set_h poses a copy -- by Panda itself, so there is no
+    question of axis order or handedness."""
+    from panda3d.core import NodePath
+
+    probe = NodePath("probe")
+    mats = np.empty((len(items), 4, 4))
+    for n, (x, y, z, s, yaw) in enumerate(items):
+        probe.set_pos(x, y, z)
+        if isinstance(s, (tuple, list)):
+            probe.set_scale(float(s[0]), float(s[1]), float(s[2]))
+        else:
+            probe.set_scale(float(s))
+        probe.set_h(-float(yaw))
+        m = probe.get_mat()
+        mats[n] = [[m[r][c] for c in range(4)] for r in range(4)]
+    return mats
+
+
+def _stamp(root, groups) -> bool:
+    """Merge placed copies of templates under *root*. ``groups`` is a list of
+    (template, [(x, y, z, scale, yaw), ...]). False if any template needs the
+    ``flatten_strong`` route instead; nothing is attached in that case."""
+    from panda3d.core import (Geom, GeomEnums, GeomNode, GeomTriangles,
+                              GeomVertexData)
+
+    parts: dict = {}
+    for tmpl, items in groups:
+        geoms = _read_template(tmpl)
+        if geoms is None:
+            return False
+        if not items or not geoms:
+            continue
+        mats = _placement_mats(items)
+        lin = mats[:, :3, :3]
+        det = np.linalg.det(lin)
+        nrm = np.transpose(np.linalg.inv(lin), (0, 2, 1))
+        for fmt, state, arrays, cols, idx in geoms:
+            key = (str(fmt), state.get_hash(), str(state))
+            parts.setdefault(key, (fmt, state, []))[2].append(
+                (arrays, cols, idx, mats, lin, nrm, det))
+
+    if not parts:
+        return True
+    node = GeomNode("stamped")
+    for fmt, state, pieces in parts.values():
+        total = sum(len(p[0][0]) * len(p[3]) for p in pieces)
+        out = [[] for _ in range(fmt.get_num_arrays())]
+        tris = []
+        base = 0
+        for arrays, cols, idx, mats, lin, nrm, det in pieces:
+            n, rows = len(mats), len(arrays[0])
+            blocks = [np.tile(a, (n, 1)) for a in arrays]
+            for k, off, kind in cols:
+                a = blocks[k]
+                stride = a.shape[1]
+                src = np.ndarray((rows, 3), np.float32, arrays[k],
+                                 offset=off, strides=(stride, 4))
+                dst = np.ndarray((n * rows, 3), np.float32, a,
+                                 offset=off, strides=(stride, 4))
+                if kind == "point":
+                    v = np.matmul(src, lin) + mats[:, None, 3, :3]
+                else:
+                    v = np.matmul(src, nrm)
+                    v /= np.maximum(np.linalg.norm(v, axis=2,
+                                                   keepdims=True), 1e-12)
+                dst[:] = v.reshape(n * rows, 3)
+            for k in range(len(out)):
+                out[k].append(blocks[k])
+            tri = idx.reshape(-1, 3)
+            inst = (tri[None, :, :]
+                    + (base + rows * np.arange(n))[:, None, None])
+            # A mirrored placement turns every triangle inside out.
+            flip = det < 0
+            if flip.any():
+                inst[flip] = inst[flip][:, :, ::-1]
+            tris.append(inst.reshape(-1))
+            base += n * rows
+        vd = GeomVertexData("stamped", fmt, Geom.UH_static)
+        vd.unclean_set_num_rows(total)
+        for k, blocks in enumerate(out):
+            buf = np.concatenate(blocks)
+            memoryview(vd.modify_array(k)).cast("B")[:] = buf.tobytes()
+        prim = GeomTriangles(Geom.UH_static)
+        prim.set_index_type(GeomEnums.NT_uint32)
+        idx = np.concatenate(tris).astype(np.uint32)
+        va = prim.modify_vertices()
+        va.unclean_set_num_rows(len(idx))
+        memoryview(va).cast("B")[:] = idx.tobytes()
+        geom = Geom(vd)
+        geom.add_primitive(prim)
+        node.add_geom(geom, state)
+    root.attach_new_node(node)
+    return True
 
 
 class PropLibrary:
@@ -170,6 +349,11 @@ class PropLibrary:
         shader = shader if shader is not None else self.shader
         if shader is not None:
             root.shader = shader
+        if _stamp(root, [(tmpl, [(float(p[0]),
+                                  float(p[4]) if len(p) > 4 else 0.0,
+                                  float(p[1]), p[3] if len(p) > 3 else 1.0,
+                                  p[2]) for p in placements])]):
+            return root
         for p in placements:
             x, z, yaw = p[0], p[1], p[2]
             s = p[3] if len(p) > 3 else 1.0
@@ -211,6 +395,19 @@ class PropLibrary:
         shader = shader if shader is not None else self.shader
         if shader is not None:
             root.shader = shader
+        stamp = []
+        for name, placements in groups.items():
+            tmpl = self.template(name)
+            if tmpl is not None and placements:
+                stamp.append((tmpl, [(float(p[0]), 0.0, float(p[1]),
+                                      p[3] if len(p) > 3 else 1.0, p[2])
+                                     for p in placements]))
+        if not stamp:
+            from ursina import destroy
+            destroy(root)
+            return None
+        if _stamp(root, stamp):
+            return root
         used = False
         for name, placements in groups.items():
             tmpl = self.template(name)

@@ -38,3 +38,10 @@ gzip/
 
 # Claude Code's own project notes. Delete this line to version them.
 memory/
+
+# Trainer optimiser/replay-buffer state (ai_sw_gpu/train_iqn_gpu.py's
+# --state-every dumps), 55 MB each and only useful for resuming the exact
+# run that wrote them -- not for deploying or reproducing a result, which
+# only needs the *.npz checkpoint next to it. ai_sw/policy/<Circuit>/ has
+# dozens of these across abandoned experiments; keep them out of git.
+ai_sw/policy/**/*_state.pt

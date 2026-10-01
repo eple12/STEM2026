@@ -8,6 +8,7 @@ single-track model. Units are SI (metres, seconds, newtons, kilograms).
 from __future__ import annotations
 
 import math
+import os
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -34,7 +35,7 @@ TRACK_SCALE = 12.67
 TRACK_SCALE_BY_NAME = {
     "Austin": 13.094, "BrandsHatch": 10.969, "Budapest": 10.882,
     "Catalunya": 11.218, "Hockenheim": 12.711, "IMS": 13.726,
-    "Melbourne": 11.129, "Mexico City": 12.067, "Montreal": 15.299,
+    "Melbourne": 11.129, "MexicoCity": 12.067, "Montreal": 15.299,
     "Monza": 12.986, "MoscowRaceway": 12.179, "Nuerburgring": 11.540,
     "Oschersleben": 14.177, "Sakhir": 12.247, "SaoPaulo": 12.502,
     "Sepang": 11.382, "Shanghai": 10.954, "Silverstone": 12.865,
@@ -321,11 +322,50 @@ HUD_MARGIN = 0.022     # clear space between a panel and the screen edge
 #: original centreline points in the car frame.
 RL_OBS = "lookahead"      # v14 rangefinder obs was worse (rec 8/ep, 170 km/h); reverted
 
-RL_OFF_TRACK_COST = 0.35       # per second beyond track limits, times speed.
+RL_OFF_TRACK_COST = 0.20       # per second beyond track limits, times speed.
                               # v17: the clean-lap bonus (zeroed for a dirty
                               # lap) does most of the work of forcing PERFECT;
                               # this is a moderate backstop with a gentle ramp.
-RL_OFF_TRACK_COST_RAMP = ((0, 1.0), (300_000, 1.0), (1_500_000, 2.0))
+                              # 2026-09-13: 0.35 -> 0.20. This fee is small
+                              # next to a lap's gross reward components, but
+                              # RL_RL_LAP_OFF_TOL disqualifies the ENTIRE
+                              # clean-lap bonus (up to ~65 on Spa) the moment
+                              # a lap has more than a couple of off-track
+                              # ticks -- so the marginal cost of a single
+                              # braking-precision mistake (this fee + the lost
+                              # bonus) already exceeds a whole lap's net
+                              # reward, before scale even ramps up. That
+                              # all-or-nothing structure, not this per-second
+                              # fee, is what should carry the "must be
+                              # PERFECT" pressure; lowering the fee itself
+                              # softens the redundant, doubly-harsh part so a
+                              # near-limit braking experiment that clips the
+                              # edge isn't punished twice as hard as it needs
+                              # to be to still net-lose against a clean lap.
+RL_OFF_TRACK_COST_RAMP = ((0, 1.0), (500_000, 1.0), (2_000_000, 1.6))
+                              # 2026-09-13: was ((0,1),(300k,1),(1.5M,2.0)),
+                              # then briefly (500k,1.0),(3.5M,1.6) -- that
+                              # v26e4 run showed loss trough right at first
+                              # PERFECT (it950, ~2.55M decisions, loss 0.123)
+                              # and then climb back to 0.18 by it1650 while
+                              # rec/off stayed flat near zero -- a moving-
+                              # target artifact, not a policy regression: the
+                              # ramp was STILL rising (1.5->1.6) a full 1M
+                              # decisions after the policy had already found
+                              # its clean line, so the value network kept
+                              # re-chasing a shifting reward floor for no
+                              # benefit. Ending the ramp at 2.0M -- before the
+                              # ~2.5M where PERFECT typically first appears --
+                              # means the reward is flat by the time there is
+                              # anything to disturb, so loss should hold
+                              # rather than climb post-PERFECT. With
+                              # RL_EDGE_MARGIN=0 the car runs the legal width
+                              # right up to the paint on entry -- a late-
+                              # braking error has no lateral margin to absorb
+                              # it and lands on this fee at full scale -- but
+                              # RL_RL_LAP_OFF_TOL / the clean-lap bonus still
+                              # carry the "must be clean" pressure, this ramp
+                              # only needs to hold still once that is found.
 #: Multiplier on RL_OFF_TRACK_COST, keyed to decisions seen. train_iqn.py reads
 #: this and passes the scale per rollout; RaceEnv.step multiplies it in. Flat
 #: ((0,1),(1,1)) disables the ramp.
@@ -353,7 +393,7 @@ RL_LINE_TOLERANCE = 2.0        # (kept for the debug overlays only)
 # away from the fast line) into a tailwind, without letting it prescribe a line
 # that clips a limit. The edge / off-track terms still measure from the
 # centreline, where the widths are defined. False -> centreline, as before.
-RL_SHAPE_TO_RACELINE = True
+RL_SHAPE_TO_RACELINE = False
 RL_RACELINE_SAFETY = 0.20     # metres the saved raceline is pulled in so every
                               #  wheel stays inside the white line by this much
 
@@ -364,6 +404,13 @@ RL_RACELINE_SAFETY = 0.20     # metres the saved raceline is pulled in so every
 # distance covered, i.e. average speed.
 RL_PROGRESS_W = 5.0 / 500.0
 RL_TIME_W = 6.0 / 5000.0 * 1000.0     # per second
+
+# 2026-09-15, tried and reverted: RL_DIRTY_LAP_PROGRESS_MULT, a multiplier
+# on RL_PROGRESS_W once a lap had gone off-track even one tick (dense,
+# every decision, on the theory that the sparse once-per-lap clean-lap
+# bonus below was too rare to actually shape steering/braking). Monza
+# diverged worse under it, not better -- reverted rather than left wired in
+# at some inert value, since no confirmed replacement exists yet.
 
 # --- v17 raceline task -----------------------------------------------------
 # "linesight": the v10-v16 reward -- sparse-ish progress minus time, the policy
@@ -448,21 +495,124 @@ RL_RL_SPEED_PACE = 1.00      # v25: v_ref = the physics grip-limited profile,
 # same design (break-even at the conservative modelled pace, grows as the
 # policy beats it) for whichever circuit is actually loaded.
 RL_RL_LAP_W = 2.5
-RL_RL_LAP_OFF_TOL = 3        # off-steps a lap may have and still count as clean
+#: Multiplier on RL_RL_LAP_W, keyed to decisions seen -- same interpolation
+#: mechanism as RL_OFF_TRACK_COST_RAMP (train_iqn.py's LAP_W_SCHED / _interp),
+#: passed into RaceEnv.step()/VecRaceEnv.step() as lap_w_mult. 2026-09-13:
+#: added because once a policy is reliably clean the flat W=2.5 rate gives a
+#: very diffuse "shave more time" gradient -- a lap a few tenths faster is a
+#: small fraction of the total per-lap return at gamma~1, easy to lose in
+#: value-estimation noise. Held at 1.0 (i.e. inert) through the same window
+#: the off-track-cost ramp needs to find a clean line, then stepped up to
+#: sharpen the reward for marginal speed gains once that is already found --
+#: it should never fire before a policy can plausibly be clean, since a
+#: steeper lap bonus with no clean baseline yet is just a bigger dangling
+#: carrot for a policy that cannot reach it. Flat ((0,1),(1,1)) disables it.
+RL_LAP_W_RAMP = ((0, 1.0), (1, 1.0))
+                              # 2026-09-13: tried ((0,1),(2.0M,1),(2.4M,1.8))
+                              # on v26e5 -- best (9256T0) came in BELOW
+                              # v26e4's 9273 and kept eroding after the boost
+                              # (9256->9249->9234->9184->9138->9121->9106
+                              # ->9071 as it approached its own stale-stop),
+                              # so a steeper post-PERFECT lap bonus made
+                              # things worse here, not better. Flattened back
+                              # to inert pending a different idea -- see
+                              # RL_POST_WIDEN_RAMP below for that idea.
+
+# 2026-09-14: the "different idea". RL_LAP_W_RAMP's failure above raised only
+# the reward for speed, not the price of risk -- so the policy pushed closer
+# to the track limit for a bigger bonus, and the all-or-nothing clean-lap
+# eval (any off-track tick zeroes the whole bonus) punished the resulting
+# off-track ticks harder than the extra speed paid for. Motivated by Monza's
+# episode-widening run (LONG_EPISODE_RATIO, rlenv.py; see the Kaggle README's
+# episode-widening section): eval reach jumped from 7,711 m (the pre-widening
+# PERFECT) to a steady 13,000-13,700 m within 100 iterations of widening --
+# so the policy plainly COULD cover a full second lap at pace, it just
+# couldn't yet do it clean, every single post-widening eval came back
+# off-track or wall/recover. RL_POST_WIDEN_RAMP scales RL_OFF_TRACK_COST and
+# RL_RL_LAP_W by the SAME factor instead of RL_RL_LAP_W alone, so the
+# relative price of "clean" vs "fast" never shifts (whatever policy was
+# already optimal stays optimal) -- only their combined signal grows
+# relative to the unscaled per-step progress/time reward (RL_PROGRESS_W /
+# RL_TIME_W), sharpening the "stay clean, get faster" gradient without
+# incentivising more risk-taking near the limit. Keyed to decisions SINCE
+# episode widening (train_iqn_gpu.py tracks the exact seen-count of the eval
+# that triggered it), not decisions since training start, since widening is
+# exactly the moment "clean" gets categorically harder (1 lap -> 2) and is
+# when this extra push is wanted -- inert (1.0) the entire time before that,
+# including through the ordinary pre-widening PERFECT climb. Flat
+# ((0,1),(1,1)) disables it. Only wired into train_iqn_gpu.py (the GPU
+# trainer used for real runs), not train_iqn.py.
+#
+# 2026-09-14: first guess was (0,1.0),(1_000_000,1.8) -- tested on Monza
+# (with --post-widen-start-at-line, below) and it reproduced EXACTLY the
+# moving-target failure mode RL_OFF_TRACK_COST_RAMP's own comment already
+# diagnosed once: all 4 widened PERFECTs (it1075/1150/1175/1200, best lap
+# 93.7 s) landed while this ramp was still climbing (roughly 1.3x-1.6x of
+# its way to 1.8x, well short of flat), and the policy then went off-track
+# on every single eval for the remaining 575 stale-stop iterations -- almost
+# exactly the window where the ramp kept climbing the rest of the way to its
+# 1.8x ceiling. First fix: shortened the window to 300k decisions, so it
+# reaches flat well before ~400k (roughly where that run's first widened
+# PERFECT appeared). Retested and confirmed on Monza: 93.30 s, beating the
+# 93.60 s record outright.
+#
+# 2026-09-14, second pass: a fixed decision count is itself circuit-
+# specific in exactly the way EPISODE_SECONDS_BY_CIRCUIT/LONG_EPISODE_RATIO
+# already flagged once for episode_seconds (rlenv.py) -- 300k was tuned to
+# ONE circuit's observed timing, and a track that takes meaningfully longer
+# (or shorter) than Monza to re-clear the harder post-widening PERFECT bar
+# has no reason to share it: too short just means extra sharpening tops out
+# early (harmless, the same flat-and-safe state as before widening even
+# starts), but too long reproduces the exact moving-target problem this was
+# meant to fix, just later. So train_iqn_gpu.py now FREEZES the ramp at
+# whatever value it has reached the moment a post-widening PERFECT is first
+# actually seen (see post_widen_ramp_freeze in harvest()), rather than
+# trusting a fixed window to land before that happens. The window below only
+# controls how fast the ramp climbs while still searching -- it no longer
+# needs to be calibrated per circuit, since freezing does the actual job now.
+# 2026-09-14: re-enabled after --n-step=6 alone showed a genuinely faster
+# line but zero widened-PERFECTs -- except the run that actually tested it
+# (Monza_v26k_scratch, 91.30 s) turned out to have been pushed to Kaggle
+# BEFORE this re-enable landed, so its one widened PERFECT (it725, 67,200
+# decisions after widening) froze the ramp at 1.00x -- i.e. it was never
+# actually active. That result says nothing about whether the ramp helps;
+# it says n-step + the cleaner reward/observation alone can find a fast
+# line, and that PERFECT recurring even once in 600 iterations can still be
+# luck rather than a solved mechanism (this run had exactly one hit, then
+# stale-stopped). 2026-09-15: OFF again (flat) while EPISODE_WIDEN_STAGES
+# (rlenv.py) is tried instead -- a different lever on the same "PERFECT
+# doesn't reliably recur past a hard difficulty jump" problem, but one that
+# changes the TASK (smaller jumps) rather than the incentive (steeper
+# reward). Keeping both off at once isolates which one, if either, is
+# actually doing the work.
+RL_POST_WIDEN_RAMP = ((0, 1.0), (1, 1.0))
+# 2026-09-13: 3 -> 6 (0.05s -> 0.10s at 60Hz). Still well under
+# RL_OFF_PERFECT_TOL=8 at the time (the eval-selection tolerance), so a
+# genuinely dirty lap still couldn't count as clean or get selected -- this
+# only stops a single-tick graze from disqualifying the whole clean-lap
+# bonus outright, which was making a near-limit braking attempt an
+# all-or-nothing bet against ~65 points of bonus for a 0.02s error.
+# 2026-09-15: RL_OFF_PERFECT_TOL was separately cut to 0 that same day
+# (2026-09-13), leaving this drifted from it (train "clean" <= 6 ticks, eval
+# PERFECT == 0 ticks) -- tried closing that gap three different ways
+# (6 -> 4, 6 -> 0, then a continuous off_steps decay replacing the binary
+# cutoff entirely) and, separately, a dense per-lap progress penalty
+# (RL_DIRTY_LAP_PROGRESS_MULT). None beat the recipe already confirmed to
+# work (Monza's 91.30 s record, Monza_v26k_scratch) -- two were statistically
+# indistinguishable from doing nothing and one diverged outright. Reverted
+# to the exact confirmed value rather than keep guessing at reward shapes
+# with no budget left to properly isolate each one.
+RL_RL_LAP_OFF_TOL = 6        # off-steps a lap may have and still count as clean
 
 #: The trainers' *_best selection tolerance: off-track physics ticks (60 Hz)
 #: a 7-launch eval may show and still count as tier-0 PERFECT. This is a
 #: SELECTION criterion only -- it never touches the training reward above,
-#: so widening it cannot destabilise learning, only change which already-
+#: so changing it cannot destabilise learning, only change which already-
 #: trained checkpoint gets written out as *_best. 2026-09-13: raised from 2
-#: (0.033 s, "an edge kiss nobody sees") to 8 (0.13 s) -- still under a third
-#: of OFF_TRACK_PATIENCE (0.45 s, the real recovery trigger below), but
-#: loose enough that a policy which grazes the line once across seven
-#: launches isn't discarded in favour of a slower one purely by eval-noise,
-#: which was quietly biasing *_best toward whichever checkpoint happened to
-#: have zero excursions on that specific eval rather than the best policy on
-#: average.
-RL_OFF_PERFECT_TOL = 8
+#: to 8, then back to 0 -- explicit request to only ever select a checkpoint
+#: with a literal zero-off-track eval as *_best, no tolerance. This was
+#: already the case during the confirmed 91.30 s Monza run, so it stays.
+RL_OFF_PERFECT_TOL = 0
 
 # Potential-based line term: Phi = -K * clip(|offset|, LO, HI). Linesight uses
 # K = 0.1 and accepts that it pulls the car off the racing line ("any pull at
@@ -478,6 +628,35 @@ RL_OFF_PERFECT_TOL = 8
 #: standing start -- plausibly undertrained on that exact narrow state.
 RL_LAUNCH_STOP_FRAC = 0.35
 RL_LAUNCH_STOP_MAX = 0.15
+
+# --------------------------------------------------------------------------
+# Adaptive (difficulty-weighted) scattered resets.
+# --------------------------------------------------------------------------
+# 2026-09-13: an alternative to training separate per-sector specialists and
+# splicing them (tried, parked -- 2x-3x the GPU for a seam-consistency
+# problem that has to be solved anyway). This keeps ONE policy training on
+# the WHOLE lap the entire time -- no splice, no seam -- but skews where
+# scattered resets land toward whichever stretch the policy is CURRENTLY
+# failing on, tracked live from real off-track telemetry rather than a
+# circuit-specific hardcoded sector. Generalises to any track for free: a
+# circuit this has never seen starts uniform and re-weights itself as soon
+# as the policy starts failing somewhere in particular.
+RL_ADAPTIVE_BUCKETS = 40      # scattered resets are drawn from this many
+                             #  equal-arclength bins instead of the raw
+                             #  per-sample index -- fine enough to localise
+                             #  a single corner, coarse enough that each bin
+                             #  still gets visited often enough to keep its
+                             #  failure-rate estimate from being pure noise.
+RL_ADAPTIVE_EMA = 0.98       # per-iteration decay on each bin's tracked
+                             #  off-track rate. High = slow to react but
+                             #  stable; the bin only reweights once a
+                             #  genuine, sustained pattern shows up, not one
+                             #  unlucky rollout.
+RL_ADAPTIVE_FLOOR = 0.30     # minimum share of the reset-weight mass kept
+                             #  UNIFORM across all bins regardless of their
+                             #  tracked difficulty, so an easy stretch never
+                             #  drops to zero visits and quietly regresses
+                             #  while training chases the hard one.
 
 RL_LINE_K = 0.10           # v25: RESTORED to v18/Linesight. v24 (K=0) drove a
                            #  wider line that eval'd 10 s slower than v18 (105 s
@@ -521,6 +700,53 @@ RL_EDGE_MARGIN = 0.0      # 2026-09-13: 2.4 (v18) -> 1.0 -> 0.0. clip(edge-off,
 RL_EDGE_OUT_K = 0.40         # v14: back on (v11 value). v13 ran without it and
                               # drifted off the limit like v5.
 RL_EDGE_OUT_CAP = 8.0         # metres past the line at which the pull saturates
+
+# Soft barrier inside the free corridor (2026-09-19). The off-track test is
+# "all four wheels past the white line", so the car CENTRE may sit up to ~1.04
+# m past the line at no cost, and the fee above only exists beyond that cliff.
+# Measured on Melbourne: a fast policy uses that corridor to within 0.0-0.3 m
+# of the cliff, so ordinary lap-to-lap jitter (+-0.2 m) drops it over and
+# PERFECT is intermittent -- and raising RL_OFF_TRACK_COST only moved the
+# cushion from ~0.1 to ~0.4 m. This adds a REAL (not potential-based) cost that
+# starts RL_EDGE_WALL_START metres past the white line and grows as the square
+# of the extra depth, in the same per-second x speed units as the off-track
+# fee: cost = COST * ((depth - START) / WIDTH)^2 * speed * dt per physics step.
+# Nothing inside START of the line is touched, so the racing line up to the
+# white line (and a little beyond) is unchanged. 0.0 disables it.
+RL_EDGE_WALL_COST = 0.0
+
+# Per-excursion off-track cost (2026-09-20). RL_OFF_TRACK_COST is per second x
+# speed, so a one- or two-tick cut costs almost nothing (0.37/tick at ramp 2.0,
+# ~0.04 s of lap time) while the corridor beyond the white line is worth ~0.5 s
+# per 0.1 m of cushion -- brushing the line for a moment is simply the optimum.
+# Scaling the per-tick fee up until a brief cut hurts (x40) makes a 20-tick
+# excursion cost >100 and inflates the value scale. This charges a FLAT amount
+# at the first tick of every excursion (a wheel-set going from on-track to
+# all-four-wheels-off), independent of how long it lasts; the per-tick fee stays
+# as it is. 0.0 disables. The ramp holds it at zero until the policy can string
+# a lap together, then brings it to full over the same window as the tick fee.
+RL_OFF_EVENT_COST = 0.0
+RL_OFF_EVENT_RAMP = ((0, 0.0), (500_000, 0.0), (2_000_000, 1.0))
+
+# Failure-state replay (GPU trainer only, --hard-states). While the policy is
+# already nearly clean, every rollout decision that puts a wheel-set past the
+# line (or hits a wall) saves the vehicle state from RL_HARD_LOOKBACK decisions
+# EARLIER -- the approach to whatever corner it just failed at -- into a bank,
+# and RL_HARD_FRAC of all episode restarts are then restored from that bank
+# instead of the usual grid / scattered start. The hard corners get trained on
+# far more often than one visit per lap, from the states that actually lead
+# into them, on ANY track, with no corner named anywhere.
+RL_HARD_FRAC = 0.20           # share of the parallel ENV SLOTS that do nothing but
+                              # short failure-state episodes. Slots, not restarts:
+                              # a restart-probability share is diluted by episode
+                              # length (a 6 s hard episode vs a 270 s normal one
+                              # would make it ~1 % of the samples); a slot share
+                              # is exactly that share of the samples.
+RL_HARD_MIN = 64              # bank size before the hard slots switch over
+RL_EDGE_WALL_START = 0.3      # metres of car-centre depth past the white line that stay free
+RL_EDGE_WALL_WIDTH = 0.5      # depth beyond START at which the cost equals COST per (m/s)
+RL_EDGE_WALL_CAP = 2.0        # the ratio depth/WIDTH saturates here, so the wedge stays bounded (~4x COST);
+                              # anything deeper is the plain off-track fee's job
 
 # Speed (as a fraction of the local reference speed) a recovered car is given
 # back after a mistake. Low enough that the mistake really costs time.
@@ -595,7 +821,13 @@ RL_POLICY = ASSET_DIR / "policies"
 # Monza that is a clean 102.7 s lap. "rl" swaps in a trained policy where one
 # exists (assets/policies/<circuit>.npz), falling back to the planner where it
 # does not. Monza uses the trained IQN policy (Monza_v7_best).
-GHOST_DRIVER = "rl"
+GHOST_DRIVER = os.environ.get("AISW_GHOST_DRIVER", "rl")
+                              # override with AISW_GHOST_DRIVER=planner to
+                              # watch the CMA-ES raceline itself (game/
+                              # raceline.py) drive, unmixed with a trained
+                              # policy -- e.g. to judge the raceline's own
+                              # quality before blaming the RL policy for a
+                              # line that was never good to begin with.
 RACELINE_EDGE_MARGIN = 0.25    # metres of asphalt left beyond the body
 RACELINE_KERB = 0.55           # fraction of the kerb the line may use
 RACELINE_LSQ_ITERS = 60
@@ -622,10 +854,30 @@ GHOST_ALPHA = 0.55             # how solid the ghost looks
 GHOST_GRID_OFFSET = 3.2        # metres beside the player's grid slot
 GHOST_GRID_BACK = 5.0          # ...and behind it
 
-# The first lap is an out lap: not counted, not timed. A standing start folded
-# into a lap time is not a lap time, and both cars need a lap to get up to
-# speed before the comparison means anything.
-OUT_LAP = True
+# --- session modes -----------------------------------------------------------
+# Qualifying always starts with an out lap (not counted, not timed): a standing
+# start folded into a lap time is not a lap time. A grand prix has none -- the
+# race is timed from lights out, the way a real one is.
+#
+# Grand prix track limits (see rules.py). Every excursion with all four wheels
+# past the white line costs the flat fee, plus GAIN_K times the seconds it is
+# estimated to have gained, so a cut can never pay for itself.
+GP_OFFTRACK_PENALTY = 2.0      # seconds per excursion, before distance
+GP_OFFTRACK_PER_M = 0.06       # ...plus this per metre of LAP covered while
+                               #  off the track. This is the term that tells a
+                               #  cut from a mistake: running wide covers a few
+                               #  metres of lap on the grass, while cutting a
+                               #  chicane means most of the chicane's distance
+                               #  is driven off the road. A flat fee cannot
+                               #  separate the two, which is why one of 5 s was
+                               #  both too harsh for a wheel over the line and
+                               #  too cheap for a cut.
+GP_OFFTRACK_GAIN_K = 2.0       # ...plus this many times the time it gained
+GP_OFFTRACK_REJOIN = 1.0       # seconds back on track that end an excursion
+GP_PENALTY_FLASH = 3.0         # how long the HUD shows a settled penalty
+# Qualifying ghost laps: the AI's fastest clean flying lap, recorded by
+# tools/record_ghost.py and replayed frame for frame.
+GHOST_LAP_DIR = ASSET_DIR / "ghosts"
 # Fraction of the autopilot's throttle used after the flag. The result card
 # comes up straight away, over a car that is still moving, and the car goes on
 # lapping at this pace until the session is left.
@@ -642,8 +894,40 @@ WALL_FRICTION = 0.55
 # ---------------------------------------------------------------------------
 # Camera -- tuned for perceived speed, not for a pretty static shot
 # ---------------------------------------------------------------------------
-CAM_MODES = ("chase", "hood", "far")
-CAM_CHASE_OFFSET = (0.0, 5, -12.5)    # low + close => ground rushes past
+# Camera 1 is the broadcast onboard -- the T-cam on top of the airbox, just
+# behind and above the halo, which is the shot an F1 viewer knows the car
+# from. Camera 2 is the close chase, and a session opens on it (CAM_DEFAULT):
+# the chase is the view you can place a car from, and the onboard is the one
+# you switch to once you know where the circuit goes. The cycle runs from the
+# tightest view outwards, so it does not start at its own first entry.
+# The bonnet camera is disabled for now -- it is still built and still
+# supported everywhere (put "hood" back in this tuple to have it again), it
+# just does not deserve a stop in the cycle.
+CAM_MODES = ("onboard", "chase", "far")
+CAM_DEFAULT = "chase"
+# The car is 0.98 m to the top of its airbox and 2.15 m from the centre of
+# gravity to the nose, so the camera sits just clear of the airbox and a
+# little behind it, and looks slightly down -- that is what puts the halo and
+# the length of the nose in the lower half of the shot instead of an empty
+# road.
+# Height is set by the near plane, not by taste: the car is 0.98 m to the top
+# of its airbox, so a camera at 1.40 m leaves 0.42 m of clearance under it,
+# and CLIP_NEAR_ONBOARD below stays inside that. Clearance is what stops the
+# bodywork being sliced open by the near plane -- the one thing this view
+# cannot do, since the car is its subject.
+CAM_ONBOARD_OFFSET = (0.0, 1.40, -0.40)
+CAM_ONBOARD_AIM_Y = 0.68
+# A real onboard is a wide-angle camera at any speed, and this one has to be:
+# the FOV below is 60 deg at rest, which is narrow enough that the nose falls
+# out of the bottom of the frame -- the car appears only once the FOV has
+# opened with speed. A floor under it keeps the same shot standing still.
+CAM_ONBOARD_FOV_MIN = 88.0
+# Close behind and above, looking down onto the car: the ground rushes past,
+# the car is big enough in frame to place on the road, and the road surface
+# either side of it is visible rather than edge-on. 6.3 m rather than the
+# 12.5 m this started at -- at racing speed the FOV has opened to ~87
+# degrees, and at 12.5 m that left the car half the size it is here.
+CAM_CHASE_OFFSET = (0.0, 4.3, -8.3)
 CAM_HOOD_OFFSET = (0.0, 1.9, 1.35)
 CAM_FAR_OFFSET = (0.0, 7.5, -17.5)
 CAM_LOOKAHEAD = 12.0
@@ -654,6 +938,44 @@ CAM_AIM_LERP = 9.0
 # (it reads as acceleration) but no more than this.
 CAM_MAX_LAG = 2.2
 # FOV opens up with speed: the periphery stretches and the world rushes by.
+# --- framing: hold the car's size on screen as the FOV opens ---------------
+# The FOV below runs from 60 deg at rest to past 110 flat out. That alone
+# makes the car 23% bigger standing still than at 80 km/h -- big enough that
+# a stopped car sinks behind the telemetry widget, while the same offset
+# frames it properly on the move. So the chase cameras are pulled back by the
+# same ratio the FOV opens by: the world still stretches with speed, the car
+# stays put in the frame.
+#
+# REF_FOV is the FOV the offsets are authored at (~80 km/h, a normal corner
+# speed). LOCK is how much of the change to cancel -- 1.0 holds the car
+# exactly, 0.0 is the old behaviour. The clamp stops the camera diving into
+# the car at 300 km/h, where full compensation would ask for 0.5x the
+# distance.
+# ...and the second half of the same job: the look-ahead shortens at low
+# speed (CAM_LOOKAHEAD below), which tips the chase camera's aim up and drops
+# the car towards the bottom of the frame -- standing still it sank behind
+# the telemetry widget. Aiming lower as the car slows cancels that, so the
+# car keeps its place in the frame from a standstill to racing speed. The
+# aim is back to its normal height by CAM_CHASE_AIM_SPEED.
+# The chase rises with speed, above CAM_CHASE_RISE_FROM. Frame-locking the
+# offset (below) scales the whole vector, height included, so at 270 km/h the
+# camera sat a metre lower than at 80 and the road ahead was squashed into
+# the middle of the frame. A small rise opens the view down the track again
+# without turning the chase into a helicopter shot -- 2.0 m was that, and
+# read as the camera climbing away from the car. It starts at the reference
+# speed, so the framing that camera 2 was tuned at is untouched.
+CAM_CHASE_RISE = 0.6           # metres added by MAX_SPEED
+CAM_CHASE_RISE_FROM = 22.0     # m/s where it starts (~80 km/h)
+
+CAM_CHASE_AIM_Y = 1.35         # aim height at speed, as every other camera
+CAM_CHASE_AIM_LOW = 0.85       # ...and standing still
+CAM_CHASE_AIM_SPEED = 22.0     # m/s (~80 km/h) where the two meet
+
+CAM_FRAME_LOCK_MODES = ("chase", "far")
+CAM_FRAME_REF_FOV = 70.0
+CAM_FRAME_LOCK = 1.0
+CAM_FRAME_SCALE = (0.85, 1.35)
+
 CAM_FOV_BASE =60.0
 CAM_FOV_GAIN = 72.0            # added at MAX_SPEED (-> 120 deg flat out)
 
@@ -670,6 +992,22 @@ CAM_FOV_GAIN = 72.0            # added at MAX_SPEED (-> 120 deg flat out)
 # correct and no polygon offsets are needed anywhere.
 CLIP_NEAR = 1.5
 CLIP_FAR = 6000.0
+# ...except on the onboard camera, which is mounted on the car: at 1.5 m the
+# near plane cuts away the halo and the airbox the shot exists to show, and
+# leaves the nose floating in front of nothing.
+#
+# 0.35 m, against 0.42 m of clearance to the airbox (CAM_ONBOARD_OFFSET), so
+# the bodywork stays outside the near plane rather than being clipped by it.
+# The margin is only 7 cm, less than the speed shake (+/- 5.5 cm at 300 km/h,
+# 17.6 cm off track), which is exactly what tore the airbox open. The shake
+# stays -- it belongs to the view -- but in this camera it is never allowed
+# to point *downwards* (see _update_camera): shaken up, sideways and along,
+# the clearance under the camera cannot shrink, and no shot is missing for
+# it.
+#
+# The precision this costs (about 15 mm at 300 m, against 9 mm at 0.6) is
+# only ever paid while this camera is selected.
+CLIP_NEAR_ONBOARD = 0.35
 
 # Road surface heights, in metres above the asphalt. These are real geometric
 # separations, not render tricks; each gap is comfortably larger than the depth
@@ -732,8 +1070,21 @@ Y_SHADOW = 0.060
 # drama and read as the picture shaking every time you touch a direction key,
 # so they are dialled back here rather than buried as literals.
 CAM_LEAN = 0.18                # camera roll per rad/s of yaw (was 0.30)
-BODY_ROLL_GAIN = 0.28          # hull roll per m/s^2 of lateral accel (was 0.42)
-BODY_ROLL_MAX = 4.5            # degrees (was 7.0)
+# Body attitude. These are presentation, not physics: the hull leans on the
+# telemetry so the car reads as loaded, and the wheels stay where the
+# suspension put them (see car.py).
+#
+# They are deliberately smaller than they "should" be, because the model
+# sits *on* the ground -- its lowest point is y = 0 -- so every degree of
+# lean and every millimetre of squat puts bodywork under the road surface.
+# At the old values a hard entry dipped a wing through the asphalt.
+BODY_ROLL_GAIN = 0.20          # hull roll per m/s^2 of lateral accel (0.28)
+BODY_ROLL_MAX = 3.2            # degrees (4.5)
+BODY_PITCH_GAIN = 0.12         # hull pitch per m/s^2 of long. accel (0.20)
+BODY_PITCH_MAX = 2.0           # degrees (3.5)
+BODY_SQUAT_MAX = 0.03          # metres of ride-height drop under downforce
+                               #  (0.07, which alone sank the floor into the
+                               #  road before any lean was added)
 
 # ---------------------------------------------------------------------------
 # Lighting -- golden hour

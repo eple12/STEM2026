@@ -77,6 +77,11 @@ EPS_REVIVE_DECAY = 150_000
 # so the last white-line clips get sanded off. Lives in config so RaceEnv and
 # this schedule cannot drift apart.
 OFF_COST_SCHED = [tuple(p) for p in config.RL_OFF_TRACK_COST_RAMP]
+LAP_W_SCHED = [tuple(p) for p in config.RL_LAP_W_RAMP]
+# Keyed to decisions since episode widening, not decisions since training
+# start -- only train_iqn_gpu.py (the GPU trainer) tracks that event and
+# applies this; see RL_POST_WIDEN_RAMP's own long comment in config.py.
+POST_WIDEN_SCHED = [tuple(p) for p in config.RL_POST_WIDEN_RAMP]
 
 # v24: curriculum on the dense-speed-reward target pace. The policy first
 # converges clean against an attainable profile (pace mult 1.0 -- this is
@@ -107,9 +112,11 @@ PACE_SCHED = [(0, 1.0), (15_000_000, 1.0)]   # v25: retired. The v24 ramp
 _W = {}
 
 
-def _init_worker(circuit, n_env, seed_base, start_at_line, n_step):
+def _init_worker(circuit, n_env, seed_base, start_at_line, n_step,
+                 focus_window=None, adaptive_reset=False):
     seed = seed_base * 100003 + os.getpid()
-    envs = [RaceEnv(circuit, seed=seed + i, start_at_line=start_at_line)
+    envs = [RaceEnv(circuit, seed=seed + i, start_at_line=start_at_line,
+                    focus_window=focus_window, adaptive_reset=adaptive_reset)
             for i in range(n_env)]
     # Stagger the first episode length per env so the 130 s truncations do not
     # all land in the same iteration forever (they never desync on their own --
@@ -127,7 +134,7 @@ def _init_worker(circuit, n_env, seed_base, start_at_line, n_step):
 
 def _rollout(job):
     (steps, gamma, eps, eps_boltz, weights, mean, std,
-     off_scale, pace_mult) = job
+     off_scale, pace_mult, lap_w_mult) = job
     envs = _W["envs"]
     obs = _W["obs"]
     hist = _W["hist"]
@@ -149,7 +156,8 @@ def _rollout(job):
                        np.where(roll < eps + eps_boltz, boltz, greedy))
 
         for k, e in enumerate(envs):
-            nobs, rew, done, info = e.step(int(act[k]), off_scale, pace_mult)
+            nobs, rew, done, info = e.step(int(act[k]), off_scale, pace_mult,
+                                           lap_w_mult)
             hist[k].append((obs[k].copy(), int(act[k]), float(rew)))
             if len(hist[k]) == n_step:
                 o0, a0, _ = hist[k][0]
@@ -217,6 +225,19 @@ def main():
                     help="use Double-DQN action selection. Linesight is plain "
                          "IQN (use_ddqn=False), which is the default here.")
     ap.add_argument("--start-at-line", type=float, default=0.15)
+    ap.add_argument("--focus-window", type=float, nargs=2, default=None,
+                    metavar=("LO", "HI"),
+                    help="see train_iqn_gpu.py's --focus-window -- same "
+                         "fraction-of-lap scattered-reset restriction, "
+                         "mirrored here for CPU-side sector-focused runs.")
+    ap.add_argument("--adaptive-reset", action="store_true",
+                    help="see train_iqn_gpu.py's --adaptive-reset -- same "
+                         "difficulty-weighted scattered-reset mechanism, "
+                         "mirrored here (each worker process tracks its own "
+                         "bucket EMA independently from its own envs' "
+                         "telemetry -- not synchronised across workers, an "
+                         "acceptable approximation since this trainer isn't "
+                         "the one actually used for the timed Kaggle runs).")
     ap.add_argument("--init-from", default=None,
                     help="warm-start weights + obs stats from this checkpoint "
                          "(basename under assets/policies, or a path to an .npz)")
@@ -327,7 +348,7 @@ def main():
     out_path = config.RL_POLICY / f"{_rname}.npz"
     best_path = config.RL_POLICY / f"{_rname}_best.npz"
     resume_seen = 0
-    resume_best = (0.0, 3)
+    resume_best = (0.0, 3, 0.0)
     if args.resume and out_path.exists():
         dR = np.load(out_path, allow_pickle=False)
         sd = online.state_dict()
@@ -353,7 +374,8 @@ def main():
             if "best_eval" in _bd.files:
                 _bsrc = _bd
         if "best_eval" in _bsrc.files:
-            resume_best = (float(_bsrc["best_eval"]), int(_bsrc["best_tier"]))
+            resume_best = (float(_bsrc["best_eval"]), int(_bsrc["best_tier"]),
+                          float(_bsrc["best_lap"]) if "best_lap" in _bsrc.files else 0.0)
         print(f"resumed {out_path.name} at {resume_seen:,} decisions "
               f"(best {resume_best[0]:.0f} T{resume_best[1]})", flush=True)
     elif args.resume:
@@ -439,11 +461,14 @@ def main():
         best_lap = min(laps) if laps else 0.0
         return total / len(EVAL_LAUNCHES), tier, per_launch, best_lap
 
-    best_eval, best_tier = resume_best   # (0.0, 3) unless --resume restored it
+    best_eval, best_tier, best_lap_saved = resume_best  # (0.0, 3, 0.0) unless --resume restored it
+    best_it = resume_seen // per_iter    # iteration the current best was set at
 
     pool = Pool(args.workers, initializer=_init_worker,
                 initargs=(args.circuit, args.envs_per_worker, args.seed,
-                          args.start_at_line, args.n_step))
+                          args.start_at_line, args.n_step,
+                          tuple(args.focus_window) if args.focus_window
+                          else None, args.adaptive_reset))
 
     def _shutdown(*_):
         pool.terminate(); pool.join(); os._exit(0)
@@ -476,6 +501,7 @@ def main():
             lr = _interp(lr_sched, seen)
             off_scale = _interp(OFF_COST_SCHED, seen)
             pace_mult = _interp(PACE_SCHED, seen)
+            lap_w_mult = _interp(LAP_W_SCHED, seen)
             for g in opt.param_groups:
                 g["lr"] = lr
 
@@ -483,7 +509,7 @@ def main():
             w = export()
             job = (args.rollout, gamma, eps, eps_b, w,
                    obs_mean.astype(np.float32), std.astype(np.float32),
-                   float(off_scale), float(pace_mult))
+                   float(off_scale), float(pace_mult), float(lap_w_mult))
             parts = pool.map(_rollout, [job] * args.workers)
 
             o = np.concatenate([p[0] for p in parts])
@@ -567,7 +593,8 @@ def main():
                      obs_std=std.astype(np.float32), circuit=args.circuit,
                      seen=np.int64(seen + per_iter),
                      best_eval=np.float32(best_eval),
-                     best_tier=np.int64(best_tier))
+                     best_tier=np.int64(best_tier),
+                     best_lap=np.float32(best_lap_saved))
 
             eval_note = ""
             if b_fill >= args.warmup and (it + 1) % args.eval_every == 0:
@@ -586,18 +613,21 @@ def main():
                                         else f"(off{worst_off})")
                 lap_s = f" lap{best_lap:5.1f}s" if best_lap > 0.0 else ""
                 if better:
-                    best_eval, best_tier = ev, tier
+                    best_eval, best_tier, best_lap_saved = ev, tier, best_lap
+                    best_it = it + 1
                     np.savez(best_path, **w_now,
                              obs_mean=obs_mean.astype(np.float32),
                              obs_std=std.astype(np.float32),
                              circuit=args.circuit,
                              seen=np.int64(seen + per_iter),
                              best_eval=np.float32(best_eval),
-                             best_tier=np.int64(best_tier))
+                             best_tier=np.int64(best_tier),
+                             best_lap=np.float32(best_lap_saved))
                     eval_note = f"  eval {ev:5.0f}m {tag}{lap_s} *BEST*"
                 else:
+                    best_lap_note = f" {best_lap_saved:.1f}s" if best_lap_saved > 0.0 else ""
                     eval_note = (f"  eval {ev:5.0f}m {tag}{lap_s} "
-                                f"(best {best_eval:.0f}T{best_tier})")
+                                f"(best {best_eval:.0f}T{best_tier}{best_lap_note} @it{best_it})")
 
             recent.extend(stats)
             mins = (time.perf_counter() - t0) / 60.0
@@ -614,6 +644,7 @@ def main():
                       f"dist {dist:5.0f}  spd {sp*3.6:5.1f}  rec {rc:4.1f}  "
                       f"off {of*100:4.1f}%  laps {laps:.0f}  "
                       f"eps {eps:.2f}  oS {off_scale:.1f}  pc {pace_mult:.2f}  "
+                      f"lw {lap_w_mult:.2f}  "
                       f"g {gamma:.4f}  "
                       f"loss {loss_acc/max(args.grad_steps,1):.3f}  "
                       f"n{len(recent):2d}+{len(stats):d}  {mins:5.1f}m"

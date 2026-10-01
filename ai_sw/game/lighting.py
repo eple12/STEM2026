@@ -16,9 +16,9 @@ import math
 
 import numpy as np
 from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
-                          CullFaceAttrib, GraphicsPipe, Mat4,
-                          OrthographicLens, Point3, RenderState, SamplerState,
-                          Texture, WindowProperties)
+                          CullFaceAttrib, GraphicsPipe, LVecBase3f, Mat4,
+                          OrthographicLens, Point3, PTA_LVecBase3f,
+                          RenderState, SamplerState, Texture, WindowProperties)
 from ursina import Entity, Vec3, camera, color, scene
 from ursina.lights import DirectionalLight
 from ursina.prefabs.sky import Sky
@@ -121,6 +121,7 @@ class Sunset:
         self._bake_texel = 0.0
         self._bake_track = track if config.BAKE_SHADOWS else None
 
+        self._shadow_center = PTA_LVecBase3f.empty_array(1)
         self._uniforms = {
             'sky_color': Vec3(*config.LIGHT_SKY),
             'ground_color': Vec3(*config.LIGHT_BOUNCE),
@@ -140,8 +141,14 @@ class Sunset:
             'shadow_fade_start': config.SHADOW_AREA * config.SHADOW_FADE_START,
             'shadow_fade_end': config.SHADOW_AREA * config.SHADOW_FADE_END,
             'shadow_strength': 1.0,
-            # Seeded so the very first frame is not lit from the origin.
-            'shadow_center': Vec3.zero,
+            # A PTA, not a Vec3: it is written in place every frame by
+            # follow(). Assigning a new value to a shader input on the scene
+            # root makes a new ShaderAttrib there, which invalidates the
+            # composed render state of every node underneath -- all of them
+            # were recomposed each frame and the old states left for Panda's
+            # state garbage collector. Mutating the array changes the uniform
+            # and nothing else.
+            'shadow_center': self._shadow_center,
             # Off until bake() has something to sample. The shader skips the
             # lookup entirely while this is zero, so the sampler being unbound
             # in the meantime costs nothing and reads nothing.
@@ -430,14 +437,16 @@ class Sunset:
 
         One shader input on the scene root, not one per lit entity: that was
         the single most expensive thing in the frame outside the draw call.
+        And written into the array it was bound with rather than re-set, so
+        the scene's render state does not change -- see ``_uniforms``.
         """
         self.sun.position = Vec3(x, config.SHADOW_HEIGHT, z)
-        scene.set_shader_input('shadow_center', Vec3(x, 0.0, z))
+        self._shadow_center[0] = LVecBase3f(x, 0.0, z)
 
     def destroy(self):
         import builtins
 
-        from ursina import destroy as _destroy
+        from .ui import destroy_tree as _destroy
 
         ge = builtins.base.graphicsEngine
         # Panda creates a shadow-casting light's depth buffer inside the GSG on

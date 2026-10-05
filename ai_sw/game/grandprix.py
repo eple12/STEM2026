@@ -26,6 +26,26 @@ from .surface import Surface
 from .vehicle import Vehicle
 
 
+_POLICY = {}
+
+
+def race_policy():
+    """The learned decision layer (raceai.Policy) if ``config.RACE_AI`` asks for
+    it and its weights are there, else None -- the rules decide. Loaded once per
+    process."""
+    if config.RACE_AI != "rl":
+        return None
+    path = config.RACE_AI_POLICY
+    if path not in _POLICY:
+        try:
+            from .raceai import Policy
+            _POLICY[path] = Policy.load(path)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"race AI: no policy at {path} ({exc.__class__.__name__}); the rules decide")
+            _POLICY[path] = None
+    return _POLICY[path]
+
+
 def solved_grips(circuit: str) -> tuple:
     """The plan grips solved for a circuit, fastest first."""
     return tuple(g for g in teams.PLAN_GRIPS
@@ -133,6 +153,7 @@ def build(track, level: int, laps: int, seed: int = 0, player: bool = True,
             drv = RaceDriver(track, frame, plans(s.skill.plan), s.skill,
                              np.random.default_rng(seed * 100 + idx))
             drv.idx = idx
+            drv.policy = race_policy()
             name, tla = s.driver.name, s.driver.tla
         e = Entrant(idx=idx, name=name, team=s.team.name, color=s.team.color,
                     vehicle=v, surface=surf, driver=drv,

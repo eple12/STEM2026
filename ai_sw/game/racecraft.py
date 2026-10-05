@@ -458,6 +458,7 @@ class RaceDriver:
         # attacking
         self.held_t = 0.0            # seconds held up behind a slower car
         self.attack = None           # (target idx, side, apex s) while passing
+        self.attack_inside = True    # ...and whether that is the inside of the corner
         self.cooldown = 0.0
         self.attacks = 0
         self.passes_made = 0
@@ -698,6 +699,17 @@ class RaceDriver:
         target = float(cands[best])
         self._set_lane(me.s, self._clip_offset(k0, target) if target else 0.0, me.v)
 
+    def _policy_tick(self, me: CarView, field: list[CarView]):
+        """A plan tick of a driver whose decisions are a policy's: a pass it
+        began carries on (and ends) by the rule layer's own machinery, then the
+        policy decides -- continue it, give it up, or something else."""
+        if self.attack is not None:
+            n_abs = self._attack_continue(me, field)
+            if n_abs is not None and (self.abs_lane is None
+                                      or abs(self.abs_lane[2] - n_abs) > 1e-6):
+                self.abs_lane = (me.s, me.n, n_abs, max(self.ABS_BLEND, 2.0 * me.v))
+        self.policy(self, me, field)
+
     # -- passing -------------------------------------------------------------
     #: Sideways distance kept from the car being passed: a body width plus room.
     ATTACK_SEP = GAP_ACROSS + 0.4
@@ -742,28 +754,7 @@ class RaceDriver:
         fr = self.frame
         views = {o.idx: o for o in field}
         if self.attack is not None:
-            tgt, side, brake_s, n_abs = self.attack
-            o = views.get(tgt)
-            if o is None or not o.racing or self.yellow:
-                self._end_attack(me, cooldown=0.5)
-                return None
-            gap = fr.ds(me.s, o.s)
-            if gap < -PASS_MARGIN:
-                # Nose clearly ahead: the other car yields from here (see
-                # _leader_cap), so the position is this car's.
-                self._end_attack(me, cooldown=1.0)
-                self.passes_made += 1
-                return None
-            past = fr.ds(brake_s, me.s)
-            if past > 0.0 and gap > PASS_MARGIN:
-                self._end_attack(me, cooldown=4.0)      # did not: tuck in
-                return None
-            if past > 60.0:
-                # Still side by side well into the corner: settle it on the
-                # road (the room rule keeps the two apart), not in the lane.
-                self._end_attack(me, cooldown=3.0)
-                return None
-            return n_abs
+            return self._attack_continue(me, field)
         if self.cooldown > 0.0 or self.leader is None or self.yellow:
             return None
         o = views.get(self.leader)
@@ -786,23 +777,36 @@ class RaceDriver:
         k = fr.node(me.s)
         if abs(float(self.plan.kappa[k])) > 3e-3:
             return None
-        best = None
-        for z in self.attack_zones:
-            dist = (fr.arc[z] - fr.arc[k]) % fr.L
-            if self.ATTACK_FROM < dist < self.ATTACK_TO \
-                    and (best is None or dist < best[0]):
-                best = (dist, int(z))
+        best = self._attack_zone(k)
         if best is None:
             return None
         # Stay in the tow until it has done its work -- right up behind, or
         # the braking zone near -- then pull out.
         if gap - GAP_ALONG > PULL_OUT_GAP and best[0] > PULL_OUT_DIST:
             return None
-        z = best[1]
+        return self._attack_begin(o, best[1], (None,))
+
+    def _attack_zone(self, k: int):
+        """(metres, zone) of the next braking zone worth passing into, within
+        the window a pull-out is made from; None if there is none."""
+        fr = self.frame
+        best = None
+        for z in self.attack_zones:
+            dist = (fr.arc[z] - fr.arc[k]) % fr.L
+            if self.ATTACK_FROM < dist < self.ATTACK_TO \
+                    and (best is None or dist < best[0]):
+                best = (dist, int(z))
+        return best
+
+    def _attack_begin(self, o: CarView, z: int, sides, commit: bool = True):
+        """Where beside car *o* to pass it for the corner of braking zone *z*,
+        or None: the inside of the corner if there is room there between it and
+        the white line, else the outside. *sides*: which to try -- ``(None,)`` is
+        inside then outside, ``(True,)`` the inside only, ``(False,)`` the
+        outside only. *commit* False only looks."""
+        fr = self.frame
         apex = self.zone_apex[z]
         inside = 1.0 if self.plan.kappa[apex] > 0.0 else -1.0
-        # Beside it, a car's width over: the inside of the next corner if
-        # there is room there between it and the white line, else the outside.
         ko = fr.node(o.s)
         lo = -self.track.w_left[ko] + EDGE_ROOM
         hi = self.track.w_right[ko] - EDGE_ROOM
@@ -810,13 +814,84 @@ class RaceDriver:
         # is a pass the later braker can still make; past that, the corner.
         settle = float(fr.arc[z]) + self.zone_settle[z] * float(
             (fr.arc[apex] - fr.arc[z]) % fr.L)
-        for side in (inside, -inside):
+        order = {(None,): (inside, -inside), (True,): (inside,), (False,): (-inside,)}[tuple(sides)]
+        for side in order:
             n_abs = o.n + side * self.ATTACK_SEP
             if lo <= n_abs <= hi:
-                self.attack = (o.idx, side, settle % fr.L, n_abs)
-                self.attacks += 1
+                if commit:
+                    self.attack = (o.idx, side, settle % fr.L, n_abs)
+                    self.attack_inside = side == inside
+                    self.attacks += 1
                 return n_abs
         return None
+
+    def _attack_continue(self, me: CarView, field: list[CarView]):
+        """A pass under way: its lane, or None once it is over -- done, given
+        up, or no longer possible -- having ended it."""
+        fr = self.frame
+        views = {o.idx: o for o in field}
+        tgt, side, brake_s, n_abs = self.attack
+        o = views.get(tgt)
+        if o is None or not o.racing or self.yellow:
+            self._end_attack(me, cooldown=0.5)
+            return None
+        gap = fr.ds(me.s, o.s)
+        if gap < -PASS_MARGIN:
+            # Nose clearly ahead: the other car yields from here (see
+            # _leader_cap), so the position is this car's.
+            self._end_attack(me, cooldown=1.0)
+            self.passes_made += 1
+            return None
+        past = fr.ds(brake_s, me.s)
+        if past > 0.0 and gap > PASS_MARGIN:
+            self._end_attack(me, cooldown=4.0)      # did not: tuck in
+            return None
+        if past > 60.0:
+            # Still side by side well into the corner: settle it on the
+            # road (the room rule keeps the two apart), not in the lane.
+            self._end_attack(me, cooldown=3.0)
+            return None
+        return n_abs
+
+    def attack_options(self, me: CarView, field: list[CarView]):
+        """(inside possible, outside possible): could a pass be started right
+        now -- a car close ahead, a straight, a braking zone in the window and
+        room beside it? What the rule layer's own triggers (being held up, the
+        tow, the cooldown) say is for whoever decides to leave out."""
+        if self.attack is not None or self.leader is None or self.yellow:
+            return False, False
+        views = {o.idx: o for o in field}
+        o = views.get(self.leader)
+        if o is None or not o.racing:
+            return False, False
+        fr = self.frame
+        gap = fr.ds(me.s, o.s)
+        if gap <= 0.0 or gap > 1.6 * self.ATTACK_GAP * max(me.v, 10.0):
+            return False, False
+        k = fr.node(me.s)
+        if abs(float(self.plan.kappa[k])) > 3e-3:
+            return False, False
+        best = self._attack_zone(k)
+        if best is None:
+            return False, False
+        return (self._attack_begin(o, best[1], (True,), commit=False) is not None,
+                self._attack_begin(o, best[1], (False,), commit=False) is not None)
+
+    def start_attack(self, me: CarView, field: list[CarView], inside: bool) -> bool:
+        """Begin a pass on the car ahead, on the inside or the outside of the
+        coming corner, if ``attack_options`` says it can be; True if it began."""
+        ins, out = self.attack_options(me, field)
+        if not (ins if inside else out):
+            return False
+        views = {o.idx: o for o in field}
+        o = views[self.leader]
+        best = self._attack_zone(self.frame.node(me.s))
+        n_abs = self._attack_begin(o, best[1], (inside,))
+        if n_abs is None:
+            return False
+        self.abs_lane = (me.s, me.n, n_abs, max(self.ABS_BLEND, 2.0 * me.v))
+        self.lane_tick = self.ticks
+        return True
 
     # -- every tick ------------------------------------------------------
     def _yellow(self, me: CarView, field: list[CarView]) -> bool:
@@ -1065,7 +1140,7 @@ class RaceDriver:
                 # contains the decision (an attack already under way).
                 before = self.watch.before(self, me, field)
             if self.policy is not None:
-                self.policy(self, me, field)
+                self._policy_tick(me, field)
             else:
                 self._plan(me, field)
         self.yellow = self._yellow(me, field)

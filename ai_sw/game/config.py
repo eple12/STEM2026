@@ -896,6 +896,13 @@ GP_LAP_VARIATION = 0.015
 # The twenty-car field (fieldproc.py) on circuits that have solved plans;
 # False races the single AI ghost everywhere, as before.
 GP_FIELD = True
+# Who decides the AI drivers' passing, defending and queueing: "rules"
+# (racecraft's hand-written layer) or "rl" (the policy trained by
+# tools/ppo_raceai.py and kept in assets/policies/raceai.npz -- the rules, if
+# that file is not there). The plan following, the room rule, yellow flags and
+# recovery are the rules' either way. See README, "레이스 AI의 학습 판단 층".
+RACE_AI = "rl"
+RACE_AI_POLICY = ASSET_DIR / "policies" / "raceai.npz"
 # Seconds a race control message about the player stays up (others: 60%).
 # Under a yellow flag every car, the player's included, keeps below this speed
 # for the stretch the flag covers (racecontrol.py judges it, racecraft.py drives

@@ -44,7 +44,7 @@ class _Logger:
         if driver.mode != "race" or before is None:
             return                            # recovery is not a decision of this layer
         ra = self.raceai
-        a = ra.rule_action(driver, me, pace_ratio)
+        a = ra.rule_action(driver, me, pace_ratio, before)
         if before[self.n0] == 0.0 and a == ra.DEFAULT_ACTION and self.rng.random() > KEEP_ALONE:
             return
         self.obs.append(before)
@@ -95,9 +95,8 @@ def main():
     ap.add_argument("--out", default=str(OUT / "rules_pairs.npz"))
     args = ap.parse_args()
 
-    from game import grandprix, raceenv
-    from game.menu import available_circuits
-    circuits = args.circuits or [c for c in available_circuits() if grandprix.ready(c)]
+    from game import raceenv
+    circuits = args.circuits or raceenv.circuits()
     tasks = [(c, k, args.seed0 + s) for c in circuits for k in raceenv.KINDS
              for s in range(args.seeds)]
     t0 = time.time()

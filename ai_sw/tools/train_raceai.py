@@ -12,7 +12,7 @@ outputs, written as the ``.npz`` ``raceai.Policy`` reads: ``mean``/``std`` (the
 observation's normalisation), ``layers``, ``W0..``, ``b0..``. The same file is
 what the game loads and what the RL stage starts from (``--init-from``).
 
-Class weights are the inverse square root of an action's frequency: a plain
+Class weights are the inverse square root of an action's frequency by default: a plain
 cross-entropy teaches "stay on the line" and little else, and the rare
 decisions -- pull out, cover, lift -- are the whole point.
 """
@@ -80,7 +80,7 @@ def bc(args):
     x = torch.tensor((obs - mean) / std)
     y = torch.tensor(act)
     freq = np.bincount(act[tr], minlength=raceai.N_ACTIONS).astype(np.float64) + 1.0
-    weight = torch.tensor((freq.sum() / freq) ** 0.5, dtype=torch.float32)
+    weight = torch.tensor((freq.sum() / freq) ** args.weight_pow, dtype=torch.float32)
     weight = weight / weight.mean()
     net = build(args.hidden, raceai.OBS_DIM, raceai.N_ACTIONS)
     opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
@@ -128,6 +128,8 @@ def main():
     b.add_argument("--batch", type=int, default=512)
     b.add_argument("--lr", type=float, default=2e-3)
     b.add_argument("--seed", type=int, default=0)
+    b.add_argument("--weight-pow", type=float, default=0.5,
+                   help="class weight = (1/frequency)^this; 1.0 favours the rare decisions")
     args = ap.parse_args()
     if args.cmd == "bc":
         bc(args)

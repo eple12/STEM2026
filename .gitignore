@@ -69,3 +69,7 @@ ai_sw/scene_preview/
 # Behaviour-cloning pairs of the rule-based race driver (40 MB, regenerable with
 # ai_sw/tools/raceai_collect.py).
 ai_sw/policy/raceai/rules_pairs.npz
+ai_sw/policy/raceai/ppo_loc2/
+ai_sw/policy/raceai/ppo_local/
+ai_sw/policy/raceai/bc_w1*
+ai_sw/policy/raceai/kg_*/*.log

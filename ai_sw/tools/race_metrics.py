@@ -14,9 +14,11 @@ would call a good outcome, and the referee's counts are averaged:
           being ahead after the corner, with no contact and no penalty.
 * sbs     side by side into the braking zone: success is no contact, no penalty.
 * defend  a faster car right behind: success is still being ahead, no penalty.
-* merge   a stranded car at the road's edge, traffic coming: success is that
-          nobody touched anybody and the car got back on the road.
-* pack    eight cars in sixty metres: success is no contact.
+* merge   a stranded car at the road's edge, traffic coming: the ego is the
+          first car coming up behind it; success is passing it with no contact
+          and no penalty.
+* pack    eight cars in sixty metres: success is no contact and no penalty
+          for the ego.
 
 Output goes to ``policy/raceai/<name>.json`` and a table on stdout.
 """
@@ -57,16 +59,8 @@ def _race(args):
 
 
 def _success(kind: str, r: dict) -> bool:
-    clean = r["ego_hits"] == 0 and r["ego_penalty_s"] == 0.0 and not r["ego_warnings"]
-    if kind == "tow":
-        return clean and r["ego_rank_end"] == 1
-    if kind == "defend":
-        return clean and r["ego_rank_end"] == 1
-    if kind == "sbs":
-        return clean
-    if kind == "merge":
-        return r["contacts"] == 0 and r["ego_recoveries"] >= 1 and r["ego_progress_m"] > 100.0
-    return r["contacts"] == 0                      # pack
+    from game import raceenv
+    return raceenv.success(kind, r)
 
 
 def summarise(reps: list[dict]) -> dict:

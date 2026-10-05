@@ -9,9 +9,14 @@ rules (the room rule, the leader cap, yellow flags, recovery).
 
 * **Actions** -- discrete, as in ``rlpolicy`` and for the same reason (an argmax
   over value estimates has no exploration noise baked into the greedy policy):
-  a lane, as metres off the plan's line, times a pace. ``LANES`` are the rule
-  layer's own lanes (racecraft.LANES); ``PACES`` are a lift, the plan's pace,
-  and a small push (a later brake, a harder exit).
+  a lane, as metres off the plan's line, times a pace (``LANES`` are the rule
+  layer's own lanes, racecraft.LANES; ``PACES`` a lift, the plan's pace, and a
+  small push); and three that are about a pass -- begin one on the inside of the
+  coming corner, begin one on the outside, or ``HOLD`` what is going on. A pass
+  is not a lane: its geometry (alongside the car ahead, settled by the braking
+  zone's middle, the room rule keeping the two apart) is the rule layer's
+  machinery and stays so; the policy decides WHEN to start one and whether to
+  give it up (any lane action while one is under way does).
 
 * **Observation** -- everything in the driver's own frame, so one policy can
   drive any circuit: where it is on the road, how fast against the plan, the
@@ -35,7 +40,10 @@ from . import config
 LANES = (-6.0, -3.5, -1.75, 0.0, 1.75, 3.5, 6.0)
 PACES = (0.94, 1.0, 1.03)
 N_LANES, N_PACES = len(LANES), len(PACES)
-N_ACTIONS = N_LANES * N_PACES
+ATTACK_IN = N_LANES * N_PACES
+ATTACK_OUT = ATTACK_IN + 1
+HOLD = ATTACK_IN + 2
+N_ACTIONS = HOLD + 1
 #: The action that is "stay on the line at the plan's pace".
 DEFAULT_ACTION = LANES.index(0.0) * N_PACES + PACES.index(1.0)
 
@@ -49,14 +57,18 @@ NEAR_AHEAD = 200.0
 _EGO = ("lane", "target", "room_l", "room_r", "speed", "pace_ratio", "accel",
         "to_brake", "held", "yellow", "aggression", "width") \
     + tuple(f"kappa{int(d)}" for d in LOOK) + tuple(f"dv{int(d)}" for d in LOOK) \
-    + ("lane_age", "lead_edge", "zone_dist", "zone_drop", "straight")
+    + ("lane_age", "lead_edge", "zone_dist", "zone_drop", "straight",
+       "attack", "can_in", "can_out")
 _NEAR = ("gap", "lat", "closing", "stopped", "valid")
 OBS_NAMES = _EGO + tuple(f"n{i}_{f}" for i in range(N_NEAR) for f in _NEAR)
 OBS_DIM = len(OBS_NAMES)
 
 
 def decode(a: int) -> tuple[float, float]:
-    """(lane offset in metres, pace multiplier) of action *a*."""
+    """(lane offset in metres, pace multiplier) of a lane action *a*; the pass
+    actions are the line at the plan's pace."""
+    if a >= ATTACK_IN:
+        return 0.0, 1.0
     return LANES[a // N_PACES], PACES[a % N_PACES]
 
 
@@ -126,6 +138,12 @@ def observe(driver, me, field, out: np.ndarray | None = None) -> np.ndarray:
         v[o + 2] = 1.5
         v[o + 3] = 0.0
     v[o + 4] = 1.0 if abs(float(plan.kappa[k])) < 3e-3 else 0.0
+    # A pass under way (the rule layer's machinery runs it for the policy too),
+    # and whether one could be started this instant, on either side.
+    v[o + 5] = 1.0 if driver.attack is not None else 0.0
+    can_in, can_out = driver.attack_options(me, field)
+    v[o + 6] = 1.0 if can_in else 0.0
+    v[o + 7] = 1.0 if can_out else 0.0
     base = len(_EGO)
     near = []
     for o in field:
@@ -149,28 +167,42 @@ def observe(driver, me, field, out: np.ndarray | None = None) -> np.ndarray:
     return v
 
 
-def apply_action(driver, me, a: int) -> None:
-    """Make *driver* do action *a* from its next tick on: move to the lane
-    (clipped to the road, as the rule layer's lanes are) and take the pace."""
-    lane, pace = decode(int(a))
+def apply_action(driver, me, a: int, field) -> None:
+    """Make *driver* do action *a* from its next tick on. A lane action moves
+    to the lane (clipped to the road, as the rule layer's lanes are) and takes
+    the pace -- and gives up a pass under way; ATTACK_IN / ATTACK_OUT begin one
+    if one can be begun (``attack_options``), else do nothing; HOLD changes
+    nothing."""
+    a = int(a)
+    if a == HOLD:
+        return
+    if a >= ATTACK_IN:
+        if driver.attack is None:
+            driver.start_attack(me, field, inside=(a == ATTACK_IN))
+        return
+    lane, pace = decode(a)
+    if driver.attack is not None:
+        driver._end_attack(me, cooldown=2.0)
     driver.pace_mult = pace
     k = driver.frame.node(me.s)
     driver._set_lane(me.s, driver._clip_offset(k, lane) if lane else 0.0, me.v)
-    # A learned lane replaces any attack the rule layer had under way.
-    driver.attack = None
-    driver.abs_lane = None
 
 
-def rule_action(driver, me, pace_ratio: float = 1.0) -> int:
+_ATTACK_COL = OBS_NAMES.index("attack")
+
+
+def rule_action(driver, me, pace_ratio: float = 1.0, before=None) -> int:
     """The action nearest to what the rule layer has just decided -- the label
-    a policy is taught from (behaviour cloning). While the rules are diving
-    down the inside the lane is not an offset from the line, so the offset
-    they will be at 40 m on is used."""
-    if driver.abs_lane is not None:
-        lane = driver._offset_at((me.s + 40.0) % driver.frame.L)[0]
-    else:
-        lane = driver.target
-    return encode(lane, pace_ratio)
+    a policy is taught from (behaviour cloning). *before* is the observation the
+    decision was made from: a pass the rules were already running is HOLD, one
+    they began this tick is ATTACK_IN / ATTACK_OUT, and otherwise the label is
+    the lane they hold and the pace they take."""
+    was = before is not None and before[_ATTACK_COL] > 0.5
+    if driver.attack is not None:
+        if was:
+            return HOLD
+        return ATTACK_IN if driver.attack_inside else ATTACK_OUT
+    return encode(driver.target, pace_ratio)
 
 
 class Policy:
@@ -192,7 +224,7 @@ class Policy:
 
     def __call__(self, driver, me, field) -> None:
         observe(driver, me, field, self._obs)
-        apply_action(driver, me, int(np.argmax(self.values(self._obs))))
+        apply_action(driver, me, int(np.argmax(self.values(self._obs))), field)
 
     @classmethod
     def load(cls, path) -> "Policy":

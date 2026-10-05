@@ -32,10 +32,11 @@ def random_policy(seed=0, hidden=64):
 
 
 def main():
-    for a in range(raceai.N_ACTIONS):
+    for a in range(raceai.ATTACK_IN):
         lane, pace = raceai.decode(a)
         assert raceai.encode(lane, pace) == a, a
-    print("actions: ok", raceai.N_ACTIONS)
+    print("actions: ok", raceai.N_ACTIONS, "(lane x pace round-trip; pass actions", raceai.ATTACK_IN,
+          raceai.ATTACK_OUT, raceai.HOLD, ")")
 
     sc = raceenv.make_scenario("Monza", "pack", 3)
     fld = sc.fld

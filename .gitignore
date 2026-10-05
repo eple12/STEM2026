@@ -73,3 +73,5 @@ ai_sw/policy/raceai/ppo_loc2/
 ai_sw/policy/raceai/ppo_local/
 ai_sw/policy/raceai/bc_w1*
 ai_sw/policy/raceai/kg_*/*.log
+ai_sw/README.md
+ai_sw/CONCEPT.md

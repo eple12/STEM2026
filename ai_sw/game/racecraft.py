@@ -377,6 +377,7 @@ class RaceDriver:
         self.frame = frame
         self.plan = plan
         self.follow = PlanFollower(plan)
+        self.follow.track = track
         self.skill = skill
         self.rng = rng
         self.idx = -1

@@ -29,7 +29,7 @@ import math
 
 import numpy as np
 
-from . import config
+from . import config, drivenet
 from .vehicle import Controls, Vehicle
 
 
@@ -169,6 +169,15 @@ class PlanFollower:
         #: (+right), and the previewed error the feedback acted on.
         self.lat_err = 0.0
         self.err = 0.0
+        #: The road (a ``trackdata`` track), for the network's view of the white
+        #: lines; set by whoever builds the follower for racing.
+        self.track = None
+        #: A network that drives instead (``drivenet.DriveNet``) or, in training,
+        #: an object with ``needs_teacher`` that is handed this follower's own
+        #: answer to learn from. None: the hand-built follower below.
+        self.drive = None
+        self._drv_n = 0
+        self._drv_a = (0.0, 0.0)
 
     def controls(self, vehicle: Vehicle, k: int, f: float,
                  offset: float = 0.0, d_off: float = 0.0, dd_off: float = 0.0,
@@ -184,6 +193,10 @@ class PlanFollower:
         ``hold_speed`` ignores the plan's speed and keeps the current one -- a
         missed braking point.
         """
+        drv = self.drive
+        if drv is not None and not drv.needs_teacher:
+            return self._net_controls(drv, vehicle, k, f, offset, d_off, dd_off, v_cap,
+                                      pace, hold_speed, flat_out, v_min)
         cfg = config
         pl = self.plan
         Lp = pl.L
@@ -285,11 +298,35 @@ class PlanFollower:
                 (cfg.TYRE_GRIP * t.load_rear) ** 2 - t.lat_rear ** 2, 0.0))
             if t.load_rear > 0.0:
                 ceiling = min(ceiling, max(tc, 1.0))
-            return Controls(throttle=min(force / ceiling, 1.0),
-                            brake=0.0, steer=steer, analog_steer=True)
-        return Controls(throttle=0.0,
-                        brake=min(-force / cfg.BRAKE_FORCE, 1.0),
-                        steer=steer, analog_steer=True)
+            ctl = Controls(throttle=min(force / ceiling, 1.0),
+                           brake=0.0, steer=steer, analog_steer=True)
+        else:
+            ctl = Controls(throttle=0.0,
+                           brake=min(-force / cfg.BRAKE_FORCE, 1.0),
+                           steer=steer, analog_steer=True)
+        if drv is not None:
+            # Training: this follower's answer is the teacher's; the object
+            # decides what is actually driven (its own, or this one).
+            if self._drv_n <= 0:
+                self._drv_a = drv.act(
+                    drivenet.features(self, vehicle, k, f, offset, d_off, dd_off, v_cap,
+                                      pace, hold_speed, flat_out, v_min, self._drv_a),
+                    (ctl.steer, ctl.throttle - ctl.brake))
+                self._drv_n = drivenet.REPEAT
+            self._drv_n -= 1
+            return drivenet.to_controls(self._drv_a, Controls)
+        return ctl
+
+    def _net_controls(self, drv, vehicle, k, f, offset, d_off, dd_off, v_cap, pace,
+                      hold_speed, flat_out, v_min):
+        """The network drives: a new decision every ``REPEAT`` ticks, held between."""
+        if self._drv_n <= 0:
+            self._drv_a = drv.act(drivenet.features(
+                self, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
+                flat_out, v_min, self._drv_a))
+            self._drv_n = drivenet.REPEAT
+        self._drv_n -= 1
+        return drivenet.to_controls(self._drv_a, Controls)
 
 
 class MinTimeDriver:

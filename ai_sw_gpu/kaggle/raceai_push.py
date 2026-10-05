@@ -3,9 +3,11 @@
     python raceai_push.py ppo-v1                              # a fresh run
     python raceai_push.py ppo-v2 --resume-from mskimdev/aisw-raceai-ppo-v1
     python raceai_push.py ppo-v1 --extra "--kl 0.2 --T 1.3" --hours 11
+    python raceai_push.py drive-a --trainer dagger --hours 4    # the steering/pedal network
 
 What runs is ``ai_sw/tools/ppo_raceai.py`` (stage 3 of the learned race driver,
-see ai_sw/README.md). It is a **CPU** kernel on purpose: the cost is the Python
+see ai_sw/README.md), or with ``--trainer dagger`` ``tools/dagger_drive.py`` (the
+steering/pedal network, game/drivenet.py; its output ``dagger_last.npz``). It is a **CPU** kernel on purpose: the cost is the Python
 simulation, not the network (59 -> 128 -> 128 -> 21), and a GPU session has two
 cores where a CPU one has four -- a GPU would make it slower. CPU sessions run
 12 h and have no weekly quota; the kernel stops itself at ``--hours`` so its
@@ -43,6 +45,7 @@ from pathlib import Path
 HOURS = {hours}
 NAME = {name!r}
 EXTRA = {extra!r}
+TRAINER = {trainer!r}
 INPUT = Path("/kaggle/input")
 WORK = Path("/tmp/aisw")
 OUT = Path("/kaggle/working/ppo")
@@ -73,7 +76,7 @@ else:
 
 OUT.mkdir(parents=True, exist_ok=True)
 resume = []
-prev = [p for p in INPUT.glob("**/ppo/ppo_state.pt")]
+prev = [p for p in INPUT.glob("**/ppo/*_state.pt")]
 if prev:
     for f in prev[0].parent.iterdir():
         if f.is_file():
@@ -81,9 +84,14 @@ if prev:
     resume = ["--resume"]
     print("resuming from", prev[0].parent, flush=True)
 
-cmd = [sys.executable, "tools/ppo_raceai.py", "--bc", "policy/raceai/bc.npz", "--out", str(OUT),
-       "--jobs", "4", "--iters", "100000", "--max-hours", str(HOURS), "--eval-every", "10",
-       "--eval-seeds", "3"] + resume + EXTRA.split()
+if TRAINER == "dagger":
+    head = ["tools/dagger_drive.py", "train", "--out", str(OUT), "--jobs", "4", "--iters", "100000",
+            "--max-hours", str(HOURS), "--eval-every", "3", "--eval-seeds", "1"]
+else:
+    head = ["tools/ppo_raceai.py", "--bc", "policy/raceai/bc.npz", "--out", str(OUT),
+            "--jobs", "4", "--iters", "100000", "--max-hours", str(HOURS), "--eval-every", "10",
+            "--eval-seeds", "3"]
+cmd = [sys.executable] + head + resume + EXTRA.split()
 print("running:", " ".join(cmd), flush=True)
 sys.stdout.flush()
 rc = subprocess.call(cmd, cwd=str(WORK / "ai_sw"))
@@ -113,8 +121,10 @@ def bundle(dest: Path):
     path = dest / "raceai_bundle.tar.gz"
     files = []
     files += sorted((REPO / "ai_sw" / "game").glob("*.py"))
-    files += [REPO / "ai_sw" / "tools" / n for n in ("ppo_raceai.py", "train_raceai.py")]
+    files += [REPO / "ai_sw" / "tools" / n for n in ("ppo_raceai.py", "train_raceai.py", "dagger_drive.py")]
     files += [REPO / "ai_sw" / "policy" / "raceai" / "bc.npz"]
+    # the decision layer the cars race with while the follower correction trains
+    files += [REPO / "ai_sw" / "assets" / "policies" / "raceai.npz"]
     files += sorted((REPO / "ai_sw" / "assets" / "racelines").glob("*.npz"))
     files += sorted(p for p in (REPO / TRACKS).rglob("*") if p.is_file())
     with tarfile.open(path, "w:gz") as tf:
@@ -130,6 +140,7 @@ def main():
     ap.add_argument("--hours", type=float, default=11.0)
     ap.add_argument("--extra", default="", help="more flags for ppo_raceai.py")
     ap.add_argument("--resume-from", default=None, help="a previous kernel slug")
+    ap.add_argument("--trainer", default="ppo_raceai", choices=("ppo_raceai", "dagger"))
     ap.add_argument("--no-dataset", action="store_true", help="reuse the published bundle")
     args = ap.parse_args()
 
@@ -165,7 +176,8 @@ def main():
         k = stage / "kernel"
         k.mkdir()
         (k / "raceai_train.py").write_text(
-            KERNEL.format(hours=args.hours, name=args.name, extra=args.extra), encoding="utf-8")
+            KERNEL.format(hours=args.hours, name=args.name, extra=args.extra,
+                          trainer=args.trainer), encoding="utf-8")
         sources = [json.dumps(args.resume_from)] if args.resume_from else []
         (k / "kernel-metadata.json").write_text(json.dumps({
             "id": f"{me}/{slug}", "title": f"aisw raceai {args.name}",

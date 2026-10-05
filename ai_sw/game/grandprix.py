@@ -27,6 +27,24 @@ from .vehicle import Vehicle
 
 
 _POLICY = {}
+_DRIVE = {}
+
+
+def drive_net():
+    """The learned steering and pedals (drivenet.DriveNet) if ``config.DRIVE_AI``
+    asks for them and the weights are there, else None -- the hand-built
+    follower drives. Loaded once per process."""
+    if config.DRIVE_AI != "rl":
+        return None
+    path = config.DRIVE_AI_POLICY
+    if path not in _DRIVE:
+        try:
+            from .drivenet import DriveNet
+            _DRIVE[path] = DriveNet.load(path)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"drive AI: no network at {path} ({exc.__class__.__name__}); the follower drives")
+            _DRIVE[path] = None
+    return _DRIVE[path]
 
 
 def race_policy():
@@ -154,6 +172,7 @@ def build(track, level: int, laps: int, seed: int = 0, player: bool = True,
                              np.random.default_rng(seed * 100 + idx))
             drv.idx = idx
             drv.policy = race_policy()
+            drv.follow.drive = drive_net()
             name, tla = s.driver.name, s.driver.tla
         e = Entrant(idx=idx, name=name, team=s.team.name, color=s.team.color,
                     vehicle=v, surface=surf, driver=drv,

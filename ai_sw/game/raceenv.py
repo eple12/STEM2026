@@ -57,6 +57,9 @@ REWARD = {
     "recovery": -3.0,      # per spin / off / stuck that needs recovering
     "strike": -0.5,        # per track-limits strike
     "switch": -0.05,       # per 3.5 m of lane change asked for
+    # What a spectator calls unnatural, though no steward does:
+    "queue": -0.6,         # per second held up behind a car with open road beside
+    "kerb": -1.0,          # per second with two wheels or more on the kerb or beyond
 }
 
 #: The slower car's pace in the tow scene, drawn from this range (the ego drives
@@ -253,6 +256,10 @@ class Referee:
         self.side_by_side = np.zeros(n)
         self.min_gap = np.full(n, np.inf)
         self.lane_moves = np.zeros(n)
+        #: Seconds held up with open road beside, and on the kerb (two wheels+).
+        self.queue_s = np.zeros(n)
+        self.kerb_s = np.zeros(n)
+        self.racing_s = np.zeros(n)
         self.defence_moves = 0
         self._target = [e.driver.target if e.driver else 0.0 for e in self.fld.cars]
         self.start_progress = None
@@ -301,6 +308,15 @@ class Referee:
         if self.tick % 3:
             return
         fr = fld.frame
+        for i, e in enumerate(cars):
+            d = e.driver
+            if d is None or not views[i].racing:
+                continue
+            self.racing_s[i] += 3 * DT
+            if e.vehicle.grip_scale < KERB_GRIP:
+                self.kerb_s[i] += 3 * DT
+            if d._is_held and e.vehicle.speed > 15.0 and free_side(fld, i):
+                self.queue_s[i] += 3 * DT
         for i in range(n):
             for j in range(i + 1, n):
                 a, b = views[i], views[j]
@@ -337,11 +353,16 @@ class Referee:
             out[f"{key}_warnings"] = int(rec.collision_warnings)
             out[f"{key}_strikes"] = int(rec.strikes)
             out[f"{key}_lane_moves_m"] = round(float(self.lane_moves[idx]), 1)
+            out[f"{key}_queue_s"] = round(float(self.queue_s[idx]), 2)
+            out[f"{key}_kerb_s"] = round(float(self.kerb_s[idx]), 2)
             out[f"{key}_side_by_side_s"] = round(float(self.side_by_side[idx]), 2)
             out[f"{key}_min_clearance_m"] = (None if not np.isfinite(self.min_gap[idx])
                                              else round(float(self.min_gap[idx]), 2))
             out[f"{key}_recoveries"] = int(e.driver.recoveries) if e.driver else 0
         out["recoveries"] = int(sum(e.driver.recoveries for e in fld.cars if e.driver))
+        racing = max(float(self.racing_s.sum()), 1e-9)
+        out["queue_pct"] = round(100.0 * float(self.queue_s.sum()) / racing, 2)
+        out["kerb_pct"] = round(100.0 * float(self.kerb_s.sum()) / racing, 2)
         out["passes"] = len(self.passes)
         out["pass_zone_offsets"] = [round(p["zone_off"], 1) for p in self.passes]
         out["passes_by_ego"] = sum(1 for p in self.passes if p["passer"] == egos[0])
@@ -364,6 +385,32 @@ def success(kind: str, r: dict) -> bool:
     if kind == "merge":
         return clean and r["goal_reached"]
     return clean                                    # sbs, pack
+
+
+#: What counts as riding the kerb: the mean grip over the four patches below
+#: this is two wheels or more past the white line (one wheel is 0.97).
+KERB_GRIP = 0.9
+
+
+def free_side(fld, i: int, margin: float = 3.0, ahead: float = 45.0, behind: float = 25.0,
+              across: float = 4.2) -> bool:
+    """Is there open road beside car *i* -- on either side, more than *margin*
+    metres to the white line and no car within *behind*/*ahead* metres along and
+    *across* metres over?"""
+    views, fr = fld.views, fld.frame
+    me = views[i]
+    tr = fld.cars[i].driver.track
+    k = fr.node(me.s)
+    for side in (1.0, -1.0):
+        room = (tr.w_right[k] - me.n) if side > 0 else (tr.w_left[k] + me.n)
+        if room <= margin:
+            continue
+        for j, o in enumerate(views):
+            if j != i and o.racing and -behind < fr.ds(me.s, o.s) < ahead                     and 0.0 < side * (o.n - me.n) < across:
+                break
+        else:
+            return True
+    return False
 
 
 def _rank(fld, idx: int) -> int:
@@ -474,7 +521,8 @@ class RaceEnv:
         return {"P": float(e.limits.progress or 0.0), "rank": _rank(self.fld, i),
                 "hits": e.hits, "events": rc.collision_warnings + len(rc.penalties),
                 "pen": self.fld.rc.penalty(i), "rec": e.driver.recoveries,
-                "strikes": rc.strikes, "target": e.driver.target}
+                "strikes": rc.strikes, "target": e.driver.target,
+                "queue": float(self.ref.queue_s[i]), "kerb": float(self.ref.kerb_s[i])}
 
     def _obs(self):
         fld = self.fld
@@ -500,6 +548,8 @@ class RaceEnv:
                 "recovery": REWARD["recovery"] * (now["rec"] - prev["rec"]),
                 "strike": REWARD["strike"] * (now["strikes"] - prev["strikes"]),
                 "switch": REWARD["switch"] * abs(now["target"] - prev["target"]) / 3.5,
+                "queue": REWARD["queue"] * (now["queue"] - prev["queue"]),
+                "kerb": REWARD["kerb"] * (now["kerb"] - prev["kerb"]),
             }
             parts[i] = p
             rewards[i] = float(sum(p.values()))

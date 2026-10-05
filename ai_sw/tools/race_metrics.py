@@ -80,6 +80,8 @@ def summarise(reps: list[dict]) -> dict:
             "side_by_side_s": round(m("ego_side_by_side_s"), 2),
             "toward_follower_moves": round(m("defence_moves"), 2),
             "ego_lane_moves_m": round(m("ego_lane_moves_m"), 1),
+            "ego_queue_s": round(m("ego_queue_s"), 2),
+            "ego_kerb_s": round(m("ego_kerb_s"), 2),
         }
     return out
 
@@ -95,6 +97,8 @@ def summarise_races(reps: list[dict]) -> dict:
         "penalised_cars_per_race": round(sum(r["n_penalised"] for r in reps) / n, 2),
         "penalty_s_per_race": round(sum(r["total_penalty_s"] for r in reps) / n, 1),
         "recoveries_per_race": round(sum(r["recoveries"] for r in reps) / n, 2),
+        "queue_pct": round(sum(r["queue_pct"] for r in reps) / n, 2),
+        "kerb_pct": round(sum(r["kerb_pct"] for r in reps) / n, 2),
         "toward_follower_moves_per_lap": round(sum(r["defence_moves"] for r in reps) / laps, 2),
         "passes_before_braking_zone": round(sum(1 for z in zone if -400 < z < 0) / max(len(zone), 1), 2),
         "passes_in_or_after_zone": round(sum(1 for z in zone if z >= 0) / max(len(zone), 1), 2),

@@ -54,11 +54,12 @@ Yellow flags (a stricken car: stopped, or being recovered):
 * **No overtaking** in the yellow zone, bar the stricken car itself. The
   car that passed is told to give the place back; if it has within
   ``GIVE_BACK_T``, nothing more, otherwise ``YELLOW_PEN``.
-* **Slow down.** Through the zone a car must run clearly slower than it did
-  at the same place on its previous lap (``YELLOW_SLOW_RATIO`` of that
-  speed, on average over the zone). The first time is a warning; a repeat
-  costs ``YELLOW_PEN`` on levels that penalise repeats. With no previous
-  lap to compare against (lap 1) there is nothing to judge on.
+* **Slow down.** Through the zone a car stays below ``config.YELLOW_SPEED_KMH``.
+  It has ``YELLOW_GRACE_T`` seconds from entering the zone to get down to it
+  (nobody brakes from 300 km/h in a car's length); after that, more than
+  ``YELLOW_OVER_T`` seconds above the limit (``YELLOW_TOL`` of tolerance) is
+  failing to slow. The first time is a warning; a repeat costs ``YELLOW_PEN``
+  on levels that penalise repeats.
 
 Time penalties are added to the race time at the flag, as in F1 when there is
 no pit stop to serve them at.
@@ -101,8 +102,10 @@ COLLISION_PEN = 5.0
 #: over its own on the lap before -- judged on at least YELLOW_MIN_T in it.
 GIVE_BACK_T = 10.0
 YELLOW_PEN = 5.0
-YELLOW_SLOW_RATIO = 0.96
 YELLOW_MIN_T = 1.5
+YELLOW_GRACE_T = 3.0
+YELLOW_TOL = 1.05
+YELLOW_OVER_T = 1.0
 #: Contacts nobody could have avoided (see the module doc): seconds a car must
 #: have been in trouble before running into it counts as the other driver's
 #: fault, and seconds after a hit by a third car in which a second one is not.
@@ -275,10 +278,10 @@ class RaceControl:
         self.messages.append(Message(t, passer, "OVERTAKING UNDER YELLOW  ·  "
                                      "GIVE THE PLACE BACK", "warn", passed))
 
-    def yellow_slow(self, t: float, car: int, ratio: float, secs: float) -> None:
-        """*car* has left a yellow zone after *secs* in it at *ratio* of its
-        previous lap's speed there, on average."""
-        if secs < YELLOW_MIN_T or ratio <= YELLOW_SLOW_RATIO:
+    def yellow_slow(self, t: float, car: int, over: float, secs: float) -> None:
+        """*car* has left a yellow zone after *secs* in it, of which *over*
+        seconds (after the grace to get down to the limit) were above it."""
+        if secs < YELLOW_MIN_T or over < YELLOW_OVER_T:
             return
         rec = self.cars[car]
         rec.yellow_warnings += 1

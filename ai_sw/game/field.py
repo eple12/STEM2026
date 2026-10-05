@@ -25,7 +25,7 @@ import numpy as np
 
 from . import config
 from .contact import HIT_IMPULSE, collide, overlap
-from .racecontrol import YELLOW_SLOW_RATIO, Message, RaceControl
+from .racecontrol import YELLOW_GRACE_T, YELLOW_TOL, Message, RaceControl
 from .racecraft import CarView, RaceDriver, TrackFrame
 from .rules import TrackLimits
 from .surface import Surface
@@ -128,7 +128,8 @@ class Entrant:
     ref_v: float = float("nan")
     #: In a yellow zone now: seconds in it, and speed-over-last-lap seconds.
     y_t: float = 0.0
-    y_sum: float = 0.0
+    #: ...and how much of that was above the limit, after the grace.
+    y_over: float = 0.0
 
     @property
     def best(self):
@@ -165,9 +166,6 @@ class Field:
         #: ("hit", t, s, a, b, impulse, state a, state b, b's lead on a,
         #: b's offset right of a), recoveries as ("recover", t, s, car, why).
         self.events: list = []
-        #: Car -> the speed (m/s) that keeps it on the right side of the
-        #: stewards' yellow-flag judgement where it is now; absent outside a zone.
-        self.yellow_limit: dict[int, float] = {}
         #: Car -> session time it began being in trouble (spun, off the road,
         #: being recovered); absent while it is not. For the stewards' idea of
         #: a contact nobody could have avoided (racecontrol.UNAVOIDABLE_T).
@@ -403,7 +401,7 @@ class Field:
         what = ("RECOVERING" if e.driver is not None and e.driver.mode == "recover"
                 else "STOPPED ON TRACK")
         self.rc.messages.append(Message(
-            self.t, e.idx, f"YELLOW SECTOR {sector}  ·  {e.tla} {what}  ·  SLOW DOWN  ·  NO OVERTAKES",
+            self.t, e.idx, f"YELLOW SECTOR {sector}  ·  {e.tla} {what}  ·  MAX {config.YELLOW_SPEED_KMH:.0f} KM/H  ·  NO OVERTAKES",
             "yellow"))
 
     def _yellow(self, views, dt: float):
@@ -443,23 +441,17 @@ class Field:
         self.frame.stricken_s = tuple((b - YELLOW_AFTER) % L for _a, b in zones)
         # Slowing for it: each car's speed through a zone against its own
         # at the same places on its lap before, judged as it leaves.
-        limits: dict[int, float] = {}
+        limit = config.YELLOW_SPEED_KMH / 3.6
         for e, me in zip(self.cars, views):
             inside = (bool(zones) and e.finish_t is None and not self._stricken(e)
                       and self.rc.yellow_at(me.s, L))
             if inside:
-                if math.isfinite(e.ref_v) and e.ref_v > 5.0:
-                    # Against its last clean lap here -- but never one slower
-                    # than most of what the plan allows (a standing start, a
-                    # lap in traffic): that would pass anything.
-                    ref = max(e.ref_v, 0.8 * float(self._ref_v[self.frame.node(me.s)]))
-                    e.y_t += dt
-                    e.y_sum += dt * me.v / ref
-                    limits[e.idx] = YELLOW_SLOW_RATIO * ref
+                e.y_t += dt
+                if e.y_t > YELLOW_GRACE_T and me.v > limit * YELLOW_TOL:
+                    e.y_over += dt
             elif e.y_t > 0.0:
-                self.rc.yellow_slow(self.t, e.idx, e.y_sum / e.y_t, e.y_t)
-                e.y_t = e.y_sum = 0.0
-        self.yellow_limit = limits
+                self.rc.yellow_slow(self.t, e.idx, e.y_over, e.y_t)
+                e.y_t = e.y_over = 0.0
 
     # -- one physics tick --------------------------------------------------
     def step(self, dt: float):

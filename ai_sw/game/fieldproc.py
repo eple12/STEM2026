@@ -39,7 +39,7 @@ COLS = ("x", "z", "yaw", "vx", "vz", "yaw_rate", "steer", "lat_accel",
         "long_accel", "downforce", "braking", "ghost", "drs", "racing",
         "progress", "laps", "finish_t", "best", "last", "lap_start",
         "penalty", "on_track", "hits", "strikes", "pos", "interval", "gap",
-        "recover", "s", "total", "stricken", "ylimit")
+        "recover", "s", "total", "stricken")
 C = {name: k for k, name in enumerate(COLS)}
 
 DT = 1.0 / 60.0
@@ -78,8 +78,6 @@ def _snapshot(fld, kick_total, messages_from: int):
         r[C["hits"]] = e.hits
         r[C["strikes"]] = fld.rc.cars[e.idx].strikes
         r[C["stricken"]] = float(fld._stricken(e)) if fld.started else 0.0
-        # The speed to stay under in a yellow zone here, m/s (nan: none).
-        r[C["ylimit"]] = fld.yellow_limit.get(e.idx, np.nan)
     # The running order and the gaps on the tower: interval to the car
     # ahead and gap to the leader, both measured at the same point of track
     # (Field.gap); at the flag, the classification by total time.

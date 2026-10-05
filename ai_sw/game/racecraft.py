@@ -116,6 +116,13 @@ YELLOW_RANGE = 350.0
 YELLOW_PACE = 0.85
 YELLOW_NEAR_PACE = 0.65
 YELLOW_NEAR = 100.0
+#: Inside a zone the AI holds this share of config.YELLOW_SPEED_KMH (under
+#: racecontrol's tolerance), and to be there on entering it brakes along a
+#: YELLOW_DECEL (m/s^2) profile from as far back as YELLOW_BRAKE_LOOK metres --
+#: from 300 km/h to 100 takes about 200 m, far more than YELLOW_LEAD.
+YELLOW_AI_SHARE = 0.94
+YELLOW_DECEL = 18.0
+YELLOW_BRAKE_LOOK = 320.0
 #: Metres before a yellow zone the AI lifts, so it is slowed on entering it.
 YELLOW_LEAD = 60.0
 #: Under a yellow, any racing car this close ahead is followed, not passed.
@@ -815,6 +822,24 @@ class RaceDriver:
                 return True
         return False
 
+    def _yellow_cap(self, me: CarView) -> float:
+        """The speed a yellow flag allows here: the limit inside a zone, and
+        before one the speed from which the limit can still be reached by its
+        start. Unbounded when there is no zone near."""
+        zones = self.frame.yellow
+        if not zones:
+            return float("inf")
+        L = self.frame.L
+        v_lim = config.YELLOW_SPEED_KMH / 3.6 * YELLOW_AI_SHARE
+        best = float("inf")
+        for a, b in zones:
+            if (me.s - a) % L <= (b - a) % L:
+                return v_lim
+            ahead = (a - me.s) % L
+            if ahead < YELLOW_BRAKE_LOOK:
+                best = min(best, math.sqrt(v_lim * v_lim + 2.0 * YELLOW_DECEL * ahead))
+        return best
+
     def _room(self, me: CarView, field: list[CarView], k: int, d: float) -> float:
         """Clamp the lane so it never closes on a car alongside.
 
@@ -1030,7 +1055,7 @@ class RaceDriver:
             dd = ddd = 0.0
             self.lane = (me.s, d, me.s, d)
             self.target = d
-        cap = self._leader_cap(me, field, d)
+        cap = min(self._leader_cap(me, field, d), self._yellow_cap(me))
         pace = self.pace_lap
         if self.yellow:
             # A stricken car ahead: lift, as a marshal's yellow flag asks, so

@@ -1415,26 +1415,9 @@ class Game:
             return cur[1], cur[2], head
         self._rc_spend(False)
         if yellow:
-            lim = self._yellow_limit_kmh()
-            slow = "SLOW DOWN" if lim is None else f"KEEP BELOW {lim} KM/H"
-            return f"YELLOW FLAG  ·  {slow}  ·  NO OVERTAKES", "warn", "RACE CONTROL"
+            return (f"YELLOW FLAG  ·  KEEP BELOW {config.YELLOW_SPEED_KMH:.0f} KM/H"
+                    "  ·  NO OVERTAKES", "warn", "RACE CONTROL")
         return "", "warn", "RACE CONTROL"
-
-    def _yellow_limit_kmh(self) -> int | None:
-        """The speed that keeps the player on the right side of the stewards'
-        yellow-flag judgement where they are now, in km/h to the next 5 below
-        (the stewards compare the zone's mean speed with the player's own on
-        the lap before, so this follows the road: lower in a corner, higher
-        on a straight). None when there is no lap to compare with yet."""
-        snap = self._snap
-        car = (self.field.player if self.field is not None
-               and self.field.player is not None else self._watch_idx)
-        if snap is None or car is None:
-            return None
-        lim = float(snap["rows"][car][self._C["ylimit"]])
-        if not math.isfinite(lim):
-            return None
-        return int(lim * 3.6 // 5) * 5
 
     def _yellow_here(self) -> bool:
         snap = self._snap

@@ -897,6 +897,10 @@ GP_LAP_VARIATION = 0.015
 # False races the single AI ghost everywhere, as before.
 GP_FIELD = True
 # Seconds a race control message about the player stays up (others: 60%).
+# Under a yellow flag every car, the player's included, keeps below this speed
+# for the stretch the flag covers (racecontrol.py judges it, racecraft.py drives
+# to it, and the HUD says it).
+YELLOW_SPEED_KMH = 100.0
 RC_MESSAGE_T = 4.0
 # Race control's messages queue and take turns: never less than this on
 # screen however many are waiting, and news of other cars that has waited

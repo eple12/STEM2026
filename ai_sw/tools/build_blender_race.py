@@ -208,7 +208,21 @@ def build(livery: str, src, prefix: str, length_fit: float, width_fit: float,
             corners = (sel[:, None] * 3 + np.arange(3)[None, :]).reshape(-1)
             v, n, r, tris = weld(g[corners], gn[corners], np.repeat(role[sel], 3))
             # reverse the corner order: see build_blender_f1.expand
-            tris = np.ascontiguousarray(tris[:, ::-1])
+            front = np.ascontiguousarray(tris[:, ::-1])
+            if key != "body":
+                # The wheel assembly is modelled single-sided: a tyre whose
+                # inner wall is missing, a cover with no back. Seen from the
+                # outside that is invisible; seen from between the wheels --
+                # which is where the camera goes in a spin or an onboard --
+                # the faces are culled and the road shows through the wheel.
+                # So each wheel face is baked twice, the second with its
+                # winding and normal reversed: from inside you get the dark
+                # back of the wheel, as a real one has.
+                nv = len(v)
+                tris = np.vstack([front, np.ascontiguousarray(tris + nv)])
+                v, n, r = np.vstack([v, v]), np.vstack([n, -n]), np.concatenate([r, r])
+            else:
+                tris = front
             parent.attach_new_node(geom_node(f"{key}__{t}", v, n, colour_of[r], tris))
             total += len(tris)
 

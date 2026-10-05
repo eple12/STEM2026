@@ -468,6 +468,22 @@ class RaceDriver:
         self.own_pace = float(np.mean(plan.v / np.maximum(frame.ref.v, 1.0))) \
             * skill.pace
         self.lead_pace: dict = {}
+        #: The decision layer can be replaced (raceai.py). ``policy(driver, me,
+        #: field)`` is called on this driver's plan ticks instead of the rule
+        #: based _plan / _attack_lane: it sets the lane (``_set_lane``) and
+        #: ``pace_mult``. The safety layers under it -- the room rule, the
+        #: leader cap, the yellow flag, recovery -- stay the rules' own.
+        self.policy = None
+        self.pace_mult = 1.0
+        #: Tick of the last lane decision (a lane change, or the start of a dive
+        #: down the inside): how long ago the car committed to where it is.
+        self.lane_tick = 0
+        #: ``watch(driver, me, field, pace_ratio, before)``, called after each
+        #: plan tick with what this driver decided (``before``: whatever
+        #: ``watch.before(driver, me, field)`` returned ahead of the decision): how a policy is taught to do
+        #: what the rules do (behaviour cloning), and how the rules are
+        #: measured. Nothing changes for a driver without either.
+        self.watch = None
 
     # -- the lane --------------------------------------------------------
     def _lane_at(self, s: float) -> tuple[float, float, float]:
@@ -550,6 +566,7 @@ class RaceDriver:
         length = min(max(1.1 * speed, 30.0), 90.0)
         self.lane = (s, d_now, (s + length) % self.frame.L, target)
         self.target = target
+        self.lane_tick = self.ticks
 
     def _clip_offset(self, k: int, d: float) -> float:
         """Keep a lane's wheels inside the white lines where it runs. The
@@ -669,6 +686,7 @@ class RaceDriver:
             else:
                 if self.abs_lane is None or abs(self.abs_lane[2] - attack_n) > 1e-6:
                     self.abs_lane = (me.s, me.n, attack_n, max(self.ABS_BLEND, 2.0 * me.v))
+                    self.lane_tick = self.ticks
                 return
         rel = slice(0, len(cands))
         keen = 0.6 + 0.8 * self.skill.aggression
@@ -1040,8 +1058,16 @@ class RaceDriver:
             if self.lane[0] == self.lane[2]:
                 dd = ddd = 0.0
             return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt)
+        before = None
         if self.ticks % self.frame.plan_every == 0:
-            self._plan(me, field)
+            if self.watch is not None and hasattr(self.watch, "before"):
+                # What the decision is made FROM -- taken ahead of it, or it
+                # contains the decision (an attack already under way).
+                before = self.watch.before(self, me, field)
+            if self.policy is not None:
+                self.policy(self, me, field)
+            else:
+                self._plan(me, field)
         self.yellow = self._yellow(me, field)
         d, dd, ddd = self._offset_at(me.s)
         d = self._clip_offset(k, d)
@@ -1068,6 +1094,8 @@ class RaceDriver:
         elif self.attack is not None:
             # Alongside another car into a corner: leave a little in hand.
             pace *= ATTACK_PACE
+        rule_pace = pace / self.pace_lap
+        pace *= self.pace_mult
         # Held up: the car ahead is costing real speed, not just sitting there.
         own = self.plan.at(self.plan.v, k, f) * pace
         held = self.leader is not None and cap < 0.985 * own
@@ -1078,6 +1106,8 @@ class RaceDriver:
         flat = vehicle.drag_scale < 0.99 and not self.yellow
         self._held = (cap, pace, flat)
         self._is_held = held
+        if self.watch is not None and self.ticks % self.frame.plan_every == 0:
+            self.watch(self, me, field, rule_pace, before)
         return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt)
 
     def _drive(self, vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt):

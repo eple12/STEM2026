@@ -153,39 +153,10 @@ def _across_span(track: Track, i: int, clear: float,
                  min_extra: float = config.CAR_BODY_WIDTH,
                  leg_frac: float = 1.0
                  ) -> tuple[np.ndarray, float]:
-    """(centre, full span) for a structure standing across the circuit.
-
-    Its legs go *clear* metres outside the asphalt on both sides, never past
-    the barrier, and it is centred on the road rather than midway between the
-    two walls. Both halves of that matter. Spanning wall to wall was fine when
-    the run-off was thirteen metres of it; against a corner's fifty it gives a
-    beam the length of a football pitch. And a circuit whose barriers sit at
-    different distances on the two sides -- Zandvoort's, everywhere -- put the
-    midpoint of the two walls well off the road, which is why the start lights
-    hung over the run-off instead of over the grid.
-
-    Where the barrier is close enough that the clamp bites, *min_extra* is the
-    floor and it wins: a full car's width of clear ground between the white
-    line and the nearest leg, whatever else is going on. A leg any nearer than
-    that is one a car running wide reaches before it has run out of road.
-
-    *leg_frac* is where the structure's legs actually stand, as a fraction of
-    the half-span -- a bridge tower's inner face is at 0.75 of it, a gantry
-    leg at 0.80, not out at the very edge. Returning a span that only clears
-    the road at its extremes then leaves the legs themselves well inside the
-    white line, which on Zandvoort's narrow, close-walled corners put a bridge
-    pillar less than a car's width off the asphalt. The floor and the target
-    are divided by it so it is the *leg*, not the span edge, that keeps clear.
-    """
-    off_r, off_l = track.wall_ray_offsets()
-    w = float(max(track.w_right[i], track.w_left[i]))
-    # Less than the leg's own half-width from the fence is a leg through
-    # the fence, so the room stops short of it by more than a token metre.
-    room = float(min(off_r[i], off_l[i])) - 1.5
-    floor_half = (w + min_extra) / leg_frac
-    want_half = (w + clear) / leg_frac
-    half = max(min(want_half, max(room, floor_half)), floor_half)
-    return track.center[i], 2.0 * half
+    """See structures.across_span: shared with the physics, which collides
+    the cars with the legs of what is placed here."""
+    from .structures import across_span
+    return across_span(track, i, clear, min_extra, leg_frac)
 
 
 def _nearest_index(track: Track, p) -> int:
@@ -654,8 +625,13 @@ def _stands(track: Track, lib: PropLibrary, ents: list[Entity], spans,
                 for f in np.linspace(0.15, 1.0, 5):
                     q = p - out * (config.STAND_SETBACK + d * 0.5) * f
                     blockers.append((q[0], q[1], w * 0.55))
-    e = lib.batch(name, places, face_forward=True)
+    # The seating shader draws the rows of seats (shaders.py, CROWD). Given
+    # to the batch, not afterwards: flattening bakes whatever shader is in
+    # force.
+    from .shaders import crowd_shader
+    e = lib.batch(name, places, face_forward=True, shader=crowd_shader)
     if e is not None:
+        e.world_shader = crowd_shader
         ents.append(e)
 
 
@@ -744,6 +720,12 @@ def _forest(track: Track, lib: PropLibrary, ents: list[Entity], rng, blockers):
                 picks[names[k]].append((p[0], p[1], y, sc))
 
     total = sum(len(v) for v in picks.values())
+    if getattr(config, "FOREST_CARDS", True):
+        from . import foliage
+        made = foliage.place(track, picks, rng)
+        ents.extend(made)
+        print(f"scenery: {total} trees ({'impostors' if foliage.impostors() else 'painted cards'}) in {len(made)} cells")
+        return
     cell = config.FOREST_CELL
     if cell <= 0:
         for name, places in picks.items():
@@ -1069,8 +1051,10 @@ def _start_gantry(track: Track, lib: PropLibrary, ents: list[Entity], blockers):
     from 12 to 15 m of asphalt and a gantry with its feet on the racing line is
     worse than no gantry at all.
     """
-    p, span = _across_span(track, 0, config.GANTRY_LEG_CLEAR, leg_frac=0.80)
-    authored = lib.footprint("gantry")[0] or 18.65
+    from .structures import GANTRY_W, gantry_place
+    _i, p, span = gantry_place(track)
+    # The physics' legs (structures.obstacles) assume this width.
+    authored = GANTRY_W
     scale = (span / authored, 1.0, 1.0)
     # Turned to meet the cars. yaw_at is the direction of travel, and a gantry
     # aimed that way shows the grid the back of its banner and the backs of
@@ -1130,19 +1114,11 @@ def _bridges(track: Track, lib: PropLibrary, ents: list[Entity], blockers):
     """Spectator bridges. Two of these round a lap break the skyline more than
     any amount of extra grandstand does, and they give a long straight a
     landmark to measure distance against."""
-    authored = lib.footprint("bridge")[0] or 25.6
+    from .structures import BRIDGE_W, bridge_places
+    # The physics' towers (structures.obstacles) assume this width.
+    authored = BRIDGE_W
     places = []
-    n = track.count
-    win = max(4, n // 50)
-    for f in np.linspace(0.0, 1.0, config.BRIDGE_COUNT, endpoint=False)[1:]:
-        i = int(np.searchsorted(track.arclen, f * track.length)) % n
-        # Slide to the straightest sample nearby: a bridge is a rigid beam set
-        # square to the tangent, so on a bend one pillar swings in towards the
-        # apex and the along-normal clearance _across_span guarantees is not
-        # the clearance the car actually sees.
-        js = (np.arange(i - win, i + win) % n)
-        i = int(js[np.argmax(track.curv_radius[js])])
-        p, span = _across_span(track, i, config.BRIDGE_LEG_CLEAR, leg_frac=0.75)
+    for i, p, span in bridge_places(track):
         places.append((p[0], p[1], yaw_at(track, i), (span / authored, 1.0, 1.0)))
         blockers.append((p[0], p[1], span * 0.6))
     e = lib.batch("bridge", places)

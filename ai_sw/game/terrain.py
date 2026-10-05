@@ -108,7 +108,13 @@ def build_mountains(track) -> Entity | None:
             # colour they need, and a green hill this far out just reads as
             # more grass.
             f = 0.62 + 0.38 * (H[j, i] / max(config.MOUNTAIN_HEIGHT, 1e-6))
-            cols.append(pal.rgb(int(52 * f), int(56 * f), int(84 * f)))
+            # Wooded hills. The sky's own haze (shaders.py) turns them blue
+            # with distance, as aerial perspective does; painted blue as well
+            # they came out violet.
+            if config.LIGHTING_PRESET == "sunset":
+                cols.append(pal.rgb(int(52 * f), int(56 * f), int(84 * f)))
+            else:
+                cols.append(pal.rgb(int(56 * f), int(70 * f), int(50 * f)))
 
     for j in range(nr - 1):
         for i in range(na):

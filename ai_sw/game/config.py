@@ -15,7 +15,15 @@ from pathlib import Path
 # Paths
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parents[2]
-TRACK_DB = REPO_ROOT / "Neural_Network_NEAT-master" / "new" / "f1tenth_racetracks-main"
+_PROJECT = Path(__file__).resolve().parents[1]
+#: The circuits (f1tenth_racetracks, MIT): shipped with the game under
+#: ``data/``; the old place beside the NEAT project is kept as a fallback, and
+#: ``FORMULA_AI_TRACKS`` points anywhere else.
+TRACK_DB = next((p for p in (
+    *([Path(os.environ["FORMULA_AI_TRACKS"])] if os.environ.get("FORMULA_AI_TRACKS") else []),
+    _PROJECT / "data" / "f1tenth_racetracks",
+    REPO_ROOT / "Neural_Network_NEAT-master" / "new" / "f1tenth_racetracks-main",
+) if p.is_dir()), _PROJECT / "data" / "f1tenth_racetracks")
 ASSET_DIR = Path(__file__).resolve().parents[1] / "assets"
 
 DEFAULT_TRACK = "Monza"
@@ -841,10 +849,17 @@ GHOST_ENABLED = True
 # and picked by name alone, so switching is a one-line edit here:
 #   "bl_red" / "bl_white"           the Blender car        (assets/models/f1)
 #   "rb_red" / "rb_white"           the baked fp04rb asset (assets/models/f1)
+#   "rc_red" / "rc_white"           assets/for+race.blend as modelled, 894k tris
+#   "rl_red" / "rl_white"           the same, decimated to 91k tris
 #   "f1red" / "f1white"             procedural, f1car.py
 #   "raceCarRed" / "raceCarWhite"   Kenney CC0 kit         (assets/models/kenney)
-PLAYER_MODEL = "bl_red"
-GHOST_MODEL = "bl_white"
+# rc_/rl_ are built by blender/export_race_car.py + tools/build_blender_race.py,
+# fitted to the same 4.45 x 2.41 m box as bl_. 1080p, twenty-car grand prix on
+# the dev laptop, back to back: bl_ 72 fps, rl_ 66 (at 160k tris: 61 against bl_'s
+# 80); rc_ 27 (qualifying, two cars: 95 / 84 / 69). rl_ is indistinguishable
+# from rc_ under the game's lighting.
+PLAYER_MODEL = "rl_red"
+GHOST_MODEL = "rl_white"
 # Fraction of the tyre's grip the AI commits to. This is the difficulty dial,
 # and it is a physical quantity rather than a fudge factor: the planner works
 # out a corner speed from the friction circle, and this says how much of the
@@ -859,22 +874,35 @@ GHOST_GRID_BACK = 5.0          # ...and behind it
 # start folded into a lap time is not a lap time. A grand prix has none -- the
 # race is timed from lights out, the way a real one is.
 #
-# Grand prix track limits (see rules.py). Every excursion with all four wheels
-# past the white line costs the flat fee, plus GAIN_K times the seconds it is
-# estimated to have gained, so a cut can never pay for itself.
-GP_OFFTRACK_PENALTY = 2.0      # seconds per excursion, before distance
-GP_OFFTRACK_PER_M = 0.06       # ...plus this per metre of LAP covered while
-                               #  off the track. This is the term that tells a
-                               #  cut from a mistake: running wide covers a few
-                               #  metres of lap on the grass, while cutting a
-                               #  chicane means most of the chicane's distance
-                               #  is driven off the road. A flat fee cannot
-                               #  separate the two, which is why one of 5 s was
-                               #  both too harsh for a wheel over the line and
-                               #  too cheap for a cut.
-GP_OFFTRACK_GAIN_K = 2.0       # ...plus this many times the time it gained
+# Grand prix track limits: rules.py measures every trip with all four wheels
+# past the white line, racecontrol.py decides what it deserves (a warning, a
+# penalty that outweighs any time gained, or nothing when the car was pushed
+# off or had already lost time) -- see the table in racecontrol.py.
 GP_OFFTRACK_REJOIN = 1.0       # seconds back on track that end an excursion
-GP_PENALTY_FLASH = 3.0         # how long the HUD shows a settled penalty
+# Grid slot (1 = pole) for a player who has not qualified on the circuit at
+# the chosen level this session: mid-pack, so there is racing both ways.
+GP_PLAYER_GRID = 10
+# Race-day form: each AI driver's race pace is a little slower than their
+# qualifying lap implies, by an amount drawn per race (|N(0, spread)|), so the
+# grid order is not the finishing order and there is something to pass.
+# Qualifying itself is unaffected.
+GP_FORM_SPREAD = 0.020
+# Chance per lap, added to every driver's own, of a late-braking error.
+GP_EXTRA_MISTAKES = 0.06
+# Added to every driver's lap-to-lap pace variation (std-dev, slower only): a
+# constant handicap sorts the field by pace in a lap or two and then nothing
+# changes; a handicap that is drawn afresh every lap keeps it shuffling.
+GP_LAP_VARIATION = 0.015
+# The twenty-car field (fieldproc.py) on circuits that have solved plans;
+# False races the single AI ghost everywhere, as before.
+GP_FIELD = True
+# Seconds a race control message about the player stays up (others: 60%).
+RC_MESSAGE_T = 4.0
+# Race control's messages queue and take turns: never less than this on
+# screen however many are waiting, and news of other cars that has waited
+# this long is dropped (the player's own always gets its turn).
+RC_MESSAGE_MIN_T = 1.6
+RC_STALE_T = 12.0
 # Qualifying ghost laps: the AI's fastest clean flying lap, recorded by
 # tools/record_ghost.py and replayed frame for frame.
 GHOST_LAP_DIR = ASSET_DIR / "ghosts"
@@ -976,8 +1004,13 @@ CAM_FRAME_REF_FOV = 70.0
 CAM_FRAME_LOCK = 1.0
 CAM_FRAME_SCALE = (0.85, 1.35)
 
-CAM_FOV_BASE =60.0
-CAM_FOV_GAIN = 72.0            # added at MAX_SPEED (-> 120 deg flat out)
+# Horizontal degrees (Ursina's camera.fov is the horizontal angle): opens
+# from 60 to 132 flat out. (62 -> 78 and 62 -> 92 were tried on 2026-10-04, and
+# 60 -> 96 with a heavier POST_SPEED_BLUR on 2026-10-05, to stop cars reading as
+# squashed; all put back: this is the rush of speed the game is meant to have.
+# The squashed look was the car model's proportions, fixed in the model.)
+CAM_FOV_BASE = 60.0
+CAM_FOV_GAIN = 72.0            # added at MAX_SPEED (-> 132 deg flat out)
 
 # --- depth buffer ------------------------------------------------------
 # A 24-bit depth buffer's precision is dominated by the NEAR plane: the
@@ -1087,16 +1120,20 @@ BODY_SQUAT_MAX = 0.03          # metres of ride-height drop under downforce
                                #  road before any lean was added)
 
 # ---------------------------------------------------------------------------
-# Lighting -- golden hour
+# Lighting
 # ---------------------------------------------------------------------------
-# The whole look is one relationship: the low beam is warm because the blue has
-# been scattered out of it, and that scattered blue is what fills the shadows.
-# Warm key, cool fill. Reverse it and the scene is just noon with an orange
-# filter over it.
-# 8.5 degrees was too low to drive under: a 10 m grandstand throws a 67 m
-# shadow at that angle, which covers the whole width of the main straight and
-# puts the racing line in the dark on every circuit.
-SUN_ELEVATION = 22.0           # degrees above the horizon
+# Everything below is LINEAR light (see shaders.py): the sun is several times
+# brighter than the sky, as it is outdoors, and post.py's tone curve brings the
+# result down to a screen. Colours picked in sRGB elsewhere (vertex colours,
+# textures) are converted to linear in the shader, so they keep meaning what
+# they meant.
+#
+# Two looks, picked by LIGHTING_PRESET:
+#   "day"     race-day afternoon: a high, near-white sun, a deep blue sky with
+#             cloud, the broadcast look every modern racing game is graded to.
+#   "sunset"  the old golden hour, retuned for linear light.
+LIGHTING_PRESET = "day"
+
 # The azimuth is derived from the circuit rather than fixed, because a fixed
 # one is flattering on some tracks and puts the sun behind the main grandstand
 # on others. Light comes across the start/finish line from the paddock side, so
@@ -1110,29 +1147,89 @@ SUN_ELEVATION = 22.0           # degrees above the horizon
 SUN_RAKE = 65.0                # degrees the beam is turned along the straight
 SUN_SIDE = -1                  # -1: sun over the grandstands, +1: over the paddock
 SUN_AZIMUTH = 205.0            # fallback when there is no track to derive from
+SUN_DISC_DEG = 0.55            # angular radius of the drawn disc (real: 0.27)
 
-LIGHT_SUN = (1.55, 0.86, 0.44)     # direct beam, over 1.0 so lit faces glow
-LIGHT_SKY = (0.42, 0.50, 0.65)     # ambient from the sky: cool
-LIGHT_BOUNCE = (0.26, 0.20, 0.15)  # ambient from the ground: warm, dim
-LIGHT_SUN_WRAP = 0.35              # softens the terminator, as grazing light does
-# The sky around the sun is far brighter than the rest of it. Without this the
-# hemispheric ambient gives every vertical face the same value and unlit
-# objects read as flat cut-outs.
-LIGHT_GLOW = (0.55, 0.30, 0.16)    # horizon glow picked up by faces turned to it
+LIGHT_SUN_WRAP = 0.08              # softens the terminator a touch
+# Global scale on what surfaces reflect of the sky.
+LIGHT_ENV = 1.0
+# Glow strength round the sun, in the sky and on faces turned towards it.
 LIGHT_GLOW_STRENGTH = 1.0
 
-# Sky dome gradient, bottom to top.
-SKY_HORIZON = (1.00, 0.60, 0.33)
-SKY_MID = (0.62, 0.45, 0.55)
-SKY_ZENITH = (0.10, 0.16, 0.36)
-SKY_GLOW_BAND = 0.22           # fraction of the dome the horizon glow occupies
+# Cloud layer: coverage threshold, edge softness, scale, brightness.
+CLOUD_SHAPE = (0.56, 0.26, 0.055, 1.15)
+CLOUD_DRIFT = (0.0016, 0.0007)  # texture units per second
 
-HAZE_COLOR = (0.94, 0.63, 0.42)
-HAZE_DENSITY = 0.92
-HAZE_START = 140.0
+HAZE_DENSITY = 0.85
+HAZE_START = 160.0
 # Far enough out that the range keeps most of its own colour. At 3200 the
 # hills came out the same value as the sky behind them and simply vanished.
-HAZE_END = 4800.0
+HAZE_END = 5200.0
+
+_LIGHTING = {
+    "day": dict(
+        # High enough that the light is white, low enough that everything
+        # still throws a shadow with some length to it.
+        SUN_ELEVATION=38.0,
+        LIGHT_SUN=(3.30, 3.12, 2.88),      # irradiance of the beam
+        LIGHT_SKY=(0.46, 0.60, 0.86),      # sky irradiance on an upward face
+        LIGHT_BOUNCE=(0.16, 0.16, 0.12),   # off the ground, on a downward one
+        LIGHT_GLOW=(1.10, 0.95, 0.75),     # forward scatter round the sun
+        SKY_ZENITH=(0.10, 0.24, 0.62),
+        SKY_HORIZON=(0.62, 0.76, 0.95),
+        SKY_GROUND=(0.10, 0.11, 0.09),     # the world below the horizon
+    ),
+    "sunset": dict(
+        # 8.5 degrees was too low to drive under: a 10 m grandstand throws a
+        # 67 m shadow at that angle, which covers the whole main straight.
+        SUN_ELEVATION=22.0,
+        LIGHT_SUN=(3.40, 1.75, 0.80),
+        LIGHT_SKY=(0.30, 0.36, 0.55),
+        LIGHT_BOUNCE=(0.20, 0.13, 0.08),
+        LIGHT_GLOW=(2.20, 0.95, 0.40),
+        SKY_ZENITH=(0.05, 0.08, 0.22),
+        SKY_HORIZON=(1.15, 0.55, 0.30),
+        SKY_GROUND=(0.08, 0.06, 0.05),
+    ),
+}
+globals().update(_LIGHTING[LIGHTING_PRESET])
+
+# --- camera chain (post.py) ----------------------------------------------------
+POST_ENABLED = True
+# Panda's threading model: "Cull/Draw" puts culling and drawing on threads of
+# their own, so they overlap the next frame's Python instead of following it
+# (a grand prix went 23 -> 17 ms a frame on the dev laptop). "" for the old
+# single-threaded renderer.
+RENDER_THREADING = "Cull/Draw"
+# Render scale: the 3D scene is drawn at full resolution up to this many
+# pixels, and above it at the size that keeps it to this many, stretched to
+# the window by the post pass (with RENDER_SHARPEN to restore edges); the HUD
+# is always drawn at the window's own resolution. The GPU, not Python, is
+# what a bigger window costs: on the dev laptop's Iris Xe a race ran 98 fps
+# at 1280x720 and 51 at 1920x1080. RENDER_SCALE multiplies the result (1.0:
+# no further scaling); RENDER_MAX_PIXELS 0 turns the cap off.
+RENDER_MAX_PIXELS = 1600 * 900           # off: full resolution at any size (sharp)
+RENDER_SCALE = 1.0
+RENDER_SHARPEN = 0.35
+# Samples on the HDR buffer; 0 for none. 2, not 4: with the pipelined
+# renderer (RENDER_THREADING) the GPU became the slowest stage, and 4x cost
+# ~3.2 ms a frame at 1600x900 on the Iris Xe against ~0.6 ms for 2x.
+POST_MSAA = 2
+POST_BITS = 11                 # 16: RGBA16F, 11: R11G11B10F, 8: RGBA8
+POST_BLOOM = 0.10              # how much of the over-bright light bleeds
+POST_BLOOM_THRESHOLD = 1.6     # linear level the glow starts from
+POST_BLOOM_KNEE = 0.8
+POST_GRAIN = 0.010
+POST_SPEED_BLUR = 0.7          # radial smear at full speed
+POST_SPEED_FROM = 0.45         # fraction of MAX_SPEED where it starts
+POST_GRADE = dict(
+    exposure=0.82,
+    contrast=1.05,
+    saturation=1.06,
+    vignette=0.22,
+    # Split tone: shadows a hair cool, highlights a hair warm.
+    shadow_tint=(0.97, 1.0, 1.04),
+    high_tint=(1.03, 1.0, 0.96),
+)
 
 # One shadow map, focused on a box around the car. Stretched over a whole
 # circuit it would be ~3 m per texel; over 140 m it is 7 cm.
@@ -1178,7 +1275,29 @@ BAKE_BACKFACE = True
 BAKE_REPLACES_LIVE = True
 BAKE_TOP = 30.0                # tallest thing that casts, for fitting the film
 
-SHADOW_RESOLUTION = (2048, 2048)
+SHADOW_RESOLUTION = (1024, 1024)   # legacy follow map (unused, see below)
+# The car's shadow has a map of its own, drawn every frame by a camera that
+# rides with the car and sees nothing else (lighting.CarShadow). Because the
+# camera moves *with* the car rather than across a grid, the car rasterises
+# into it identically from one frame to the next: nothing for its edges to
+# crawl over, and it is placed from the same interpolated pose the car is
+# drawn at, so it cannot trail the car either. The static world's shadows all
+# come from the baked map.
+CAR_SHADOW_RES = 1024         # 9 mm texels over the 9 m film; 2048 cost ~1.8 ms of GPU a frame
+CAR_SHADOW_FILM = 9.0          # metres across: the car at any heading, plus its shadow
+CAR_SHADOW_DEPTH = 12.0        # metres either side of the car along the beam
+CAR_SHADOW_BIAS_M = 0.012      # depth slack, metres
+CAR_SHADOW_SOFT_M = 0.035      # penumbra width, metres
+CAR_SHADOW_NORMAL_M = 0.012    # lookup pushed out along the normal, metres
+# The other cars' shadows (lighting.FieldShadow): one wider map round the car
+# on camera, pushed ahead of it along the view, faded out at its edge.
+FIELD_SHADOW_RES = 2048
+FIELD_SHADOW_FILM = 90.0       # metres across (4.4 cm texels)
+FIELD_SHADOW_DEPTH = 40.0      # metres either side along the beam
+FIELD_SHADOW_AHEAD = 22.0      # film centre this far ahead of the car, metres
+FIELD_SHADOW_BIAS_M = 0.05
+FIELD_SHADOW_SOFT_M = 0.09
+FIELD_SHADOW_NORMAL_M = 0.05
 SHADOW_AREA = 140.0            # metres across the shadow film
 SHADOW_DEPTH = 300.0           # how far along the beam the film reaches
 SHADOW_HEIGHT = 60.0           # where the light node sits above the car
@@ -1197,7 +1316,7 @@ SHADOW_FADE_END = 0.48
 
 SHADOW_BIAS = 0.0004
 SHADOW_BLUR = 0.0018
-SHADOW_SAMPLES = 3
+SHADOW_SAMPLES = 3              # PCF taps per axis near the car (9; 16 cost ~1 ms more)
 
 CAM_SHAKE = 0.055              # metres of jitter at MAX_SPEED
 CAM_SHAKE_OFFTRACK = 3.2       # multiplier on grass/kerb
@@ -1256,7 +1375,7 @@ FENCE_SETBACK = 1.1            # metres behind the rail; a fence is not a barrie
 # Tight enough that there is no sky through the near band -- that is the
 # whole job. A treeline you can see the horizon through is a scattering of
 # trees, not a treeline, and it leaves the circuit as open as bare grass did.
-FOREST_BANDS = ((2.0, 28.0, 8.5), (28.0, 118.0, 24.0))
+FOREST_BANDS = ((2.0, 28.0, 6.5), (28.0, 118.0, 24.0))
 # Big. A 12 m tree scaled to 1.0-2.0 stands 12-24 m, and fewer large trees
 # close a horizon than many small ones -- at a tenth of the triangles.
 FOREST_SCALE = (0.95, 2.05)    # random size multiplier per tree
@@ -1275,6 +1394,8 @@ FOREST_SCALE = (0.95, 2.05)    # random size multiplier per tree
 # 130 m is *worse than not culling at all*, which is the same wall an earlier
 # attempt at cell-batching the roadside hit. Re-measure before changing this.
 FOREST_CELL = 400.0
+#: Painted card trees (foliage.py) instead of the faceted Blender models.
+FOREST_CARDS = True
 FOREST_CLEAR = 1.8             # metres a tree keeps from the barrier line
 FOREST_PROP_CLEAR = 6.0        # ...and from anything already built there
 # The grandstand is swept along the wall in scenery.py rather than placed as
@@ -1449,7 +1570,9 @@ START_HOLD_MIN = 1.2
 START_HOLD_MAX = 2.6
 START_LIGHTS_OUT = 0.25
 START_GANTRY_RISE = 0.42
-TOTAL_LAPS = 3
+# Laps in a session: the grand prix distance, and qualifying's timed laps
+# (after the out lap, which is not timed).
+TOTAL_LAPS = 5
 # --- surrounding landform ------------------------------------------------
 # A circuit on an endless flat plane has no sense of place. These ring the
 # track far enough out that they cannot intrude on it whatever its shape.
@@ -1469,4 +1592,16 @@ MINIMAP_POINTS = 180           # centreline samples drawn in the HUD minimap
 
 WINDOW_SIZE = (1280, 720)
 FULLSCREEN = False
+
+# --- recording (recorder.py) -----------------------------------------------------
+# F9 starts and stops a screen recording of the game window: ffmpeg's desktop
+# capture into the GPU's H.264 encoder, so the game itself does no work for it.
+# The REC marker (top right) is part of the picture; turn it off for a clean
+# video if you will remember that you are recording.
+REC_KEY = "f9"
+REC_FPS = 60
+REC_BITRATE_MBPS = 30.0        # 1080p60 of this game: ~220 MB a minute
+REC_INDICATOR = True
+REC_DIR = None                 # default: Videos\FORMULA-AI
+REC_FFMPEG = ""                # default: ffmpeg on PATH, else Program Files/ffmpeg
 PHYSICS_HZ = 120

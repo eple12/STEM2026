@@ -78,6 +78,10 @@ class Controls:
     # already analog and should not be filtered a second time -- doing so adds
     # half a second of lag and makes a controller chase its own tail.
     analog_steer: bool = False
+    #: Back up: brake from a standstill is held to reverse. Without it the
+    #: car parked by the low-speed cutoff below never gets going -- a plain
+    #: brake held at rest must stay at rest (the grid, a stop).
+    reverse: bool = False
 
 
 @dataclass
@@ -121,6 +125,11 @@ class Vehicle:
     traction_control: bool = config.TRACTION_CONTROL
     abs_enabled: bool = config.ABS_ENABLED
     steer_assist: bool = config.STEER_ASSIST
+    #: Per-car multipliers for a field of different cars: engine power (a
+    #: team's car), and aerodynamic drag (set each step by the race for a car
+    #: in another's slipstream). 1.0 is the car every other tool assumes.
+    power_scale: float = 1.0
+    drag_scale: float = 1.0
 
     # State as it was before the most recent step, so the renderer can
     # interpolate. A fixed-step loop runs 3 or 4 times per frame depending on
@@ -156,11 +165,12 @@ class Vehicle:
     # -- convenience ---------------------------------------------------
     @property
     def speed(self) -> float:
-        return float(np.linalg.norm(self.vel))
+        return math.hypot(float(self.vel[0]), float(self.vel[1]))
 
     @property
     def forward_speed(self) -> float:
-        return float(np.dot(self.vel, _fwd(self.yaw)))
+        return (float(self.vel[0]) * math.sin(self.yaw)
+                + float(self.vel[1]) * math.cos(self.yaw))
 
     @property
     def slip_angle(self) -> float:
@@ -168,7 +178,8 @@ class Vehicle:
         v = self.speed
         if v < 1.0:
             return 0.0
-        lat = float(np.dot(self.vel, _right(self.yaw)))
+        lat = (float(self.vel[0]) * math.cos(self.yaw)
+               - float(self.vel[1]) * math.sin(self.yaw))
         return math.atan2(lat, abs(self.forward_speed) + 1e-6)
 
     @property
@@ -368,19 +379,26 @@ class Vehicle:
 
     # -- integration -------------------------------------------------
     def step(self, ctl: Controls, dt: float, surface) -> None:
-        self.prev_pos = self.pos.copy()
+        # Not a copy: nothing modifies ``pos`` in place (every update below,
+        # and in contact.py, assigns a new array), so the old one can be kept.
+        self.prev_pos = self.pos
         self.prev_yaw = self.yaw
         if self.frozen:
-            self.vel *= 0.0
+            self.vel = np.zeros(2)
             self.yaw_rate = 0.0
             self._update_steering(ctl.steer, dt, 0.0, analog=ctl.analog_steer)
             return
 
         cfg = config
-        fwd, right = _fwd(self.yaw), _right(self.yaw)
-        v_long = float(np.dot(self.vel, fwd))
-        v_lat = float(np.dot(self.vel, right))
-        speed = self.speed
+        # Plain floats throughout: this runs for twenty cars at every physics
+        # step, and two-element numpy arrays cost more in call overhead than
+        # the arithmetic they hold. fwd = (sy, cy), right = (cy, -sy);
+        # (wx, wz) is the world velocity.
+        sy, cy = math.sin(self.yaw), math.cos(self.yaw)
+        wx, wz = float(self.vel[0]), float(self.vel[1])
+        v_long = wx * sy + wz * cy
+        v_lat = wx * cy - wz * sy
+        speed = math.hypot(wx, wz)
 
         # -- surface -------------------------------------------------
         # Yaw goes in so the surface is sampled under the wheels rather than
@@ -393,7 +411,7 @@ class Vehicle:
         # -- aero ----------------------------------------------------
         v2 = v_long * v_long
         downforce = cfg.DOWNFORCE_COEFF * v2
-        drag = cfg.DRAG_COEFF * v_long * abs(v_long)
+        drag = cfg.DRAG_COEFF * self.drag_scale * v_long * abs(v_long)
 
         # -- axle loads (static + longitudinal transfer + downforce) --
         W = cfg.CAR_MASS * cfg.GRAVITY
@@ -452,7 +470,8 @@ class Vehicle:
         if ctl.throttle > 0.0:
             f_engine = cfg.ENGINE_FORCE_MAX
             if v_long > 1.0:
-                f_engine = min(f_engine, cfg.ENGINE_POWER / v_long)
+                f_engine = min(f_engine,
+                               cfg.ENGINE_POWER * self.power_scale / v_long)
 
             # Traction limit at the driven (rear) axle; grass eats grip too.
             traction = mu * load_rear
@@ -546,8 +565,8 @@ class Vehicle:
         # -- the car would corner at any g you asked for. Accelerating in world
         # coordinates keeps the turn rate honest: the path only bends as hard
         # as the lateral force actually bends it.
-        fwd0, right0 = _fwd(self.yaw), _right(self.yaw)
-        self.vel = self.vel + (fwd0 * a_long + right0 * a_lat) * dt
+        wx += (sy * a_long + cy * a_lat) * dt
+        wz += (cy * a_long - sy * a_lat) * dt
         # Banking, and this one term is the whole of it. On a cambered road
         # gravity has a component along the surface, pointing down the slope,
         # and on the outside of a banked corner "down the slope" is towards
@@ -563,15 +582,19 @@ class Vehicle:
         bank, nrm, surf_y = surface.camber(self.pos)
         self.surface_y = surf_y
         self.surface_bank = bank
-        self.surface_roll = bank * float(np.dot(nrm, right0))
+        nrx, nrz = float(nrm[0]), float(nrm[1])
+        self.surface_roll = bank * (nrx * cy - nrz * sy)
         if bank:
-            self.vel = self.vel + nrm * (cfg.GRAVITY * math.sin(bank) * dt)
+            g = cfg.GRAVITY * math.sin(bank) * dt
+            wx += nrx * g
+            wz += nrz * g
 
         if kinematic:
             # ...except at a crawl, where we steer the velocity directly.
-            v_long = float(np.dot(self.vel, fwd0))
-            v_lat = float(np.dot(self.vel, right0)) * math.exp(-12.0 * dt)
-            self.vel = fwd0 * v_long + right0 * v_lat
+            v_long = wx * sy + wz * cy
+            v_lat = (wx * cy - wz * sy) * math.exp(-12.0 * dt)
+            wx = sy * v_long + cy * v_lat
+            wz = cy * v_long - sy * v_lat
 
         # -- yaw ------------------------------------------------------
         if not kinematic:
@@ -583,11 +606,14 @@ class Vehicle:
             self.esc_cut = self._stability_control(v_long, dt, mu)
         self.yaw += self.yaw_rate * dt
 
-        if self.speed < cfg.LOW_SPEED_CUTOFF and ctl.throttle <= 0.0:
-            self.vel *= 0.0
+        if (math.hypot(wx, wz) < cfg.LOW_SPEED_CUTOFF and ctl.throttle <= 0.0
+                and not (ctl.reverse and ctl.brake > 0.0)):
+            wx = wz = 0.0
             self.yaw_rate = 0.0
 
-        self.pos = self.pos + self.vel * dt
+        self.vel = np.array((wx, wz))
+        self.pos = np.array((float(self.pos[0]) + wx * dt,
+                             float(self.pos[1]) + wz * dt))
 
         # -- wall ------------------------------------------------------
         # An impulse at the contact point, not at the centre of mass. A corner

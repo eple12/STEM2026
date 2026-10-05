@@ -571,29 +571,76 @@ class Track:
         the edge of the window the hint was stale (a reset, a teleport), so
         fall back to a full scan.
         """
-        n = self.count
         px, pz = float(pos_xz[0]), float(pos_xz[1])
-        # Plain Python over a list: twenty-one points is far below the size
+        # Plain Python over a list: a handful of points is far below the size
         # where numpy's per-call overhead pays for itself, and this runs a
-        # dozen times per car per physics step.
+        # dozen times per car per physics step -- twenty cars' worth in a
+        # grand prix.
         cl = getattr(self, "_center_list", None)
-        if cl is None or len(cl) != n:
+        if cl is None:
             cl = self._center_list = self.center.tolist()
-        lo = hint - window
-        best, k = math.inf, 0
-        for j in range(2 * window + 1):
-            cx, cz = cl[(lo + j) % n]
-            dx = cx - px
-            dz = cz - pz
-            d = dx * dx + dz * dz
-            if d < best:
-                best, k = d, j
-        if 0 < k < 2 * window:
-            return (lo + k) % n
+        n = len(cl)
+        # Walk downhill from the hint rather than scanning the whole window:
+        # from the last answer the nearest sample is almost always the same
+        # one or its neighbour, so this is two or three distances instead of
+        # twenty-one. Walking the full window means the hint was stale (a
+        # reset, a teleport): fall back to the full scan.
+        k = hint % n
+        cx, cz = cl[k]
+        best = (cx - px) * (cx - px) + (cz - pz) * (cz - pz)
+        for step in (1, -1):
+            moved = 0
+            while moved < window:
+                j = (k + step) % n
+                cx, cz = cl[j]
+                d = (cx - px) * (cx - px) + (cz - pz) * (cz - pz)
+                if d >= best:
+                    break
+                k, best = j, d
+                moved += 1
+            if moved >= window:
+                break
+            if moved:
+                break
+        else:
+            moved = 0
+        if moved < window:
+            # A walk downhill finds *a* nearest point, and on the road it is
+            # the nearest. Off it -- across the infield of a chicane, out
+            # over a run-off -- the leg the car left can hold a local
+            # minimum the walk stops in while the car is already beside the
+            # next leg: the lap stopped advancing, "wrong way" came up
+            # driving forwards, the walls went to the wrong segment and the
+            # track limits measured nothing. Off the road, look properly,
+            # over the stretch of lap a car can actually have crossed.
+            wm = getattr(self, "_wmax_list", None)
+            if wm is None:
+                wm = self._wmax_list = (np.maximum(self.w_left, self.w_right)
+                                        + 1.0).tolist()
+            if best <= wm[k] * wm[k]:
+                return k
+            return self._nearest_near(px, pz, k)
 
         dx = self.center[:, 0] - px
         dz = self.center[:, 1] - pz
         return int(np.argmin(dx * dx + dz * dz))
+
+    #: How far along the lap either side of the last answer an off-road
+    #: search looks: more than any cut, far less than half a lap, so a
+    #: parallel straight a kilometre on is never taken for the nearest.
+    OFFROAD_SEARCH_M = 300.0
+
+    def _nearest_near(self, px: float, pz: float, k: int) -> int:
+        n = len(self.center)
+        span = getattr(self, "_offroad_span", None)
+        if span is None:
+            step = max(float(np.median(self.seg_len)), 0.5)
+            span = self._offroad_span = min(n // 2 - 1,
+                                            int(self.OFFROAD_SEARCH_M / step))
+        idx = np.arange(k - span, k + span + 1) % n
+        c = self.center[idx]
+        d = (c[:, 0] - px) ** 2 + (c[:, 1] - pz) ** 2
+        return int(idx[int(np.argmin(d))])
 
     def barrier_lines(self) -> tuple[np.ndarray, np.ndarray]:
         """(right, left) barrier polylines, as arrays of (start, end) points.
@@ -845,6 +892,16 @@ class Track:
         # plane rather than stopping at a cliff.
         return (low - edge) * t * fade
 
+    @property
+    def is_flat(self) -> bool:
+        """No camber anywhere: every surface height is zero (the f1tenth
+        circuits as they come). Lets per-frame callers skip the lookups."""
+        flat = getattr(self, "_is_flat", None)
+        if flat is None:
+            flat = self._is_flat = (not config.BANKING_ENABLED
+                                    or not np.any(np.abs(self.bank()) > 1e-9))
+        return flat
+
     def surface_pose(self, pts):
         """(height, camber, track normal) at arbitrary world points.
 
@@ -855,6 +912,12 @@ class Track:
         as smooth as the road is.
         """
         p = np.atleast_2d(np.asarray(pts, dtype=float))
+        if self.is_flat:
+            # Height and camber zero everywhere (and the callers do not use
+            # the normal): skip the nearest-sample search -- this runs for
+            # the car and the camera every frame.
+            z = np.zeros(len(p))
+            return z, z.copy(), None
         n = self.count
         i = self.nearest_indices(p)
         if not config.BANKING_ENABLED:

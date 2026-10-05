@@ -1,10 +1,12 @@
 @echo off
-REM FORMULA-AI launcher. Double-click to open the start menu and pick a circuit.
+REM FORMULA-AI launcher (needs the environment FORMULA-AI.bat in the repo root sets up).
+REM Double-click to open the start menu and pick a circuit.
 REM To skip the menu:  run.bat --track Spa --laps 5
 setlocal
 cd /d "%~dp0"
 
-set "PY=..\.venv312\Scripts\python.exe"
+set "PY=.venv\Scripts\python.exe"
+if not exist "%PY%" set "PY=..\.venv312\Scripts\python.exe"
 if not exist "%PY%" set "PY=python"
 
 "%PY%" run.py %*

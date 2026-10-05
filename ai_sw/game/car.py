@@ -8,6 +8,8 @@ Four sources are supported, picked by the model *name* alone (config.PLAYER_MODE
   under ``assets/models/f1``.
 * ``rb_red`` / ``rb_white`` -- the supplied fp04rb asset, baked the same way by
   ``tools/build_f1_asset.py``.
+* ``rc_*`` / ``rl_*`` -- ``assets/for+race.blend`` (full / decimated), baked by
+  ``blender/export_race_car.py`` and ``tools/build_blender_race.py``.
 * ``f1red`` / ``f1white`` -- built from primitives at runtime by ``f1car.py``.
 * anything else -- a .glb from the Kenney Racing Kit, CC0
   (``assets/models/kenney``, see its LICENSE.txt), through ``panda3d-gltf``.
@@ -163,8 +165,9 @@ class Car(Entity):
         self.wheels = self._rig_wheels()
         self._radius = self._wheel_radius()
 
-        # No painted blob under the car any more: the sun casts a real one
-        # (see lighting.py), and two shadows for one car is worse than either.
+        # Not a shadow -- the sun casts the real one (lighting.py) -- but the
+        # occlusion under the floor that no shadow map draws.
+        self.contact = self._add_contact_shadow()
         self.sync()
 
     # -- setup ---------------------------------------------------------
@@ -230,6 +233,121 @@ class Car(Entity):
             np.wrt_reparent_to(hub.spinner)
             hubs.append(hub)
         return hubs
+
+    #: Per-model colours the car shader paints with: the secondary panels,
+    #: and the accent line (and the helmet).
+    LIVERY = {
+        "bl_red": dict(b=(16, 16, 18), c=(242, 242, 244)),
+        "bl_white": dict(b=(14, 22, 58), c=(214, 24, 34)),
+    }
+
+    def apply_materials(self, model: str = DEFAULT_MODEL, livery=None):
+        """Give each part of the car the surface it is made of.
+
+        Under one material the whole car read as moulded plastic. The baked
+        cars name their parts (``body__Livery``, ``FL__Rubber``...), and each
+        gets its own: lacquered paint with a clear coat over it, carbon in a
+        satin weave, matt rubber, dark machined rims. The car shader then
+        paints the livery on the paint per pixel (see shaders.py, CAR).
+
+        A model without named parts falls back to telling them apart by
+        colour. Call after the lighting has been applied: these are per-part
+        inputs, and they override the car-wide one from there.
+        """
+        from panda3d.core import GeomVertexReader
+        from panda3d.core import Vec3 as PVec3
+
+        from .shaders import material
+
+        # the baked cars share their colourway by suffix: rc_white, rl_white...
+        liv = self.LIVERY.get(model) or self.LIVERY.get(
+            "bl_" + model.rpartition("_")[2], self.LIVERY["bl_red"])
+        if livery is not None:
+            # A team's colours, (r, g, b) 0..1: the paint itself as well.
+            a, b, c = livery
+            self.set_shader_input("livery_a", PVec3(*a))
+            self.set_shader_input("livery_b", PVec3(*b))
+            self.set_shader_input("livery_c", PVec3(*c))
+        else:
+            self.set_shader_input("livery_a", PVec3(-1.0, -1.0, -1.0))
+            self.set_shader_input("livery_b", PVec3(*(v / 255.0 for v in liv["b"])))
+            self.set_shader_input("livery_c", PVec3(*(v / 255.0 for v in liv["c"])))
+        named = {"Livery": (1.0, material(0.30, 1.0, 1.0)),
+                 "Carbon": (2.0, material(0.36, 1.3, 0.45)),
+                 "Rubber": (3.0, material(0.90, 0.6, 0.0)),
+                 "Metal": (4.0, material(0.24, 14.0, 0.0)),
+                 "Interior": (0.0, material(0.70, 0.8, 0.0))}
+
+        for w in self.wheels:
+            for gn in w.find_all_matches("**/+GeomNode"):
+                gn.set_python_tag("on_wheel", True)
+        for gn in self.find_all_matches("**/+GeomNode"):
+            node = gn.node()
+            key = next((k for k in named if k in gn.get_name()), None)
+            if key is not None:
+                part, mat = named[key]
+                gn.set_shader_input("part", part)
+                gn.set_shader_input("material", mat)
+                continue
+            acc = [0.0, 0.0, 0.0]
+            n = 0
+            for i in range(node.get_num_geoms()):
+                vdata = node.get_geom(i).get_vertex_data()
+                if not vdata.has_column("color"):
+                    continue
+                rd = GeomVertexReader(vdata, "color")
+                rows = vdata.get_num_rows()
+                for r in range(0, rows, max(1, rows // 64)):
+                    rd.set_row(r)
+                    c = rd.get_data4()
+                    acc[0] += c[0]
+                    acc[1] += c[1]
+                    acc[2] += c[2]
+                    n += 1
+            if n == 0:
+                continue
+            r, g, b = (v / n for v in acc)
+            hi_, lo_ = max(r, g, b), min(r, g, b)
+            sat = (hi_ - lo_) / max(hi_, 1e-4)
+            lum = 0.2126 * r + 0.7152 * g + 0.0722 * b
+            on_wheel = gn.has_python_tag("on_wheel")
+            if (sat > 0.35 and hi_ > 0.25) or lum > 0.72:
+                mat = material(0.34, 1.0, 1.0)          # lacquered paint
+            elif lum < 0.16 and on_wheel:
+                mat = material(0.88, 0.6, 0.0)          # tyre rubber
+            elif lum < 0.16:
+                mat = material(0.30, 1.1, 0.55)         # carbon, satin coat
+            else:
+                mat = material(0.28, 3.0, 0.0)          # machined metal
+            gn.set_shader_input("material", mat)
+
+    def _add_contact_shadow(self):
+        """Ambient occlusion under the car: the soft darkening where the
+        floor is a few centimetres off the road and no sky reaches. The sun's
+        shadow does not do this -- in the car's own shadow, or with the sun
+        overhead, the car otherwise floats."""
+        import numpy as np
+        from panda3d.core import TransparencyAttrib
+
+        from .textures import panda_texture
+
+        h, w = 128, 64
+        y = (np.arange(h) + 0.5) / h * 2 - 1
+        x = (np.arange(w) + 0.5) / w * 2 - 1
+        X, Y = np.meshgrid(x, y)
+        d = (np.abs(X) ** 4 + np.abs(Y) ** 4) ** 0.25
+        a = np.clip(1.0 - d, 0.0, 1.0) ** 1.6
+        img = np.zeros((h, w, 4))
+        img[..., 3] = a * 255
+        e = Entity(parent=self, model="quad", name="contact_shadow",
+                   rotation_x=90, scale=(2.35, 4.6), y=config.Y_SHADOW,
+                   color=(0, 0, 0, 0.62), unlit=True)
+        e.set_texture(panda_texture(img, "contact_shadow", repeat=False), 1)
+        e.set_transparency(TransparencyAttrib.M_alpha)
+        e.set_depth_write(False)
+        e.set_bin("transparent", 0)
+        e.no_light = True
+        return e
 
     def _wheel_radius(self) -> float:
         if not self.wheels:

@@ -4,10 +4,11 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from ursina import Entity, Mesh, color, scene
+from ursina import Entity, Mesh, Vec4, color, scene
 
 from . import config, terrain, textures, trackdata
 from . import palette as pal
+from .shaders import ground_shader, material, road_shader
 from .trackdata import Track, _smooth_ring
 
 ASPHALT_UV_LEN = 12.0     # metres per texture repeat, lengthwise
@@ -344,9 +345,25 @@ class TrackScene:
         self.entities: list[Entity] = []
         self._build()
 
-    def _add(self, e: Entity):
+    def _add(self, e: Entity, shader=None, **inputs):
+        """Keep *e*, and say which world shader it wants and with what.
+
+        The lighting assigns both (``Sunset.apply`` reads ``world_shader`` and
+        ``world_inputs``): assigning a shader in Ursina writes its defaults
+        over any input already on the entity, so the inputs have to go on
+        after it, not here."""
         self.entities.append(e)
+        if shader is not None:
+            e.world_shader = shader
+        e.world_inputs = inputs
         return e
+
+    def _ground_inputs(self):
+        """Mown stripes run parallel to the main straight, the way a
+        circuit's groundsmen cut them for the cameras on the grid."""
+        n = self.track.normal[0]
+        return dict(detail_map=textures.asphalt_detail(),
+                    mow=Vec4(float(n[0]), float(n[1]), 7.0, 0.11))
 
     def _build(self):
         t = self.track
@@ -361,15 +378,20 @@ class TrackScene:
         w = h = 2.0 * (r_inner + config.MOUNTAIN_DEPTH * config.MOUNTAIN_RAMP)
         grass = self._add(Entity(
             parent=scene, model="plane", position=(cx, config.Y_GRASS, cz),
-            scale=(w, 1, h), texture=textures.grass(),
+            scale=(w, 1, h),
+            texture=textures.smooth_filtering(textures.grass()),
             texture_scale=(w / GRASS_TILE, h / GRASS_TILE),
-        ))
+        ), ground_shader, material=material(0.92, 0.5),
+            **self._ground_inputs())
 
         # --- run-off apron ------------------------------------------------
         # Drawn before the asphalt so it is the surface the track sits on,
         # and before the kerbs so a kerb still reads on top of paved run-off.
         self._add(Entity(parent=scene, model=_runoff_mesh(t),
-                         texture=textures.ground(), double_sided=True))
+                         texture=textures.smooth_filtering(textures.ground()),
+                         double_sided=True),
+                  ground_shader, material=material(0.90, 0.6),
+                  **self._ground_inputs())
 
         # --- asphalt (flat colour + tiny vertex jitter, no repeating texture) --
         base = (pal.ASPHALT.r, pal.ASPHALT.g, pal.ASPHALT.b)
@@ -381,10 +403,16 @@ class TrackScene:
         yR = np.concatenate([t.surface_y(np.arange(t.count), t.w_right)])
         yL = np.concatenate([yL, yL[:1]])
         yR = np.concatenate([yR, yR[:1]])
+        # The road shader reads the lap position off U (metres along the lap)
+        # and the position across the road off V, and lays the lap map --
+        # rubber, braking marks, dust, patches -- over world-space grain.
         asphalt = self._add(Entity(
             parent=scene,
-            model=_tint(_strip_mesh(L, R, s, yL, yR, 1.0, 1.0), base, 0.06, 11),
-            double_sided=True))
+            model=_tint(_strip_mesh(L, R, s, yL, yR, 1.0, 1.0), base, 0.03, 11),
+            double_sided=True),
+            road_shader, material=material(0.78, 1.0),
+            lap_map=textures.lap_map(t), detail_map=textures.asphalt_detail(),
+            lap_length=float(t.length))
 
         # --- white edge lines -----------------------------------------
         # Widened from 0.30 m to 0.50 m: below roughly a pixel of screen width
@@ -406,23 +434,29 @@ class TrackScene:
             yo = t.surface_y(ring[:-1], lo) + config.Y_LINE
             yi = np.concatenate([yi, yi[:1]])
             yo = np.concatenate([yo, yo[:1]])
+            # Paint, not light: a white line at 0.94 in linear light is a
+            # strip of fluorescent tube. Worn road paint is a dull 0.8.
             e = self._add(Entity(
                 parent=scene,
                 model=_strip_mesh(inner, outer, s, yi, yo, 1.0, 1.0),
-                color=color.rgba(0.94, 0.94, 0.94, 1.0), double_sided=True))
+                color=color.rgba(0.86, 0.86, 0.85, 1.0), double_sided=True),
+                ground_shader, material=material(0.62, 1.0),
+                **self._ground_inputs())
 
         # --- tar seams across the track -------------------------------
         # Regular transverse detail is the strongest optical-flow cue there is:
         # at speed these stream under the car and give the eye a beat to read.
         seams = self._add(Entity(parent=scene, model=self._seams(t),
-                                 double_sided=True))
+                                 double_sided=True),
+                          ground_shader, material=material(0.70, 1.0),
+                          **self._ground_inputs())
 
         # --- kerbs ----------------------------------------------------
         # Every corner run in ONE mesh. A circuit has a dozen or two of them
         # and they all share a texture, so an entity each is a dozen or two
         # draw calls -- and, more expensively here, a dozen or two nodes for
         # Ursina to walk and Panda to cull every single frame.
-        kerb_tex = textures.kerb()
+        kerb_tex = textures.smooth_filtering(textures.kerb())
         verts, uvs, tris = [], [], []
         for side in (+1, -1):
             for inner, outer, seg, idx in self._kerb_iter(side):
@@ -436,7 +470,9 @@ class TrackScene:
                 parent=scene, texture=kerb_tex, double_sided=True,
                 model=Mesh(vertices=verts, triangles=tris, uvs=uvs,
                            normals=[(0.0, 1.0, 0.0)] * len(verts),
-                           mode="triangle")))
+                           mode="triangle")),
+                ground_shader, material=material(0.55, 1.0),
+                **self._ground_inputs())
 
         # No wall strip here any more. It was a grey ribbon standing behind the
         # barrier models, and once the barriers followed the same line
@@ -472,7 +508,10 @@ class TrackScene:
                        # shader whatever it likes, and N.L was 0.10 instead of
                        # the 0.38 the sun's elevation calls for.
                        normals=[(0.0, 1.0, 0.0)] * 4, mode="triangle"),
-            texture=textures.checker(), double_sided=True))
+            texture=textures.smooth_filtering(textures.checker()),
+            double_sided=True),
+            ground_shader, material=material(0.60, 1.0),
+            **self._ground_inputs())
 
     # -- transverse tar seams -----------------------------------------
     def _seams(self, t: Track, spacing: float = 9.0, width: float = 0.30):
@@ -509,6 +548,50 @@ class TrackScene:
 
     def _kerb_iter(self, side):
         return _kerb_segments(self.track, side)
+
+
+def grid_boxes(track: Track, poses, light):
+    """The starting grid painted on the road: for each car's slot -- *poses*
+    is [(x, z, yaw)], exactly where the field put the cars -- a white bar
+    across the slot just ahead of the nose, and a short leg back from each
+    end of it, the bracket every F1 grid box is drawn with. One mesh, lit
+    like the other road paint. Returns the entity (the session owns it)."""
+    bar_w, bar_d, leg = 2.6, 0.22, 1.4
+    verts, tris = [], []
+
+    def quad(p0, p1, p2, p3):
+        k = len(verts)
+        verts.extend((p0, p1, p2, p3))
+        tris.extend((k, k + 1, k + 2, k, k + 2, k + 3))
+
+    for x, z, yaw in poses:
+        fx, fz = math.sin(yaw), math.cos(yaw)
+        rx, rz = fz, -fx
+        cx = x + fx * (config.BODY_TO_FRONT + 0.45)
+        cz = z + fz * (config.BODY_TO_FRONT + 0.45)
+        h = bar_w / 2.0
+
+        def at(a, b):
+            # a metres to the right, b metres forward, from the bar's centre
+            return (cx + rx * a + fx * b, cz + rz * a + fz * b)
+        corners = [at(-h, 0.0), at(h, 0.0), at(h, bar_d), at(-h, bar_d),
+                   at(-h, -leg), at(-h + bar_d, -leg), at(-h + bar_d, 0.0),
+                   at(h - bar_d, -leg), at(h, -leg), at(h - bar_d, 0.0)]
+        hy, _b, _n = track.surface_pose(corners)
+        p = [(c[0], float(y) + config.Y_LINE, c[1]) for c, y in zip(corners, hy)]
+        quad(p[0], p[1], p[2], p[3])          # the bar
+        quad(p[4], p[5], p[6], p[0])          # left leg
+        quad(p[7], p[8], p[1], p[9])          # right leg
+    e = Entity(parent=scene, model=Mesh(vertices=verts, triangles=tris,
+                                        normals=[(0.0, 1.0, 0.0)] * len(verts),
+                                        mode="triangle", static=True),
+               color=color.rgba(0.86, 0.86, 0.85, 1.0), double_sided=True)
+    n = track.normal[0]
+    e.world_shader = ground_shader
+    e.world_inputs = dict(detail_map=textures.asphalt_detail(),
+                          mow=Vec4(float(n[0]), float(n[1]), 7.0, 0.11))
+    light.apply(e, casts=False, material=material(0.62, 1.0))
+    return e
 
 
 def line_markers(track: Track, spacing: float = 6.0):

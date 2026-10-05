@@ -32,8 +32,9 @@ COLS = ("x", "z", "yaw", "vx", "vz", "yaw_rate", "steer_angle", "steer_input",
 C = {name: k for k, name in enumerate(COLS)}
 
 
-def lap_path(circuit: str):
-    return config.GHOST_LAP_DIR / f"{circuit}.npz"
+def lap_path(circuit: str, level: int | None = None):
+    suffix = "" if level is None else f"_L{level}"
+    return config.GHOST_LAP_DIR / f"{circuit}{suffix}.npz"
 
 
 class Recording:
@@ -46,9 +47,10 @@ class Recording:
         self.driver = driver
 
 
-def load(circuit: str, track: Track | None = None) -> Recording | None:
+def load(circuit: str, track: Track | None = None,
+         level: int | None = None) -> Recording | None:
     """The circuit's ghost lap, or None if it has none (or a stale one)."""
-    path = lap_path(circuit)
+    path = lap_path(circuit, level)
     if not path.is_file():
         return None
     try:
@@ -88,7 +90,8 @@ def _frame(v: Vehicle, ctl: Controls, i: int) -> list[float]:
 
 def record(track: Track, laps: int = 5, limit: float | None = None,
            verbose: bool = True, start: dict | None = None,
-           accept=None, starts: list | None = None):
+           accept=None, starts: list | None = None, driver_factory=None,
+           power_scale: float = 1.0):
     """Drive *laps* flying laps and return (best clean Recording or None,
     [(lap time, clean) for every flying lap]).
 
@@ -109,10 +112,16 @@ def record(track: Track, laps: int = 5, limit: float | None = None,
     dt = 1.0 / config.PHYSICS_HZ
     surface = Surface(track)
     v = Vehicle()
+    v.power_scale = power_scale
     pos, yaw = track.start_pose()
     v.place(pos, yaw)
     v.frozen = False
-    driver, _pilot, _line, _pace = make_driver(track, surface)
+    if driver_factory is not None:
+        # A given driver (a difficulty level's pole sitter, say) rather than
+        # the ghost's own.
+        driver = driver_factory(surface)
+    else:
+        driver, _pilot, _line, _pace = make_driver(track, surface)
     name = type(driver).__name__
 
     n = track.count
@@ -202,11 +211,63 @@ def record(track: Track, laps: int = 5, limit: float | None = None,
     return best, laps_seen
 
 
-def save(circuit: str, rec: Recording):
+def save(circuit: str, rec: Recording, level: int | None = None):
     config.GHOST_LAP_DIR.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(lap_path(circuit), frames=rec.frames, hz=rec.hz,
+    np.savez_compressed(lap_path(circuit, level), frames=rec.frames, hz=rec.hz,
                         lap_time=rec.lap_time, splits=rec.splits,
                         sectors=np.asarray(rec.sectors), driver=rec.driver)
+
+
+def level_lap(circuit: str, level: int, track: Track,
+              progress=None) -> Recording | None:
+    """Qualifying's lap to beat at a difficulty level: the pole sitter's.
+
+    The fastest AI driver at that level (``grandprix.quali_table``) drives
+    its solved plan, at its pace and with its engine, for a flying lap, and
+    the lap is kept in ``assets/ghosts/<circuit>_L<level>.npz``. Recorded
+    the first time it is asked for -- a few seconds behind the loading card
+    -- or ahead of time by ``tools/solve_all.py``. None where the circuit
+    has no solved plans.
+    """
+    rec = load(circuit, track, level)
+    if rec is not None:
+        return rec
+    rec = record_level(circuit, level, track, progress=progress)
+    if rec is not None:
+        save(circuit, rec, level)
+    return rec
+
+
+def record_level(circuit: str, level: int, track: Track,
+                 progress=None) -> Recording | None:
+    from . import grandprix
+    from .mintime_driver import MinTimeDriver, path_file
+    if not grandprix.ready(circuit):
+        return None
+    pole = grandprix.quali_table(circuit, level)[0]
+    plan = path_file(circuit, pole.skill.plan)
+    tick = [0]
+
+    def factory(surface):
+        drv = MinTimeDriver(track, surface, plan, pace=pole.skill.pace)
+        if progress is None:
+            return drv
+        # Keep the loading card's bar moving while the lap is driven.
+        inner = drv.controls
+
+        def controls(vehicle):
+            tick[0] += 1
+            if tick[0] % 600 == 0:
+                progress()
+            return inner(vehicle)
+        drv.controls = controls
+        return drv
+
+    best, _laps = record(track, laps=1, verbose=False, driver_factory=factory,
+                         power_scale=pole.power)
+    if best is not None:
+        best.driver = f"{pole.driver.name} (L{level})"
+    return best
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,21 @@ def main():
                          "runs of it drifted 2.2 ms apart, which is larger "
                          "than the effect. Interleaving cancels the drift.")
     ap.add_argument("--ab-block", type=int, default=60)
+    ap.add_argument("--ab-post", action="store_true",
+                    help="alternate the HDR camera chain (post.py) on and off")
+    ap.add_argument("--ab-post-b", action="append", default=[],
+                    help="with --ab-post: KEY=VALUE config overrides for the "
+                         "'off' bin, which then runs the chain with them "
+                         "instead of without it")
+    ap.add_argument("--ab-fx", action="store_true",
+                    help="alternate the sparks/smoke update on and off")
+    ap.add_argument("--ab-hide", default=None,
+                    choices=("foliage", "scenery", "track", "hud", "cars"),
+                    help="alternate one group of the scene shown and hidden")
+    ap.add_argument("--set", action="append", default=[],
+                    help="KEY=VALUE config override for the whole run")
+    ap.add_argument("--ghost", action="store_true",
+                    help="start the AI as well -- what a real race costs")
     ap.add_argument("--ab-bake", action="store_true",
                     help="alternate the baked far-field shadow lookup on and "
                          "off, to price the extra sample")
@@ -98,6 +113,14 @@ def main():
                     help="fraction of the wall carrying grandstands, to price "
                          "them against a near-empty circuit")
     args = ap.parse_args()
+    import ast
+    for kv in args.set:
+        k, v = kv.split("=", 1)
+        setattr(config, k, ast.literal_eval(v))
+    b_over = {}
+    for kv in args.ab_post_b:
+        k, v = kv.split("=", 1)
+        b_over[k] = ast.literal_eval(v)
 
     if args.shadow_res:
         config.SHADOW_RESOLUTION = (args.shadow_res, args.shadow_res)
@@ -159,6 +182,12 @@ def main():
     game.read_controls = lambda: pilot.controls(game.vehicle)
     game.state = 1                      # RACING
     game.vehicle.frozen = False
+    if game.field is not None:
+        # A grand prix with the twenty-car field: start it too, or the other
+        # nineteen sit on the grid for the whole run.
+        game.field.event("go")
+    if args.ghost and game.ghost is not None:
+        game.ghost.start()
 
     if args.no_gc:
         import gc
@@ -173,6 +202,48 @@ def main():
         from ursina import scene as _s
         _s.set_shader_input("bake_ready", 1.0 if on else 0.0)
 
+    def _group():
+        if args.ab_hide == "foliage":
+            return [e for e in game.scenery if getattr(e, "is_foliage", False)]
+        if args.ab_hide == "scenery":
+            return [e for e in game.scenery
+                    if not getattr(e, "is_foliage", False)]
+        if args.ab_hide == "track":
+            return list(game.world.scene.entities)
+        if args.ab_hide == "hud":
+            return [game.hud.root]
+        if args.ab_hide == "cars":
+            return [game.car] + ([game.ghost.car] if game.ghost else [])
+        return []
+
+    def _show(on: bool):
+        for e in _group():
+            if on:
+                e.show()
+            else:
+                e.hide()
+
+    _fx_update = game.fx.update
+
+    def _fx(on: bool):
+        game.fx.update = _fx_update if on else (lambda *a, **k: None)
+
+    def _post(on: bool):
+        from game import post
+        post.disable()
+        if on:
+            post.enable()
+        elif b_over:
+            keep = {k: getattr(config, k) for k in b_over}
+            for k, v in b_over.items():
+                setattr(config, k, v)
+            post.enable()
+            for k, v in keep.items():
+                setattr(config, k, v)
+        else:
+            from ursina import scene as _s
+            _s.set_shader_input("direct_out", 1.0)
+
     def _static_casters(on: bool):
         for e in game.scenery:
             if e is None:
@@ -183,20 +254,26 @@ def main():
                 e.hide(game.light.SHADOW_MASK)
 
     def update():
-        if args.ab_static_casters or args.ab_bake:
+        ab = (args.ab_static_casters or args.ab_bake or args.ab_post
+              or args.ab_hide or args.ab_fx)
+        if ab:
             want = (state["n"] // max(args.ab_block, 1)) % 2 == 0
             if want != state["ab_on"]:
-                (_bake_lookup if args.ab_bake else _static_casters)(want)
+                (_fx if args.ab_fx else _show if args.ab_hide else
+                 _post if args.ab_post else
+                 _bake_lookup if args.ab_bake else _static_casters)(want)
                 state["ab_on"] = want
                 # The frame that flips the state pays for the flip.
                 state["skip"] = 2
+        t_up = time.perf_counter()
         game.update()
+        state.setdefault("up", []).append(time.perf_counter() - t_up)
         now = time.perf_counter()
         if state["last"] is not None:
             state["n"] += 1
             if state["n"] > args.warmup:
                 state["dt"].append(now - state["last"])
-                if args.ab_static_casters or args.ab_bake:
+                if ab:
                     if state["skip"] > 0:
                         state["skip"] -= 1
                     else:
@@ -226,20 +303,32 @@ def main():
             print(f"  worst frame   {fps.min():7.1f} fps   "
                   f"({dt.max():5.2f} ms)")
             print(f"  over 16.7 ms  {100.0 * (dt > 16.7).mean():5.1f} % of frames")
-            if args.ab_static_casters or args.ab_bake:
+            up = np.array(state["up"][-len(dt):]) * 1000.0
+            print(f"  game.update   {up.mean():5.2f} ms mean  (the rest -- Panda's "
+                  f"cull/draw/flip and Ursina -- {dt.mean() - up.mean():5.2f} ms)")
+            if ab:
                 on = np.array(state["ab"][True]) * 1000.0
                 off = np.array(state["ab"][False]) * 1000.0
                 print()
                 print(f"  interleaved, {args.ab_block}-frame blocks:")
-                label_on = ("baked lookup on " if args.ab_bake
+                label_on = ("effects on        " if args.ab_fx else
+                            f"{args.ab_hide} shown " if args.ab_hide else
+                            "camera chain on " if args.ab_post else
+                            "baked lookup on " if args.ab_bake
                             else "roadside casts shadows")
-                label_off = ("baked lookup off" if args.ab_bake
+                label_off = ("effects off       " if args.ab_fx else
+                             f"{args.ab_hide} hidden" if args.ab_hide else
+                             "camera chain off" if args.ab_post else
+                             "baked lookup off" if args.ab_bake
                              else "roadside does not   ")
                 print(f"    {label_on}     {on.mean():5.2f} ms  "
                       f"(median {np.median(on):5.2f}, n={len(on)})")
                 print(f"    {label_off}     {off.mean():5.2f} ms  "
                       f"(median {np.median(off):5.2f}, n={len(off)})")
-                what = ("the far-field lookup costs" if args.ab_bake
+                what = ("the effects cost" if args.ab_fx else
+                        f"{args.ab_hide} costs" if args.ab_hide else
+                        "the camera chain costs   " if args.ab_post else
+                        "the far-field lookup costs" if args.ab_bake
                         else "static casters cost      ")
                 print(f"    {what} {on.mean() - off.mean():5.2f} ms")
             application.quit()

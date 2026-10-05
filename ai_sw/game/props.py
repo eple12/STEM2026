@@ -37,9 +37,17 @@ MODEL_DIR = config.ASSET_DIR / "models"
 # number of draw calls. Anything it does not recognise -- a vertex layout or a
 # primitive it has not been taught -- falls back to the old route.
 
-#: Per template: its geoms, read out as arrays. Keyed by id; templates live
-#: as long as the library, which outlives every batch built from them.
-_GEOMS: dict[int, list | None] = {}
+#: Python tag on a template's node holding its geoms, read out as arrays.
+#:
+#: This used to be a module dict keyed by ``id(tmpl)``. Templates are freed when
+#: a circuit's scenery is done (``PropLibrary.dispose``), and the next circuit's
+#: templates -- different props -- can be handed the same address, so a gantry
+#: or a guardrail came out as whatever stood at that address last time: green
+#: plates along the whole wall, a gantry of floating black boxes. Whether an
+#: address was reused depended on the allocator, hence "sometimes". A tag on the
+#: node cannot outlive, or be confused with, the node it describes.
+_TAG = "stamp_geoms"
+_UNSTAMPABLE = False
 
 
 def _read_template(tmpl):
@@ -47,15 +55,20 @@ def _read_template(tmpl):
     None if any of them is something ``_stamp`` cannot reproduce."""
     from panda3d.core import GeomEnums, GeomTriangles
 
-    key = id(tmpl)
-    if key in _GEOMS:
-        return _GEOMS[key]
+    node = tmpl.node()
+    if node.has_python_tag(_TAG):
+        cached = node.get_python_tag(_TAG)
+        return None if cached is _UNSTAMPABLE else cached
+
+    def give_up():
+        node.set_python_tag(_TAG, _UNSTAMPABLE)
+        return None
+
     out = []
     for gnp in tmpl.find_all_matches("**/+GeomNode"):
         gn = gnp.node()
         if not gnp.get_mat(tmpl).is_identity():
-            _GEOMS[key] = None
-            return None
+            return give_up()
         net = gnp.get_net_state()
         for i in range(gn.get_num_geoms()):
             geom = gn.get_geom(i)
@@ -71,8 +84,7 @@ def _read_template(tmpl):
                                 GeomEnums.C_vector):
                         if (col.get_numeric_type() != GeomEnums.NT_float32
                                 or col.get_num_components() < 3):
-                            _GEOMS[key] = None
-                            return None
+                            return give_up()
                         kind = "point" if cont == GeomEnums.C_point else "dir"
                         cols.append((k, col.get_start(), kind))
             arrays = [np.frombuffer(memoryview(vd.get_array(k)).cast("B"),
@@ -83,8 +95,7 @@ def _read_template(tmpl):
             for k in range(geom.get_num_primitives()):
                 prim = geom.get_primitive(k).decompose()
                 if not isinstance(prim, GeomTriangles):
-                    _GEOMS[key] = None
-                    return None
+                    return give_up()
                 if not prim.is_indexed():
                     prim = GeomTriangles(prim)
                     prim.make_indexed()
@@ -104,7 +115,7 @@ def _read_template(tmpl):
             arrays = [a[used] for a in arrays]
             out.append((fmt, net.compose(gn.get_geom_state(i)), arrays, cols,
                         idx.reshape(-1).astype(np.int64)))
-    _GEOMS[key] = out
+    node.set_python_tag(_TAG, out)
     return out
 
 

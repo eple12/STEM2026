@@ -40,7 +40,7 @@ def main():
     DirectionalLight().look_at(Vec3(0.6, -1.0, 0.3))
 
     ga.SESSION.update(laps=3, mute=True, track=args.circuit)
-    ga._build_race(args.circuit, 3, True)
+    ga._build_race(args.circuit, 3, True, intro=False)
     OUT.mkdir(parents=True, exist_ok=True)
 
     def shot(name):

@@ -1,0 +1,2 @@
+tree_impostors.png is rendered from Poly Haven models (CC0 1.0):
+island_tree_01, island_tree_02, fir_tree_01 -- https://polyhaven.com

@@ -14,7 +14,9 @@ import os
 for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 
-from game.app import main  # noqa: E402
-
 if __name__ == "__main__":
+    # Imported here, not at the top: the grand prix runs its field in a
+    # worker process, and on Windows a worker re-imports this file -- it
+    # must not pull the whole renderer in with it.
+    from game.app import main
     main()

@@ -16,6 +16,7 @@ from ursina import window
 
 from . import config
 from . import palette as pal
+from . import post
 from .lighting import Sunset
 from .scenery import build_scenery
 from .surface import Surface
@@ -92,7 +93,13 @@ class World:
             e.enabled = False
 
     def show(self):
-        window.color = pal.rgb(*[int(v * 255) for v in config.SKY_HORIZON])
+        # Behind the sky dome, so only ever seen for a frame; the horizon's
+        # colour, clamped, since the sky values are linear and run over 1.
+        window.color = pal.rgb(*[min(255, int(255 * v ** (1 / 2.2)))
+                                 for v in config.SKY_HORIZON])
+        # The camera chain is on while a circuit is on screen. Idempotent, so
+        # the first show (straight after building) switches it on as well.
+        post.enable()
         if self.shown:
             return
         self.shown = True
@@ -101,9 +108,7 @@ class World:
         for e, on in self._was:
             e.enabled = on
         self._was = []
-        buf = self._sun_buffer()
-        if buf is not None:
-            buf.set_active(True)
+        self.light.set_active(True)
 
     def hide(self):
         """Off the screen, and out of the frame: nothing here is drawn or
@@ -111,15 +116,14 @@ class World:
         if not self.shown:
             return
         self.shown = False
+        post.disable()
         self._was = [(e, e.enabled) for e in self._entities()]
         for e, _ in self._was:
             e.enabled = False
-        buf = self._sun_buffer()
         # The sun stays set on the scene root -- the menu is all 2D and never
-        # reads it -- but its depth pass is switched off, or it would go on
-        # rendering an empty scene into the shadow map every frame.
-        if buf is not None:
-            buf.set_active(False)
+        # reads it -- but the car's depth pass is switched off, or it would go
+        # on rendering an empty scene into its map every frame.
+        self.light.set_active(False)
 
     def forget(self):
         """Drop the light's references to entities a finished session built."""
@@ -128,6 +132,7 @@ class World:
     def destroy(self):
         """Ursina has no scene-clearing call, so anything created here has to
         be given back by hand -- anything missed stays in the scene graph."""
+        post.disable()
         self.light.destroy()
         if self.mountains is not None:
             destroy_tree(self.mountains)

@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 from ursina import Entity, Mesh, Text, Vec3, camera
 
-from . import config
+from . import config, teams
 from . import palette as pal
 from .trackdata import Track, load_track
 
@@ -69,19 +69,24 @@ def circuit_stats(track: Track, thresh: float = 400.0, min_run: int = 3):
 
 QUALI, GRAND_PRIX = "quali", "gp"
 
-#: (key, title, description lines, detail) per session mode, in menu order.
+#: (key, title, the one line of facts under it) per session, in menu order.
 MODES = (
-    (QUALI, "QUALIFYING",
-     ("Hot laps against the AI's fastest clean lap,",
-      "replayed as a ghost from the line every lap.",
-      "Leave the track and the lap is deleted."),
-     "OUT LAP  ·  UNLIMITED FLYING LAPS"),
-    (GRAND_PRIX, "GRAND PRIX",
-     ("Race the AI from lights out over a set distance.",
-      "First to the flag wins, penalties included.",
-      "Every trip off the track costs time."),
-     "{laps} LAPS  ·  {pen:.0f} S TRACK LIMITS PENALTY"),
+    (QUALI, "QUALIFYING", "OUT LAP  +  {laps} TIMED LAPS"),
+    (GRAND_PRIX, "GRAND PRIX", "{laps} LAPS  ·  20 CARS"),
 )
+
+#: The keys, as the controls panel lists them: (keys, what they do).
+CONTROLS = (
+    ("W / UP", "THROTTLE"), ("S / DOWN", "BRAKE"), ("A D / LEFT RIGHT", "STEER"),
+    ("SPACE", "HANDBRAKE"), ("R", "BACK ON TRACK"),
+    ("C", "CAMERA"), ("X", "LOOK BACK"), ("G / SHIFT+G", "WATCH CARS"),
+    ("TAB", "INTERVAL / LEADER"), ("T", "DRIVER AIDS"),
+    ("H", "HIDE HUD"), ("M", "MUTE"), ("ESC", "PAUSE"),
+)
+
+#: The chosen difficulty box while the session cards have the keys: still
+#: red, but not the live red of the row being changed.
+RED_IDLE = pal.rgb(120, 16, 12)
 
 
 def _base_screen(menu, subtitle: str):
@@ -97,60 +102,131 @@ def _base_screen(menu, subtitle: str):
 
 
 class ModeMenu:
-    """The main menu: qualifying or grand prix. Calls ``on_pick(mode)``."""
+    """The main menu: qualifying or grand prix, the difficulty, and the
+    controls. Calls ``on_pick(mode)``; ``on_level(level)`` on every change
+    of difficulty.
 
-    CARD_W, CARD_H = 0.78, 0.50
+    Two rows take the keys: the session cards (A/D) and the difficulty
+    boxes (A/D once W/S has moved down to them). ENTER goes on from either.
+    """
+
+    CARD_W, CARD_H = 0.78, 0.205
+    CARD_Y = 0.110
+    #: The difficulty panel: top edge and height, and the boxes in it.
+    LV_TOP, LV_H = -0.030, 0.190
+    BOX_H, BOX_GAP = 0.112, 0.012
+    #: The controls panel's top edge, and both panels' width.
+    KEYS_TOP = -0.245
+    PANEL_W = 1.62
 
     def __init__(self, on_pick, on_quit, laps: int = config.TOTAL_LAPS,
-                 initial: str | None = None):
+                 initial: str | None = None, level: int = teams.DEFAULT_LEVEL,
+                 on_level=None):
         self.on_pick = on_pick
         self.on_quit = on_quit
+        self.on_level = on_level or (lambda lv: None)
         self.font = pick_font()
         keys = [m[0] for m in MODES]
         self.sel = keys.index(initial) if initial in keys else 0
+        self.levels = sorted(teams.DIFFICULTY)
+        self.level = level if level in teams.DIFFICULTY else teams.DEFAULT_LEVEL
+        self.row = 0                 # 0: session cards, 1: difficulty
         self.root = Entity(parent=camera.ui)
         _base_screen(self, "racing")
 
         Entity(parent=self.root, model="quad", color=PANEL_HI,
-               scale=(1.60, 0.0035), position=(0, 0.255, 0.2))
+               scale=(1.60, 0.0035), position=(0, 0.275, 0.2))
         Entity(parent=self.root, model="quad", color=RED,
-               scale=(0.30, 0.006), position=(-0.65, 0.255, 0.15))
-        self._txt(spaced("main menu"), size=0.8, col=GREY, pos=(-0.80, 0.212))
+               scale=(0.30, 0.006), position=(-0.65, 0.275, 0.15))
+        self._txt(spaced("main menu"), size=0.8, col=GREY, pos=(-0.80, 0.245))
 
+        H = self.CARD_H
         self.cards = []
-        for k, (_key, title, lines, detail) in enumerate(MODES):
+        for k, (_key, title, detail) in enumerate(MODES):
             cx = -0.40 + k * 0.82
-            c = Entity(parent=self.root, position=(cx, -0.06, 0.1))
+            c = Entity(parent=self.root, position=(cx, self.CARD_Y, 0.1))
             bg = Entity(parent=c, model="quad", color=PANEL,
-                        scale=(self.CARD_W, self.CARD_H), position=(0, 0, 0.08))
+                        scale=(self.CARD_W, H), position=(0, 0, 0.08))
             band = Entity(parent=c, model="quad", color=RED,
                           scale=(self.CARD_W, 0.010),
-                          position=(0, self.CARD_H / 2 - 0.005, 0.06))
+                          position=(0, H / 2 - 0.005, 0.06))
             tag = Entity(parent=c, model=skew_quad(0.075, 0.040), color=PANEL_HI,
-                         position=(-self.CARD_W / 2 + 0.070, 0.180, 0.05))
+                         position=(-self.CARD_W / 2 + 0.070, H / 2 - 0.042, 0.05))
             x0 = -self.CARD_W / 2 + 0.040
             idx = Text(f"{k + 1:02d}", parent=c, font=self.font, scale=0.9,
                        color=GREY, origin=(0, 0),
-                       position=(-self.CARD_W / 2 + 0.070, 0.180, -0.1))
-            name = Text(title, parent=c, font=self.font, scale=2.6, color=WHITE,
-                        origin=(-0.5, 0), position=(x0, 0.095, -0.1))
-            desc = [Text(line, parent=c, font=self.font, scale=0.95, color=GREY,
-                         origin=(-0.5, 0), position=(x0, 0.005 - j * 0.045, -0.1))
-                    for j, line in enumerate(lines)]
+                       position=(-self.CARD_W / 2 + 0.070, H / 2 - 0.042, -0.1))
+            name = Text(title, parent=c, font=self.font, scale=2.4, color=WHITE,
+                        origin=(-0.5, 0), position=(x0, H / 2 - 0.108, -0.1))
             # INK, not PANEL_HI: the selected card's ground *is* PANEL_HI.
             Entity(parent=c, model="quad", color=INK,
                    scale=(self.CARD_W - 0.080, 0.0025),
-                   position=(0, -0.160, 0.05))
-            info = Text(detail.format(laps=laps, pen=config.GP_OFFTRACK_PENALTY),
-                        parent=c, font=self.font, scale=0.72, color=GREY_DIM,
-                        origin=(-0.5, 0), position=(x0, -0.200, -0.1))
+                   position=(0, -H / 2 + 0.050, 0.05))
+            info = Text(detail.format(laps=laps), parent=c, font=self.font,
+                        scale=0.72, color=GREY_DIM, origin=(-0.5, 0),
+                        position=(x0, -H / 2 + 0.026, -0.1))
             self.cards.append(dict(bg=bg, band=band, tag=tag, idx=idx,
-                                   name=name, desc=desc, info=info))
+                                   name=name, info=info))
 
-        self._txt("A / D   or   LEFT / RIGHT      SELECT          ENTER   CONTINUE"
-                  "          ESC   QUIT",
+        self._build_level()
+        self._build_controls()
+        self._txt("A / D  CHOOSE          W / S  SESSION  ·  DIFFICULTY"
+                  "          ENTER  CONTINUE          ESC  QUIT",
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
         self._refresh()
+
+    # -- difficulty --------------------------------------------------------
+    def _build_level(self):
+        """A panel of six boxes, one per level, each carrying its number and
+        name. The chosen one is red, and the ones below it keep a red foot,
+        so the row reads as a gauge filled up to the level."""
+        top, H, W = self.LV_TOP, self.LV_H, self.PANEL_W
+        Entity(parent=self.root, model="quad", color=PANEL,
+               scale=(W, H), position=(0.0, top - H / 2, 0.3))
+        self.lv_cursor = Entity(parent=self.root, model="quad", color=RED,
+                                scale=(0.008, H),
+                                position=(-W / 2 - 0.004, top - H / 2, 0.25))
+        self.lv_head = self._txt(spaced("difficulty"), size=0.72, col=GREY_DIM,
+                                 pos=(-0.79, top - 0.026))
+        n = len(self.levels)
+        inner = W - 0.060
+        bw = (inner - (n - 1) * self.BOX_GAP) / n
+        bh = self.BOX_H
+        cy = top - 0.054 - bh / 2
+        self.lv_boxes = []
+        for k, lv in enumerate(self.levels):
+            x = -inner / 2 + k * (bw + self.BOX_GAP)
+            box = Entity(parent=self.root, model="quad", color=PANEL_HI,
+                         scale=(bw, bh), position=(x + bw / 2, cy, 0.2))
+            foot = Entity(parent=self.root, model="quad", color=RED,
+                          scale=(bw, 0.006),
+                          position=(x + bw / 2, cy - bh / 2 + 0.003, 0.15))
+            num = Text(str(lv), parent=self.root, font=self.font, scale=2.2,
+                       color=GREY, origin=(-0.5, 0),
+                       position=(x + 0.020, cy + 0.020, -0.1))
+            name = Text(teams.DIFFICULTY[lv].name.upper(), parent=self.root,
+                        font=self.font, scale=0.86, color=GREY,
+                        origin=(-0.5, 0), position=(x + 0.022, cy - 0.032, -0.1))
+            self.lv_boxes.append(dict(box=box, foot=foot, num=num, name=name))
+
+    # -- controls ------------------------------------------------------------
+    def _build_controls(self):
+        top = self.KEYS_TOP
+        Entity(parent=self.root, model="quad", color=PANEL,
+               scale=(self.PANEL_W, 0.170), position=(0.0, top - 0.085, 0.3))
+        self._txt(spaced("controls"), size=0.72, col=GREY_DIM,
+                  pos=(-0.79, top - 0.026))
+        per_row = 5
+        for k, (keys, what) in enumerate(CONTROLS):
+            r, c = divmod(k, per_row)
+            x = -0.79 + c * 0.322
+            y = top - 0.066 - r * 0.036
+            w = 0.012 * len(keys) + 0.020
+            Entity(parent=self.root, model="quad", color=PANEL_HI,
+                   scale=(w, 0.028), position=(x + w / 2, y, 0.2))
+            self._txt(keys, size=0.62, col=WHITE, pos=(x + w / 2, y),
+                      origin=(0, 0))
+            self._txt(what, size=0.66, col=GREY, pos=(x + w + 0.014, y))
 
     def _txt(self, s, *, size=1.0, col=WHITE, pos=(0, 0), origin=(-0.5, 0), z=-0.1):
         return Text(s, parent=self.root, font=self.font, scale=size, color=col,
@@ -159,22 +235,42 @@ class ModeMenu:
     def _refresh(self):
         for k, c in enumerate(self.cards):
             on = k == self.sel
+            focus = on and self.row == 0
             c["bg"].color = PANEL_HI if on else PANEL
             c["band"].enabled = on
-            c["tag"].color = RED if on else PANEL_HI
+            c["tag"].color = RED if focus else PANEL_HI
             c["idx"].color = WHITE if on else GREY_DIM
             c["name"].color = WHITE if on else GREY
-            for d in c["desc"]:
-                d.color = GREY if on else GREY_DIM
             c["info"].color = RED if on else GREY_DIM
+        focus = self.row == 1
+        live = RED if focus else RED_IDLE
+        for b, lv in zip(self.lv_boxes, self.levels):
+            on = lv == self.level
+            below = lv < self.level
+            b["box"].color = live if on else PANEL_HI
+            b["foot"].enabled = below
+            b["foot"].color = live
+            b["num"].color = WHITE if on or below else GREY_DIM
+            b["name"].color = WHITE if on else GREY if below else GREY_DIM
+        self.lv_cursor.enabled = focus
+        self.lv_head.color = WHITE if focus else GREY_DIM
 
     def on_key(self, key: str):
         n = len(MODES)
-        if key in ("right arrow", "d", "down arrow", "s"):
-            self.sel = (self.sel + 1) % n
+        if key in ("down arrow", "s", "up arrow", "w"):
+            self.row = 1 - self.row
             self._refresh()
-        elif key in ("left arrow", "a", "up arrow", "w"):
-            self.sel = (self.sel - 1) % n
+        elif key in ("right arrow", "d", "left arrow", "a",
+                     "right arrow hold", "d hold", "left arrow hold", "a hold"):
+            step = 1 if key.startswith(("right", "d")) else -1
+            if self.row == 0:
+                if key.endswith("hold"):
+                    return
+                self.sel = (self.sel + step) % n
+            else:
+                k = self.levels.index(self.level)
+                self.level = self.levels[min(max(k + step, 0), len(self.levels) - 1)]
+                self.on_level(self.level)
             self._refresh()
         elif key in ("enter", "space"):
             self.on_pick(MODES[self.sel][0])
@@ -192,14 +288,25 @@ class StartMenu:
 
     def __init__(self, names: list[str], on_start, on_quit, initial: str | None = None,
                  on_back=None, mode: str | None = None,
-                 laps: int = config.TOTAL_LAPS):
+                 laps: int = config.TOTAL_LAPS, level: int = teams.DEFAULT_LEVEL,
+                 quali: dict | None = None, on_watch=None,
+                 grid="quali", on_grid=None):
         self.names = names
+        #: Grand prix start: "quali" or a slot 1..20 (A / D), kept in the
+        #: session through ``on_grid``.
+        self.grid = grid
+        self.on_grid = on_grid
         self.on_start = on_start
+        #: G: watch this session instead of driving it.
+        self.on_watch = on_watch
         self.on_quit = on_quit
         # ESC goes back to the main menu when there is one to go back to.
         self.on_back = on_back
         self.mode = mode
         self.laps = laps
+        self.level = level
+        #: (circuit, level) -> the player's qualifying lap this session.
+        self.quali = quali or {}
         self.font = pick_font()
         self.sel = names.index(initial) if initial in names else 0
         self.top = 0                      # first visible row
@@ -252,8 +359,10 @@ class StartMenu:
         Entity(parent=self.root, model="quad", color=RED,
                scale=(0.30, 0.006), position=(-0.74, 0.255, 0.15))
         title = dict((m[0], m[1]) for m in MODES).get(self.mode)
+        lvl = teams.DIFFICULTY.get(self.level)
         self._txt(spaced("circuit select")
-                  + ("" if title is None else "   ·   " + spaced(title)),
+                  + ("" if title is None else "   ·   " + spaced(title))
+                  + ("" if lvl is None else "   ·   " + spaced(lvl.name)),
                   size=0.8, col=GREY, pos=(-0.80, 0.212))
         self._count = self._txt("", size=0.8, col=GREY_DIM,
                                 pos=(-0.055, 0.212), origin=(0.5, 0))
@@ -309,8 +418,12 @@ class StartMenu:
         self.p_mode = Text("", parent=p, font=self.font, scale=0.72, color=GREY,
                            origin=(0.5, 0), position=(0.300, 0.305, -0.1))
 
+        # Grand prix: where the player starts (A / D).
+        self.p_grid = Text("", parent=p, font=self.font, scale=0.95, color=WHITE,
+                           origin=(-0.5, 0), position=(-0.300, 0.165, -0.1))
+
         # Where the track outline gets drawn each time the selection moves.
-        self.map_anchor = Entity(parent=p, position=(0, -0.02, -0.05))
+        self.map_anchor = Entity(parent=p, position=(0, -0.055, -0.05))
 
         labels = (spaced("length"), spaced("turns"), spaced("longest straight"))
         self.stat_val = []
@@ -325,8 +438,12 @@ class StartMenu:
     def _build_footer(self):
         Entity(parent=self.root, model="quad", color=PANEL_HI,
                scale=(1.78, 0.0035), position=(0, -0.452, 0.2))
-        self._txt("W / S   or   UP / DOWN      SELECT          ENTER   START"
-                  "          ESC   " + ("BACK" if self.on_back else "QUIT"),
+        watch = ("WATCH POLE LAP" if self.mode == QUALI else "WATCH AI RACE")
+        self._txt("W / S   SELECT          ENTER   START"
+                  + ("          A / D   START POSITION"
+                     if self.mode == GRAND_PRIX else "")
+                  + (f"          G   {watch}" if self.on_watch else "")
+                  + "          ESC   " + ("BACK" if self.on_back else "QUIT"),
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
 
     # -- state ----------------------------------------------------------
@@ -385,16 +502,35 @@ class StartMenu:
         self.p_name.text = label
         # Suppress the subtitle when it only restates the label.
         self.p_full.text = "" if full.upper() == label else full
+        from . import grandprix
+        solved = grandprix.ready(key)
         if self.mode == QUALI:
-            from .replay import lap_time as ghost_lap_time
-            t = ghost_lap_time(key)
-            self.p_mode.text = (f"GHOST LAP   {lap_time(t)}" if t is not None
-                                else "NO GHOST LAP  ·  SOLO RUNS")
-            self.p_mode.color = PURPLE if t is not None else GREY_DIM
-        elif self.mode == GRAND_PRIX:
-            self.p_mode.text = f"{self.laps} LAPS  ·  VS AI"
-            self.p_mode.color = GREY
-        else:
+            from .replay import lap_path, lap_time as ghost_lap_time
+            t = ghost_lap_time(key) if not solved else None
+            if solved:
+                path = lap_path(key, self.level)
+                if path.is_file():
+                    from .replay import load
+                    rec = load(key, None, self.level)
+                    t = rec.lap_time if rec is not None else None
+                self.p_mode.text = (f"POLE  ·  LEVEL {self.level}   {lap_time(t)}"
+                                    if t is not None else
+                                    f"20 DRIVERS  ·  LEVEL {self.level}")
+                self.p_mode.color = PURPLE if t is not None else GREY
+            else:
+                self.p_mode.text = (f"GHOST LAP   {lap_time(t)}" if t is not None
+                                    else "NO GHOST LAP  ·  SOLO RUNS")
+                self.p_mode.color = PURPLE if t is not None else GREY_DIM
+        self.p_grid.text = ""
+        if self.mode == GRAND_PRIX:
+            if solved:
+                self.p_grid.text = "START   " + self._grid_text(key)
+                self.p_mode.text = f"{self.laps} LAPS  ·  20 CARS"
+                self.p_mode.color = GREY
+            else:
+                self.p_mode.text = f"{self.laps} LAPS  ·  VS 1 AI  (FIELD NOT SOLVED)"
+                self.p_mode.color = GREY_DIM
+        elif self.mode != QUALI:
             self.p_mode.text = ""
 
         track = self._track(key)
@@ -413,7 +549,7 @@ class StartMenu:
 
         lo, hi = track.bounds()
         span = float(max(hi[0] - lo[0], hi[1] - lo[1])) or 1.0
-        k = 0.40 / span
+        k = 0.35 / span
         cx, cz = (hi[0] + lo[0]) / 2, (hi[1] + lo[1]) / 2
 
         def to_uv(p):
@@ -429,9 +565,32 @@ class StartMenu:
         # 5.8 km circuit shrinks to about one pixel.
         s, t = track.center[0], track.normal[0]
         half = span * 0.035
-        Entity(parent=self._outline, color=RED,
+        # In front of the outline (smaller z is nearer), not level with it:
+        # at the same depth the two lines were drawn in whatever order the
+        # depth test happened to settle, so the start line went over the
+        # curve on some circuits and under it on others.
+        Entity(parent=self._outline, color=RED, z=-0.02,
                model=Mesh(vertices=[to_uv(s - t * half), to_uv(s + t * half)],
                           mode="line", thickness=9))
+
+    def _grid_text(self, key: str) -> str:
+        """The grand prix start as the panel says it: < P7 > for a chosen
+        slot, or the qualifying lap's time when that is what is selected."""
+        q = self.quali.get((key, self.level))
+        if self.grid == "quali":
+            if q is not None:
+                return f"[ LAST QUALIFYING {lap_time(q)} ]"
+            return f"[ QUALIFYING: NONE  ·  P{config.GP_PLAYER_GRID} ]"
+        return f"[ P{int(self.grid)} ]" + ("   POLE" if int(self.grid) == 1 else "")
+
+    def _step_grid(self, d: int):
+        """A / D: qualifying, then pole to last, round and round."""
+        opts = ["quali"] + list(range(1, 21))
+        i = opts.index(self.grid) if self.grid in opts else 0
+        self.grid = opts[(i + d) % len(opts)]
+        if self.on_grid is not None:
+            self.on_grid(self.grid)
+        self._show(self.names[self.sel])
 
     # -- input ----------------------------------------------------------
     def on_key(self, key: str):
@@ -442,8 +601,15 @@ class StartMenu:
         elif key in ("up arrow", "w", "up arrow hold", "w hold"):
             self.sel = (self.sel - 1) % n
             self._refresh()
+        elif (self.mode == GRAND_PRIX
+              and key in ("d", "right arrow", "a", "left arrow",
+                          "d hold", "right arrow hold", "a hold",
+                          "left arrow hold")):
+            self._step_grid(1 if key.startswith(("d", "right")) else -1)
         elif key in ("enter", "space"):
             self.on_start(self.names[self.sel])
+        elif key == "g" and self.on_watch is not None:
+            self.on_watch(self.names[self.sel])
         elif key == "escape":
             (self.on_back or self.on_quit)()
 

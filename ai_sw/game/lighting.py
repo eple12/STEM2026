@@ -16,44 +16,50 @@ import math
 
 import numpy as np
 from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
-                          CullFaceAttrib, GraphicsPipe, LVecBase3f, Mat4,
-                          OrthographicLens, Point3, PTA_LVecBase3f,
+                          CullFaceAttrib, GraphicsPipe, Mat4,
+                          OrthographicLens, Point3,
                           RenderState, SamplerState, Texture, WindowProperties)
-from ursina import Entity, Vec3, camera, color, scene
+from ursina import Entity, Vec2, Vec3, Vec4, camera, color, scene
 from ursina.lights import DirectionalLight
-from ursina.prefabs.sky import Sky
 
 from . import config
-from .shaders import sunset_shader
+from .shaders import material as make_material
+from .shaders import sky_shader, sunset_shader
 
 
-def _sky_texture(size: int = 256):
-    """A vertical gradient: deep blue overhead down to the horizon glow.
+_CLOUDS = None
 
-    Deliberately uniform round the compass rather than painting a sun disc into
-    it. The dome's UV mapping would have to be established before a disc could
-    be lined up with the actual light direction, and a sun in the wrong part of
-    the sky is worse than no sun at all -- the shadows would point somewhere
-    else and the eye reads that immediately.
+
+def _cloud_texture(size: int = 512):
+    """Two tileable cloud fields in R and G: broad billows and their detail.
+
+    Built once per process -- it is the same sky over every circuit -- and
+    mipmapped, because the layer is foreshortened into the horizon and an
+    unfiltered noise texture there is a band of sparkle.
     """
-    from PIL import Image
-    from ursina import Texture
+    global _CLOUDS
+    if _CLOUDS is not None:
+        return _CLOUDS
+    from panda3d.core import Texture as PTexture
 
-    top = np.array(config.SKY_ZENITH, dtype=float)
-    mid = np.array(config.SKY_MID, dtype=float)
-    low = np.array(config.SKY_HORIZON, dtype=float)
-
-    v = np.linspace(0.0, 1.0, size)[:, None]          # 0 = horizon, 1 = zenith
-    # Two ramps: horizon -> mid is fast (the glow is a narrow band), mid ->
-    # zenith is slow. A single lerp gives a flat, poster-like sky.
-    t1 = np.clip(v / config.SKY_GLOW_BAND, 0.0, 1.0) ** 0.65
-    t2 = np.clip((v - config.SKY_GLOW_BAND) / (1.0 - config.SKY_GLOW_BAND), 0.0, 1.0)
-    band = low + (mid - low) * t1
-    rgb = band + (top - band) * (t2 ** 1.15)
-
-    img = np.repeat(rgb[::-1][:, None, :], 8, axis=1)   # V=0 at the image top
-    return Texture(Image.fromarray(np.clip(img * 255, 0, 255).astype(np.uint8),
-                                   mode="RGB"))
+    from .textures import _noise
+    broad = _noise(size, octaves=(3, 6, 12, 24, 48), seed=41)
+    detail = _noise(size, octaves=(8, 16, 32, 64, 128), seed=42)
+    broad = (broad - broad.min()) / max(np.ptp(broad), 1e-6)
+    detail = (detail - detail.min()) / max(np.ptp(detail), 1e-6)
+    img = np.zeros((size, size, 3), np.uint8)
+    img[..., 0] = (broad * 255).astype(np.uint8)
+    img[..., 1] = (detail * 255).astype(np.uint8)
+    tex = PTexture("clouds")
+    tex.setup_2d_texture(size, size, PTexture.T_unsigned_byte,
+                         PTexture.F_rgb8)
+    # Panda wants BGR, bottom row first.
+    tex.set_ram_image(np.ascontiguousarray(img[::-1, :, ::-1]).tobytes())
+    tex.set_minfilter(SamplerState.FT_linear_mipmap_linear)
+    tex.set_magfilter(SamplerState.FT_linear)
+    tex.set_anisotropic_degree(4)
+    _CLOUDS = tex
+    return tex
 
 
 def _blank_shadow_map():
@@ -92,10 +98,12 @@ class Sunset:
         import builtins
         builtins.render.clear_light()
 
-        self.sky = Sky(texture=_sky_texture(), color=color.white)
+        self.sky = _SkyDome()
 
-        self.sun = DirectionalLight(shadow_map_resolution=config.SHADOW_RESOLUTION,
-                                    shadows=True)
+        # Direction only: the light's own shadow buffer is never created
+        # (no shader names its shadowMap). The car has its own map, CarShadow,
+        # and the static world is baked.
+        self.sun = DirectionalLight(shadows=False)
         # Panda's own light colour is unused: this shader reads the light for
         # its direction and shadow map only, and takes the beam colour from a
         # uniform, so warmth and intensity are tuned in one place.
@@ -107,7 +115,8 @@ class Sunset:
         self._dir = Vec3(math.cos(el) * math.sin(az), -math.sin(el),
                          math.cos(el) * math.cos(az))
         self.sun.look_at(self._dir)
-        self._focus_lens()
+        self.car_shadow = CarShadow(self.sun)
+        self.field_shadow = FieldShadow(self.sun)
 
         # The baked map gets its own buffer and camera rather than a second
         # DirectionalLight. Two reasons. Panda only brings a light's shadow
@@ -121,25 +130,46 @@ class Sunset:
         self._bake_texel = 0.0
         self._bake_track = track if config.BAKE_SHADOWS else None
 
-        self._shadow_center = PTA_LVecBase3f.empty_array(1)
+        sun_vec = Vec3(-self._dir.x, -self._dir.y, -self._dir.z).normalized()
         self._uniforms = {
-            'sky_color': Vec3(*config.LIGHT_SKY),
-            'ground_color': Vec3(*config.LIGHT_BOUNCE),
+            # The sky, as both the dome and every reflection read it.
+            'sky_zenith': Vec3(*config.SKY_ZENITH),
+            'sky_horizon': Vec3(*config.SKY_HORIZON),
+            'sky_ground': Vec3(*config.SKY_GROUND),
+            'sun_vec': sun_vec,
             'sun_color': Vec3(*config.LIGHT_SUN),
-            'sun_wrap': config.LIGHT_SUN_WRAP,
             'glow_color': Vec3(*config.LIGHT_GLOW),
             'glow_strength': config.LIGHT_GLOW_STRENGTH,
-            # Horizontal direction towards the sun (the beam travels the other
-            # way), so a face can tell whether it is looking into the glow.
-            'sun_dir_world': Vec3(-self._dir.x, 0.0, -self._dir.z).normalized(),
-            'haze_color': color.rgba(*config.HAZE_COLOR, config.HAZE_DENSITY),
+            # Irradiance for the diffuse ambient: sky above, bounce below.
+            'ambient_sky': Vec3(*config.LIGHT_SKY),
+            'ambient_ground': Vec3(*config.LIGHT_BOUNCE),
+            'sun_wrap': config.LIGHT_SUN_WRAP,
+            'env_strength': config.LIGHT_ENV,
+            'haze_color': color.rgba(1.0, 1.0, 1.0, config.HAZE_DENSITY),
             'haze_start': config.HAZE_START,
             'haze_end': config.HAZE_END,
-            'shadow_bias': config.SHADOW_BIAS,
-            'shadow_blur': config.SHADOW_BLUR,
+            # The camera chain develops the frame (post.py); until it says it
+            # is there, the shaders develop their own output.
+            'direct_out': 1.0,
+            'cloud_map': _cloud_texture(),
+            'clouds': Vec4(*config.CLOUD_SHAPE),
+            'cloud_drift': Vec2(0.0, 0.0),
+            'sun_disc': math.cos(math.radians(config.SUN_DISC_DEG)),
+            'car_map': self.car_shadow.texture(),
+            # Names without underscores: Panda splits trans_x_to_y_of_<name>
+            # on them.
+            'carcam': self.car_shadow.cam,
+            'shadow_bias': self.car_shadow.bias,
+            'shadow_blur': config.CAR_SHADOW_SOFT_M / config.CAR_SHADOW_FILM,
             'shadow_samples': config.SHADOW_SAMPLES,
-            'shadow_fade_start': config.SHADOW_AREA * config.SHADOW_FADE_START,
-            'shadow_fade_end': config.SHADOW_AREA * config.SHADOW_FADE_END,
+            'shadow_fade_start': config.CAR_SHADOW_FILM * 0.75,
+            'car_normal_offset': config.CAR_SHADOW_NORMAL_M,
+            'field_map': self.field_shadow.texture(),
+            'fieldcam': self.field_shadow.cam,
+            'field_on': 0.0,
+            'field_bias': self.field_shadow.bias,
+            'field_blur': config.FIELD_SHADOW_SOFT_M / config.FIELD_SHADOW_FILM,
+            'field_normal_offset': config.FIELD_SHADOW_NORMAL_M,
             'shadow_strength': 1.0,
             # A PTA, not a Vec3: it is written in place every frame by
             # follow(). Assigning a new value to a shader input on the scene
@@ -148,7 +178,6 @@ class Sunset:
             # were recomposed each frame and the old states left for Panda's
             # state garbage collector. Mutating the array changes the uniform
             # and nothing else.
-            'shadow_center': self._shadow_center,
             # Off until bake() has something to sample. The shader skips the
             # lookup entirely while this is zero, so the sampler being unbound
             # in the meantime costs nothing and reads nothing.
@@ -196,20 +225,6 @@ class Sunset:
         # put the sun over the paddock while the constant said "grandstands".
         d = -nrm * (config.SUN_SIDE * math.cos(rake)) + tan * math.sin(rake)
         return math.degrees(math.atan2(float(d[0]), float(d[1])))
-
-    def _focus_lens(self):
-        """Point the shadow camera at a box around the origin, not the scene.
-
-        ``DirectionalLight.update_bounds`` fits the film to an entity's extent,
-        which for a whole circuit is exactly the useless case. Setting the lens
-        by hand, and moving the light with the car, keeps the texels where they
-        can be seen. Near is negative so geometry behind the light's own node
-        still casts.
-        """
-        lens = self.sun._light.get_lens()
-        lens.set_film_size(config.SHADOW_AREA, config.SHADOW_AREA)
-        lens.set_film_offset(0, 0)
-        lens.set_near_far(-config.SHADOW_DEPTH, config.SHADOW_DEPTH)
 
     def _make_bake_target(self, track):
         """An offscreen depth buffer and an orthographic camera over the lap.
@@ -384,7 +399,7 @@ class Sunset:
     BAKE_MASK = 0b0010
 
     def apply(self, *entities, spec_strength=None, spec_power=None, casts=True,
-              baked=False):
+              baked=False, material=None, shader=None):
         """Give an entity (and its children) the sunset shader.
 
         ``casts=False`` keeps the entity out of both shadow maps. The road
@@ -409,6 +424,13 @@ class Sunset:
         # 0.74 m texel, which dulls the grandstands with their own acne and
         # needs enough depth slack to lift shadows off their casters.
         drop_live = into_bake and config.BAKE_REPLACES_LIVE
+        if material is None and spec_power is not None:
+            # The old Blinn-Phong pair, read as a microfacet material: the
+            # exponent maps onto roughness the standard way, and the strength
+            # onto the reflectance at normal incidence.
+            rough = math.sqrt(2.0 / (float(spec_power) + 2.0))
+            level = (spec_strength if spec_strength is not None else 0.1) / 0.1
+            material = make_material(rough, level)
         for e in entities:
             if e is None:
                 continue
@@ -417,31 +439,44 @@ class Sunset:
                     target.hide(self.SHADOW_MASK)
                 if not into_bake:
                     target.hide(self.BAKE_MASK)
-                target.shader = sunset_shader
-                # Only what actually differs per entity is set per entity.
-                if spec_strength is not None:
-                    target.set_shader_input('spec_strength', spec_strength)
-                if spec_power is not None:
-                    target.set_shader_input('spec_power', spec_power)
+                # A variant the entity asked for (the road, the grass)
+                # unless the caller insists on one.
+                target.shader = (shader or getattr(target, "world_shader", None)
+                                 or sunset_shader)
+                # Only what actually differs per entity is set per entity --
+                # and after the shader, whose defaults would overwrite it.
+                for k, v in getattr(target, "world_inputs", {}).items():
+                    target.set_shader_input(k, v)
+                if material is not None:
+                    target.set_shader_input('material', material)
                 self._lit.append(target)
 
     @staticmethod
     def _walk(e):
+        if getattr(e, "no_light", False):
+            # Decals that draw themselves (the car's contact shadow).
+            e.hide(Sunset.SHADOW_MASK | Sunset.BAKE_MASK)
+            return
         yield e
         for child in getattr(e, 'children', ()):
             yield from Sunset._walk(child)
 
     # -- per frame -----------------------------------------------------
-    def follow(self, x: float, z: float):
-        """Move the shadow map's focus to (x, z), and tell the shader where.
+    def follow(self, car):
+        """Put the car's shadow camera on the car, as drawn this frame.
 
-        One shader input on the scene root, not one per lit entity: that was
-        the single most expensive thing in the frame outside the draw call.
-        And written into the array it was bound with rather than re-set, so
-        the scene's render state does not change -- see ``_uniforms``.
+        Called after the car has been posed from the interpolated physics
+        state, so the shadow and the car are always the same instant.
         """
-        self.sun.position = Vec3(x, config.SHADOW_HEIGHT, z)
-        self._shadow_center[0] = LVecBase3f(x, 0.0, z)
+        p = car.world_position
+        self.car_shadow.follow(p)
+
+    def cast(self, entity):
+        """*entity* (and everything under it) casts into the car map."""
+        self.car_shadow.cast(entity)
+
+    def set_active(self, on: bool):
+        self.car_shadow.set_active(on)
 
     def destroy(self):
         import builtins
@@ -459,6 +494,8 @@ class Sunset:
         sun_buf = self.sun._light.get_shadow_buffer(builtins.base.win.get_gsg())
         if sun_buf is not None:
             ge.remove_window(sun_buf)
+        self.car_shadow.destroy()
+        self.field_shadow.destroy()
 
         builtins.render.clear_light()
         _destroy(self.sky)
@@ -471,3 +508,304 @@ class Sunset:
             self._bake_cam = None
         scene.set_shader_input('bake_ready', 0.0)
         self._lit.clear()
+
+
+class _SkyDome(Entity):
+    """The sky: a dome on the camera, drawn first, shaded analytically.
+
+    It replaces Ursina's textured ``Sky``. A painted gradient cannot know
+    where the sun is, and the moment the bodywork reflects the sky the two had
+    better agree -- so the dome evaluates the same ``sky_radiance`` the world
+    shaders reflect, plus the sun's disc and a cloud layer.
+    """
+
+    def __init__(self):
+        from panda3d.core import PTA_LVecBase2f
+        # The model's radius is 1: it is scaled to just inside the far plane
+        # every frame, as Ursina's own Sky does -- any bigger and the far
+        # plane clips the whole dome away.
+        super().__init__(parent=scene, model="sky_dome", double_sided=True,
+                         scale=camera.clip_plane_far * 0.8)
+        self.shader = sky_shader
+        self.set_bin("background", 0)
+        self.set_depth_write(False)
+        self.set_light_off()
+        # Not a shadow caster, and not in either shadow pass.
+        self.hide(Sunset.SHADOW_MASK | Sunset.BAKE_MASK)
+        self._drift = PTA_LVecBase2f.empty_array(1)
+        self.set_shader_input("cloud_drift", self._drift)
+        self._t = 0.0
+
+    def update(self):
+        # Ursina calls this every frame, the intro film included -- the race
+        # loop's own per-frame hook does not run during it.
+        import time as _time
+        self.position = camera.world_position
+        far = camera.clip_plane_far * 0.8
+        if abs(self.scale_x - far) > 1.0:
+            self.scale = far
+        # Clouds creep across the sky; a still cloud layer is a painting.
+        t = _time.perf_counter()
+        self._drift[0] = Vec2(t * config.CLOUD_DRIFT[0], t * config.CLOUD_DRIFT[1])
+
+
+class CarShadow:
+    """A shadow map for the hero car alone, carried along with it.
+
+    The general-purpose map used to follow the car across the world: it was
+    re-centred on the car's *physics* position, which runs up to a step
+    behind the interpolated pose the car is drawn at, and either slid by
+    fractions of a texel (edges crawl) or snapped by whole ones (the shadow
+    steps). Both read as a shadow that lags and shivers.
+
+    This one is a camera fixed to the car's drawn position and pointed along
+    the sun. It sees only what has been given to ``cast`` -- the player's car
+    -- so its 9 m film puts 4 mm in a texel, and since it moves rigidly with
+    the car, the car lands on exactly the same texels every frame: the only
+    thing that can change the shadow is the car actually turning against the
+    sun. One small depth pass of one car a frame.
+    """
+
+    MASK = 0b0100
+
+    def __init__(self, sun):
+        import builtins
+
+        base = builtins.base
+        res = int(config.CAR_SHADOW_RES)
+        fb = FrameBufferProperties()
+        fb.set_rgb_color(False)
+        fb.set_depth_bits(24)
+        self.buf = base.graphicsEngine.make_output(
+            base.pipe, "car_shadow", -900, fb, WindowProperties.size(res, res),
+            GraphicsPipe.BF_refuse_window, base.win.get_gsg(), base.win)
+        self.tex = Texture("car_shadow")
+        if self.buf is not None:
+            self.tex.set_format(Texture.F_depth_component)
+            self.buf.add_render_texture(self.tex, GraphicsOutput.RTM_bind_or_copy,
+                                        GraphicsOutput.RTP_depth)
+            self.buf.set_clear_depth_active(True)
+            self.buf.set_clear_depth(1.0)
+        else:
+            print("lighting: no car shadow buffer; the car casts no shadow")
+            self.tex = _blank_shadow_map()
+        self.tex.set_minfilter(SamplerState.FT_shadow)
+        self.tex.set_magfilter(SamplerState.FT_shadow)
+        self.tex.set_wrap_u(SamplerState.WM_border_color)
+        self.tex.set_wrap_v(SamplerState.WM_border_color)
+        self.tex.set_border_color((1.0, 1.0, 1.0, 1.0))
+
+        self.lens = OrthographicLens()
+        film, depth = config.CAR_SHADOW_FILM, config.CAR_SHADOW_DEPTH
+        self.lens.set_film_size(film, film)
+        self.lens.set_near_far(-depth, depth)
+        cam = Camera("car_shadow_cam", self.lens)
+        cam.set_camera_mask(self.MASK)
+        # Thin plates (wings, endplates) are single-sided: draw both faces,
+        # or a wing lit from behind casts nothing.
+        cam.set_initial_state(RenderState.make(
+            CullFaceAttrib.make(CullFaceAttrib.M_cull_none), 1))
+        self.cam = builtins.render.attach_new_node(cam)
+        self.cam.set_quat(sun.get_quat(builtins.render))
+        if self.buf is not None:
+            self.buf.make_display_region(0, 1, 0, 1).set_camera(self.cam)
+        # Nothing is drawn into this map unless it is shown through on
+        # purpose (cast): the whole scene is hidden from its camera.
+        builtins.render.hide(self.MASK)
+        self.bias = config.CAR_SHADOW_BIAS_M / (2.0 * depth)
+        self.follow(Vec3(0, 0, 0))
+
+    def texture(self):
+        return self.tex
+
+    def cast(self, entity):
+        entity.show_through(self.MASK)
+        for d in entity.find_all_matches("**/contact_shadow"):
+            d.hide(self.MASK)
+
+    def follow(self, p):
+        # Only the camera moves: the shaders read its matrix from the scene
+        # graph at draw time (trans_world_to_clip_of_carcam), so the lookup
+        # always matches the frame the map was drawn in.
+        import builtins
+        self.cam.set_pos(builtins.render, p.x, p.y + 0.5, p.z)
+
+    def set_active(self, on: bool):
+        if self.buf is not None:
+            self.buf.set_active(on)
+
+    def destroy(self):
+        import builtins
+        if self.buf is not None:
+            builtins.base.graphicsEngine.remove_window(self.buf)
+            self.buf = None
+        self.cam.remove_node()
+        builtins.render.show(self.MASK)
+
+
+_DEPTH_VERT = """#version 150
+uniform mat4 p3d_ModelViewProjectionMatrix;
+in vec4 p3d_Vertex;
+void main() { gl_Position = p3d_ModelViewProjectionMatrix * p3d_Vertex; }
+"""
+_DEPTH_FRAG = """#version 150
+out vec4 o;
+void main() { o = vec4(1.0); }
+"""
+
+
+class FieldShadow:
+    """The other cars' shadows: one map, wide, round the car on camera.
+
+    They used to go into the hero car's map (``CarShadow``), whose 9 m film
+    is sized for one car: a car alongside threw a shadow, one a length away
+    did not, and they flicked on and off as the gaps changed. This map is
+    ``FIELD_SHADOW_FILM`` across, pushed ahead of the followed car along the
+    view (where the cars that matter are), and faded out at its edge in the
+    shader rather than cut off.
+
+    It draws a scene of its own: one stand-in per car, the car's far-LOD
+    copy merged into a single depth-only mesh and posed from the real car
+    every frame -- twenty draws, not the 300-odd of the cars themselves.
+    The camera is moved in whole texels of its own film, so a shadow cast
+    by a car standing still stays on the same texels while the map moves
+    (no crawl along the edges).
+    """
+
+    def __init__(self, sun):
+        import builtins
+
+        from panda3d.core import NodePath, Shader as PShader
+
+        base = builtins.base
+        res = int(config.FIELD_SHADOW_RES)
+        self.res = res
+        fb = FrameBufferProperties()
+        fb.set_rgb_color(False)
+        fb.set_depth_bits(24)
+        self.buf = base.graphicsEngine.make_output(
+            base.pipe, "field_shadow", -899, fb, WindowProperties.size(res, res),
+            GraphicsPipe.BF_refuse_window, base.win.get_gsg(), base.win)
+        self.tex = Texture("field_shadow")
+        if self.buf is not None:
+            self.tex.set_format(Texture.F_depth_component)
+            self.buf.add_render_texture(self.tex, GraphicsOutput.RTM_bind_or_copy,
+                                        GraphicsOutput.RTP_depth)
+            self.buf.set_clear_depth_active(True)
+            self.buf.set_clear_depth(1.0)
+            self.buf.set_active(False)
+        else:
+            print("lighting: no field shadow buffer; other cars cast no shadow")
+            self.tex = _blank_shadow_map()
+        self.tex.set_minfilter(SamplerState.FT_shadow)
+        self.tex.set_magfilter(SamplerState.FT_shadow)
+        self.tex.set_wrap_u(SamplerState.WM_border_color)
+        self.tex.set_wrap_v(SamplerState.WM_border_color)
+        self.tex.set_border_color((1.0, 1.0, 1.0, 1.0))
+
+        self.root = NodePath("field_shadow_scene")
+        self.root.set_shader(PShader.make(PShader.SL_GLSL, _DEPTH_VERT,
+                                          _DEPTH_FRAG), 10)
+        self.root.set_two_sided(True)
+        self.film = film = config.FIELD_SHADOW_FILM
+        depth = config.FIELD_SHADOW_DEPTH
+        self.lens = OrthographicLens()
+        self.lens.set_film_size(film, film)
+        self.lens.set_near_far(-depth, depth)
+        cam = Camera("field_shadow_cam", self.lens)
+        cam.set_scene(self.root)
+        self.cam = self.root.attach_new_node(cam)
+        q = sun.get_quat(builtins.render)
+        self.cam.set_quat(q)
+        self._right = q.get_right()
+        self._up = q.get_up()
+        self._fwd = q.get_forward()
+        if self.buf is not None:
+            self.buf.make_display_region(0, 1, 0, 1).set_camera(self.cam)
+        self.bias = config.FIELD_SHADOW_BIAS_M / (2.0 * depth)
+        self.stand_ins: dict = {}
+
+    def texture(self):
+        return self.tex
+
+    @staticmethod
+    def _switch(on: bool):
+        # Read by the shaders as field_on: with no cars in the map there is
+        # nothing to look up -- and what the map last held (another session)
+        # must not show through.
+        from ursina import scene
+        scene.set_shader_input("field_on", 1.0 if on else 0.0)
+
+    def add(self, key, model):
+        """A stand-in for one car, from a copy of its geometry (any
+        NodePath: its own pose is ignored, the car's is copied each frame)."""
+        from panda3d.core import NodePath
+        np_ = NodePath("stand_in")
+        for gn in model.find_all_matches("**/+GeomNode"):
+            c = NodePath(gn.node().make_copy())
+            node = c.node()
+            for i in range(node.get_num_geoms()):
+                node.set_geom_state(i, RenderState.make_empty())
+            c.set_state(RenderState.make_empty())
+            for k in list(node.get_python_tag_keys()):
+                node.clear_python_tag(k)
+            c.reparent_to(np_)
+            c.set_transform(gn.get_transform(model))
+        np_.flatten_strong()
+        np_.reparent_to(self.root)
+        if not self.stand_ins:
+            self._switch(True)
+        self.stand_ins[key] = np_
+        if self.buf is not None:
+            self.buf.set_active(True)
+
+    def pose(self, key, car, shown: bool = True):
+        s = self.stand_ins.get(key)
+        if s is None:
+            return
+        if not shown:
+            if not s.is_hidden():
+                s.hide()
+            return
+        if s.is_hidden():
+            s.show()
+        import builtins
+        s.set_mat(car.get_mat(builtins.render))
+
+    def clear(self):
+        for s in self.stand_ins.values():
+            s.remove_node()
+        if self.stand_ins:
+            self._switch(False)
+        self.stand_ins.clear()
+        if self.buf is not None:
+            self.buf.set_active(False)
+
+    def follow(self, p, view_xz=None):
+        """Centre the film on *p* (pushed ahead along *view_xz*), in whole
+        texels of the film so the cars' shadows do not crawl."""
+        if not self.stand_ins:
+            return
+        x, y, z = float(p[0]), float(p[1]), float(p[2])
+        if view_xz is not None:
+            vx, vz = view_xz
+            n = math.hypot(vx, vz)
+            if n > 1e-6:
+                a = config.FIELD_SHADOW_AHEAD / n
+                x += vx * a
+                z += vz * a
+        pt = Vec3(x, y, z)
+        texel = self.film / self.res
+        r = round(pt.dot(self._right) / texel) * texel
+        u = round(pt.dot(self._up) / texel) * texel
+        f = pt.dot(self._fwd)
+        pos = self._right * r + self._up * u + self._fwd * f
+        self.cam.set_pos(pos)
+
+    def destroy(self):
+        import builtins
+        self.clear()
+        if self.buf is not None:
+            builtins.base.graphicsEngine.remove_window(self.buf)
+            self.buf = None
+        self.root.remove_node()

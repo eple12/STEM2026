@@ -14,7 +14,7 @@ FOG = rgb(176, 196, 214)
 ASPHALT = rgb(68, 70, 76)
 ASPHALT_EDGE = rgb(58, 60, 66)
 BARRIER = rgb(52, 54, 60)
-GRASS = rgb(58, 122, 58)
+GRASS = rgb(76, 102, 50)
 
 # roadside furniture
 POST_A = rgb(206, 48, 44)

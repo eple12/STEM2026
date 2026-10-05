@@ -10,6 +10,7 @@ import math
 import numpy as np
 
 from . import config
+from .structures import box_hit, obstacles
 from .trackdata import Track
 
 
@@ -17,6 +18,8 @@ class Surface:
     def __init__(self, track: Track):
         self.track = track
         self.hint = 0
+        #: The legs of the gantry and the bridges (structures.obstacles).
+        self._legs = obstacles(track)
         # The barrier chords, plus the centreline sample nearest each one, so a
         # query only has to look at the handful of segments beside the car.
         # Done once: it is a few hundred segments against a thousand samples.
@@ -46,6 +49,15 @@ class Surface:
             cand = [self._candidates(k, s) for k, s in ((0, 1), (1, -1))]
             track._barrier_candidates = cand
         self._cand = cand
+        # Plain lists for the per-step lookups (shared through the track).
+        lists = getattr(track, "_surface_lists", None)
+        if lists is None:
+            lists = (track.center.tolist(), track.normal.tolist(),
+                     track.w_right.tolist(), track.w_left.tolist(),
+                     cand[0][1].tolist(), cand[1][1].tolist())
+            track._surface_lists = lists
+        (self._cl, self._nl, self._wr, self._wl,
+         self._clear_r, self._clear_l) = lists
 
     def _candidates(self, k: int, side: int):
         """(chord table per sample, clear distance per sample) for one side.
@@ -84,11 +96,12 @@ class Surface:
         return table, clear
 
     def _local(self, pos_xz):
-        t = self.track
-        i = t.nearest_index(pos_xz, self.hint)
+        i = self.track.nearest_index(pos_xz, self.hint)
         self.hint = i
-        offset = float(np.dot(np.asarray(pos_xz) - t.center[i], t.normal[i]))
-        edge = t.w_right[i] if offset > 0 else t.w_left[i]
+        cx, cz = self._cl[i]
+        nx, nz = self._nl[i]
+        offset = (float(pos_xz[0]) - cx) * nx + (float(pos_xz[1]) - cz) * nz
+        edge = self._wr[i] if offset > 0 else self._wl[i]
         return i, offset, edge
 
     @staticmethod
@@ -138,20 +151,23 @@ class Surface:
             d = abs(offset)
             return d <= edge + config.KERB_WIDTH, self._surface_at(d, edge)
 
-        c = np.asarray(pos_xz, dtype=float)
-        fwd = np.array([math.sin(yaw), math.cos(yaw)])
-        right = np.array([math.cos(yaw), -math.sin(yaw)]) * config.WHEEL_HALF_TRACK
-        self._local(c)                       # refresh the search hint
+        cx0, cz0 = float(pos_xz[0]), float(pos_xz[1])
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        ht = config.WHEEL_HALF_TRACK
+        rx, rz = cy * ht, -sy * ht
+        self._local((cx0, cz0))              # refresh the search hint
+        nearest = self.track.nearest_index
+        cl, nl, wr, wl = self._cl, self._nl, self._wr, self._wl
         inside = False
         total = 0.0
-        for along in (fwd * config.CG_TO_FRONT, -fwd * config.CG_TO_REAR):
-            for side in (right, -right):
-                p = c + along + side
-                i = self.track.nearest_index(p, self.hint)
-                offset = float(np.dot(p - self.track.center[i],
-                                      self.track.normal[i]))
-                edge = float(self.track.w_right[i] if offset > 0
-                             else self.track.w_left[i])
+        for along in (config.CG_TO_FRONT, -config.CG_TO_REAR):
+            ax, az = cx0 + sy * along, cz0 + cy * along
+            for px, pz in ((ax + rx, az + rz), (ax - rx, az - rz)):
+                i = nearest((px, pz), self.hint)
+                cx, cz = cl[i]
+                nx, nz = nl[i]
+                offset = (px - cx) * nx + (pz - cz) * nz
+                edge = wr[i] if offset > 0 else wl[i]
                 d = abs(offset)
                 inside = inside or d <= edge
                 total += self._surface_at(d, edge)
@@ -230,32 +246,49 @@ class Surface:
         metres away. It now hits the segments the props are placed on.
         """
         t = self.track
-        c = np.asarray(pos_xz, dtype=float)
-        self._local(c)                       # refresh the search hint
-        fwd = np.array([math.sin(yaw), math.cos(yaw)])
-        right = np.array([math.cos(yaw), -math.sin(yaw)])
-        hw = right * config.BODY_HALF_WIDTH
-        nose, tail = fwd * config.BODY_TO_FRONT, -fwd * config.BODY_TO_REAR
-        corners = (c + nose + hw, c + nose - hw, c + tail + hw, c + tail - hw)
+        cx0, cz0 = float(pos_xz[0]), float(pos_xz[1])
+        self._local((cx0, cz0))              # refresh the search hint
+        sy, cy = math.sin(yaw), math.cos(yaw)
+        hwx, hwz = cy * config.BODY_HALF_WIDTH, -sy * config.BODY_HALF_WIDTH
+        nf, nr = config.BODY_TO_FRONT, -config.BODY_TO_REAR
+        corners = ((cx0 + sy * nf + hwx, cz0 + cy * nf + hwz),
+                   (cx0 + sy * nf - hwx, cz0 + cy * nf - hwz),
+                   (cx0 + sy * nr + hwx, cz0 + cy * nr + hwz),
+                   (cx0 + sy * nr - hwx, cz0 + cy * nr - hwz))
 
         deep, hit_m = 0.0, None
         touching = []
         hd = config.BARRIER_HALF_DEPTH
-        for p in corners:
-            i = t.nearest_index(p, self.hint)
-            rel = p - t.center[i]
-            side = 1 if float(np.dot(rel, t.normal[i])) > 0 else -1
+        cl, nl = self._cl, self._nl
+        for px, pz in corners:
+            i = t.nearest_index((px, pz), self.hint)
+            ccx, ccz = cl[i]
+            rx, rz = px - ccx, pz - ccz
+            nx, nz = nl[i]
+            side = 1 if rx * nx + rz * nz > 0 else -1
             # Inside every candidate chord's face by more than the rail's half
             # depth: no contact is possible, so skip the chord test.
-            clear = self._cand[0 if side > 0 else 1][1][i]
-            if math.hypot(rel[0], rel[1]) + hd < clear - 1e-6:
+            clear = (self._clear_r if side > 0 else self._clear_l)[i]
+            if math.hypot(rx, rz) + hd < clear - 1e-6:
                 continue
+            p = np.array((px, pz))
             pen, m = self._barrier_hit(p, i, side)
             if m is None or pen <= 0.0:
                 continue
             touching.append(p)
             if pen > deep:
                 deep, hit_m = pen, m
+        # The legs of the gantry and the bridges: solid, like the barrier.
+        leg = None
+        for box in self._legs:
+            h = box_hit(cx0, cz0, yaw, nf, -nr, config.BODY_HALF_WIDTH, box)
+            if h is not None and h[0] > deep and (leg is None or h[0] > leg[0]):
+                leg = h
+        c = np.array((cx0, cz0))
+        if leg is not None:
+            depth, nx, nz, px, pz = leg
+            wall_normal = np.array((nx, nz))
+            return c + wall_normal * depth, wall_normal, np.array((px, pz)) - c
         if hit_m is None:
             return None, None, None
 

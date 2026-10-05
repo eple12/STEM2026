@@ -4,9 +4,11 @@
     python tools/session_check.py --only limits      # the penalty maths, no window
     python tools/session_check.py --only quali --circuit Monza
 
-``limits`` drives TrackLimits along the centreline by hand: an honest trip
-wide pays the flat fee alone, and a cut across the infield pays more than the
-time it could have saved.
+``limits`` drives TrackLimits along the centreline by hand and hands each
+excursion to race control (``racecontrol.py``): an honest trip wide is a
+track-limits warning and costs nothing, a cut across the infield costs more
+than the time it could have saved, and a trip off right after a contact is
+let go.
 
 ``quali`` runs a qualifying session with a slower autopilot on a circuit that
 has a recorded ghost lap and checks the ghost's life cycle -- hidden on the out
@@ -27,6 +29,7 @@ DT = 1.0 / config.PHYSICS_HZ
 
 
 def check_limits(circuit: str):
+    from game.racecontrol import RaceControl
     from game.rules import TrackLimits
     from game.trackdata import load_track
 
@@ -44,23 +47,39 @@ def check_limits(circuit: str):
             for _ in range(max(1, steps)):
                 off = off_from is not None and off_from <= k < off_to
                 p = c[k % n] + (nrm[k % n] * lateral if off else 0.0)
-                lim.update(DT, k % n, p, off, t)
+                lim.update(DT, k % n, p, off, t, speed)
                 t += DT
         return t
 
-    # 1. Running wide: off for ~60 m of lap on the outside, nothing gained.
-    lim = TrackLimits(track)
+    def judge(lim, rc, car=0):
+        while lim.pending:
+            rc.excursion(car, lim.pending.pop(0))
+
+    # 1. Running wide: off for ~60 m of lap on the outside, nothing gained:
+    #    a warning, no time.
+    lim = TrackLimits(track, config.GP_OFFTRACK_REJOIN)
+    rc = RaceControl(1)
     k0 = n // 4
     m = int(60.0 / ds)
     t = drive(lim, k0, k0 + 3 * m, off_from=k0 + m, off_to=k0 + 2 * m,
               lateral=track.w_right.max() + 4.0)
     t = drive(lim, k0 + 3 * m, k0 + 3 * m + int(80 / ds), t0=t)
-    want = config.GP_OFFTRACK_PENALTY + config.GP_OFFTRACK_PER_M * 60.0
-    print(f"  run wide : {lim.incidents} incident, {lim.penalty:.2f} s "
-          f"(60 m of lap off the road; expected ~{want:.2f})")
+    judge(lim, rc)
+    print(f"  run wide : {lim.incidents} incident, {rc.penalty(0):.2f} s, "
+          f"strikes {rc.cars[0].strikes}: {[m.text for m in rc.messages]}")
     assert lim.incidents == 1, "one excursion counted as several"
-    assert abs(lim.penalty - want) < 0.6, (
-        f"running wide cost {lim.penalty:.2f} s, not ~{want:.2f}")
+    assert rc.penalty(0) == 0.0, "running wide was penalised"
+    assert rc.cars[0].strikes == 1
+
+    # ...and the same trip just after a contact: nothing at all.
+    lim = TrackLimits(track, config.GP_OFFTRACK_REJOIN)
+    rc = RaceControl(2)
+    rc.cars[0].last_contact = 0.0
+    drive(lim, k0, k0 + 3 * m, off_from=k0 + m, off_to=k0 + 2 * m,
+          lateral=track.w_right.max() + 4.0)
+    judge(lim, rc)
+    assert rc.penalty(0) == 0.0 and rc.cars[0].strikes == 0, "pushed off, yet judged"
+    print("  pushed off: excused")
 
     # 2. Cutting. The circuit's best shortcut in a band of lap distance --
     #    the two points furthest apart round the lap for how close they are
@@ -90,28 +109,30 @@ def check_limits(circuit: str):
         ka, kb = best_shortcut(lo_m, hi_m)
         along = float(arc[kb] - arc[ka])
         chord = float(np.hypot(*(c[kb] - c[ka])))
-        lim = TrackLimits(track)
+        lim = TrackLimits(track, config.GP_OFFTRACK_REJOIN)
+        rc = RaceControl(1)
         t = drive(lim, ka - 10, ka + 1)
         m_steps = max(1, int(chord / speed / DT))
         for st in range(1, m_steps + 1):
             p = c[ka] + (c[kb] - c[ka]) * (st / m_steps)
             i, _ = surf.progress(p)
-            lim.update(DT, i, p, True, t)
+            lim.update(DT, i, p, True, t, speed)
             t += DT
         drive(lim, kb + 1, kb + 1 + int(80 / ds), t0=t)
+        judge(lim, rc)
         saved = (along - chord) / speed
         print(f"  {label:9s}: {along:.0f} m of lap in a {chord:.0f} m line "
               f"saves {saved:.2f} s at {speed:.0f} m/s; penalty "
-              f"{lim.penalty:.2f} s")
+              f"{rc.penalty(0):.2f} s")
         assert lim.incidents == 1
-        assert lim.penalty > saved, "cutting the track paid for itself"
-        return lim.penalty
+        assert rc.penalty(0) > saved, "cutting the track paid for itself"
+        return rc.penalty(0)
 
     cut("chicane", 80.0, 260.0)
     cut("big cut", 260.0, 0.5 * track.length)
 
     # 3. Progress unwraps across the line.
-    lim = TrackLimits(track)
+    lim = TrackLimits(track, config.GP_OFFTRACK_REJOIN)
     drive(lim, n - 20, n + 20)
     assert abs(lim.progress - float(track.arclen[19])) < 1.0, lim.progress
     print(f"  progress : {lim.progress:.1f} m after crossing the line")

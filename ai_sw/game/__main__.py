@@ -5,7 +5,8 @@ import os
 for _var in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS"):
     os.environ.setdefault(_var, "1")
 
-from .app import main  # noqa: E402
-
 if __name__ == "__main__":
+    # Imported here so a worker process (fieldproc.py) re-importing the main
+    # module does not load the renderer.
+    from .app import main
     main()

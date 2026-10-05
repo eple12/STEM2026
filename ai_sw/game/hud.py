@@ -1,858 +1,933 @@
-"""On-screen display: an F1 broadcast overlay, laid out the way F1 TV lays one out.
+"""On-screen display: the F1 TV broadcast package, laid out as it is on air.
 
-Top-left, the session bar -- wordmark tile, lap counter, circuit, session
-clock -- with the **timing tower** hanging under it: one row per car, position
-block, team-colour bar, three-letter name, gap, best lap. Top-right, the
-**lap-time block**: the running lap with its three sector lights beneath it,
-then last and best. Bottom-centre, the **onboard telemetry widget**: shift
-lights across the top, speed, gear, throttle and brake bars, steering. The
-track map sits bottom-right. Status flags and the spectator lower-third come
-up bottom-left. On the grid, the five-lamp **start gantry** counts the race in.
+Top-left, the **timing tower**: the wordmark and the lap counter (or the
+session clock in qualifying) in its header, a status strip that turns yellow
+under a yellow flag and chequered at the finish, and a row per car --
+position, team mark, three-letter name, the interval to the car ahead (or
+the gap to the leader: TAB), and beside the tower the chips a broadcast
+hangs off a row: a time penalty, DRS open, a car out of the race for the
+moment. Rows slide to their new places when the order changes, so a pass
+can be followed on the tower as well as on the road; arrows show places
+gained or lost since the start. The player's row is lit.
+
+Bottom-right, the **driver chyron**: who is on camera, the running lap time,
+the time to beat, and three sector bars in purple, green and yellow.
+Bottom-centre, the **speed graphic** with the revs, the gear and the pedals.
+Bottom-left, a track map with every car on it. On the grid, the five-column
+**start lights** drop in; a **race control** box carries the stewards' word;
+the result and pause cards are cut from the same cloth.
+
+Colours follow the timing conventions exactly: purple is the session best,
+green a personal best, yellow slower than your own best.
+
+All of it is drawn through ``hudkit``: one mesh for every panel and bar, one
+per typeface for every label -- split into what never changes and what
+changes every frame, so a new speed or lap time re-uploads only the small
+live buffers. Running numbers (speed, lap clock, gaps) are ``DigitField``s:
+their cells are fixed when the HUD is built and a new value only swaps which
+pre-rasterised glyph each cell shows.
 
 Layout note: on an aspect-ratio change Ursina rescales ``e.x`` for every
-*direct child* of ``camera.ui`` (see window.update_aspect_ratio). Anything made
-of several pieces must therefore live inside a single container entity, or the
-pieces drift apart from each other. So everything here hangs off one
-``self.root`` at x = 0, which is also what makes ``destroy()`` a single call
-when the race hands back to the menu.
-
-Panels use GLASS rather than the menu's opaque PANEL: a broadcast overlay sits
-on top of a moving picture and has to let the track show through.
+*direct child* of ``camera.ui``. Everything here hangs off one ``self.root``
+at x = 0, and the HUD is rebuilt when the ratio changes (``stale``).
 """
 from __future__ import annotations
 
 import math
 
-from ursina import Circle, Entity, Mesh, Text, Vec3, camera, window
+import numpy as np
+
+from ursina import Entity, camera, window
 
 from . import config
 from . import palette as pal
+from .hudkit import ShapeBatch, ShapeLayer, TextLayer, _rgba
 from .trackdata import Track
-from .ui import destroy_tree
-from .ui import (AMBER, GLASS, GLASS_HI, GREEN, GREY, GREY_DIM, INK, KEYCAP,
-                 LAMP_OFF, LAMP_ON, LED_BLUE, LED_GREEN, LED_OFF, LED_RED,
-                 PANEL_HI, PURPLE, RED, SLANT_DEG, TEAM_AI, TEAM_YOU, WHITE,
-                 YELLOW, caption, delta_time, gear_of, lap_time, pick_font,
-                 skew_quad, spaced)
+from .ui import (AMBER, GREEN, PURPLE, RED, TEAM_AI, TEAM_YOU, WHITE, YELLOW,
+                 caption, delta_time, destroy_tree, gear_of, lap_time)
 
-#: Sector-light colour by status. "live" is the sector being driven now.
+# --- broadcast palette -------------------------------------------------------
+BG = pal.rgb(14, 14, 20, 232)
+BG_ROW = pal.rgb(18, 18, 26, 218)
+BG_ROW2 = pal.rgb(24, 24, 33, 218)
+BG_HI = pal.rgb(44, 44, 58, 236)
+BG_SOFT = pal.rgb(10, 10, 16, 120)
+HILITE = pal.rgb(236, 236, 242, 240)
+WATCH_HI = pal.rgb(150, 18, 14, 236)
+RULE = pal.rgb(255, 255, 255, 22)
+CLEAR = pal.rgb(0, 0, 0, 0)
+INK = pal.rgb(12, 12, 16)
+GREY = pal.rgb(168, 170, 180)
+DIM = pal.rgb(112, 114, 126)
+LAMP_OFF = pal.rgb(44, 12, 12)
+LAMP_ON = pal.rgb(255, 26, 14)
+LAMP_GLOW = pal.rgb(255, 30, 10, 70)
+DRS_GREEN = pal.rgb(40, 200, 90)
+STRIP_IDLE = pal.rgb(70, 72, 84)
+
+#: Sector bar colour by status. "live" is the sector being driven.
 SECTOR_COL = {"purple": PURPLE, "green": GREEN, "yellow": YELLOW,
-              "live": pal.rgb(120, 96, 40), "off": pal.rgb(40, 40, 52)}
+              "live": pal.rgb(110, 110, 124), "off": pal.rgb(48, 48, 60)}
 
-#: The key legend along the bottom edge, as (key, what it does).
+#: Race-control flag square and its glyph, by what the message is saying.
+FLAG_COL = {"warn": YELLOW, "red": RED, "pen": AMBER, "flag": WHITE,
+            "clear": pal.rgb(60, 180, 120), "info": GREY, "yellow": YELLOW,
+            "green": GREEN}
+FLAG_ICON = {"warn": "!", "red": "!", "pen": "+", "flag": "!", "clear": "=",
+             "info": "i", "yellow": "!", "green": "="}
+
+#: Status strip under the tower header.
+STRIP_COL = {"green": GREEN, "yellow": YELLOW, "idle": STRIP_IDLE}
+
+#: Rev lights: green, then red, then blue at the shift point.
+N_LEDS = 15
+LED_ON = ([pal.rgb(40, 220, 90)] * 5 + [pal.rgb(240, 40, 30)] * 5
+          + [pal.rgb(70, 120, 255)] * 5)
+LED_OFF = pal.rgb(40, 40, 52)
+
 KEYS = (("W", "THROTTLE"), ("S", "BRAKE"), ("A/D", "STEER"),
         ("SPACE", "HANDBRAKE"), ("R", "RESET"), ("C", "CAMERA"),
-        ("G", "WATCH AI"), ("T", "AIDS"), ("M", "MUTE"), ("H", "HUD"),
-        ("ESC", "PAUSE"))
-
-N_LEDS = 12
-
-#: Flag plate and text colour, by what the flag is saying.
-FLAG_COL = {"warn": (YELLOW, INK), "red": (RED, WHITE), "pen": (AMBER, INK)}
+        ("X", "LOOK BACK"), ("G", "WATCH NEXT CAR"), ("T", "AIDS"),
+        ("TAB", "GAPS"), ("M", "MUTE"), ("H", "HUD"), ("ESC", "PAUSE"))
 
 
 def pen_tag(seconds: float) -> str:
     """A penalty as a tower tag: seconds, with a decimal while it is small
     enough for one to matter."""
-    return f"+{seconds:.1f}S" if seconds < 20 else f"+{seconds:.0f}S"
+    return f"+{seconds:.0f}S" if abs(seconds - round(seconds)) < 0.05 else (
+        f"+{seconds:.1f}S" if seconds < 20 else f"+{seconds:.0f}S")
 
 
-class _QuadBatch:
-    """Collects the HUD's static plates into a single mesh.
-
-    Every plate, accent and rule used to be its own Entity, each a node for
-    Ursina to walk and Panda to cull and draw every frame. None of them ever
-    move. Merged, they are one draw call and one node, and the depth order is
-    preserved because z is baked per vertex exactly as it was per entity.
-    """
-
-    def __init__(self, ox: float = 0.0, oy: float = 0.0):
-        self.ox, self.oy = ox, oy
-        self.v: list = []
-        self.t: list = []
-        self.c: list = []
-
-    def add(self, x, y, z, w, h, angle, col):
-        s = math.tan(math.radians(angle)) * h / 2
-        corners = ((-w / 2 + s, h / 2), (w / 2 + s, h / 2),
-                   (w / 2 - s, -h / 2), (-w / 2 - s, -h / 2))
-        n = len(self.v)
-        for px, py in corners:
-            self.v.append((x + px, y + py, z))
-            self.c.append(col)
-        # Counter-clockwise on screen, same winding as skew_quad.
-        self.t += [n, n + 2, n + 1, n, n + 3, n + 2]
-
-    def build(self, parent):
-        if not self.v:
-            return None
-        from panda3d.core import TransparencyAttrib
-        e = Entity(parent=parent,
-                   model=Mesh(vertices=self.v, triangles=self.t,
-                              colors=self.c, mode="triangle", static=True))
-        # Vertex alpha carries the glass panels; without this it is ignored.
-        e.setTransparency(TransparencyAttrib.MAlpha)
-        return e
+def tenths(t: float | None) -> str:
+    """A running lap time the way the chyron shows it: to the tenth."""
+    if t is None:
+        return "-:--.-"
+    m, s = divmod(max(0.0, t), 60.0)
+    return f"{int(m):d}:{int(s):02d}.{int((s % 1.0) * 10):d}"
 
 
-class _QuadRef:
-    """One block inside a ``_DynQuads``, recoloured through ``.color`` just
-    as the Entity it stands in for was."""
-
-    __slots__ = ("_owner", "_index", "_color")
-
-    def __init__(self, owner, index: int, col):
-        self._owner, self._index, self._color = owner, index, col
-
-    @property
-    def color(self):
-        return self._color
-
-    @color.setter
-    def color(self, col):
-        self._color = col
-        self._owner.recolor(self._index, col)
+def _rgb01(col) -> tuple:
+    """A (r, g, b) 0..1 team colour as an opaque RGBA tuple."""
+    return (float(col[0]), float(col[1]), float(col[2]), 1.0)
 
 
-class _DynQuads:
-    """Opaque blocks whose colour changes at runtime, merged into one mesh.
+class _Pair:
+    """Two shapes shown and hidden together."""
 
-    The shift lights and sector lights were an Entity each: fifteen draw
-    calls, each with its own shader bind, for rectangles that never move.
-    Here each is four vertices in one mesh, and a colour change rewrites
-    those four vertex colours in place -- no new node and no new render
-    state. Opaque colours only: the mesh stays in the opaque bin, where the
-    entities it replaces were drawn.
-    """
+    __slots__ = ("a", "b")
 
-    def __init__(self):
-        self.v: list = []
-        self.t: list = []
-        self.c: list = []
-        self.entity = None
+    def __init__(self, a, b):
+        self.a, self.b = a, b
 
-    def add(self, x, y, z, w, h, col) -> _QuadRef:
-        n = len(self.v)
-        # Corner order and winding of Ursina's own "quad" model.
-        for px, py in ((-w / 2, -h / 2), (w / 2, -h / 2),
-                       (w / 2, h / 2), (-w / 2, h / 2)):
-            self.v.append((x + px, y + py, z))
-            self.c.append(col)
-        self.t += [n, n + 1, n + 2, n + 2, n + 3, n]
-        return _QuadRef(self, n // 4, col)
-
-    def build(self, parent):
-        if not self.v:
-            return None
-        self.entity = Entity(parent=parent,
-                             model=Mesh(vertices=self.v, triangles=self.t,
-                                        colors=self.c, mode="triangle",
-                                        static=False))
-        return self.entity
-
-    def recolor(self, i: int, col):
-        if self.entity is None:
-            self.c[4 * i:4 * i + 4] = [col] * 4
-            return
-        from panda3d.core import GeomVertexWriter
-        vdata = self.entity.model.geomNode.modifyGeom(0).modifyVertexData()
-        w = GeomVertexWriter(vdata, "color")
-        w.setRow(4 * i)
-        r, g, b, a = (float(col[0]), float(col[1]), float(col[2]),
-                      float(col[3]))
-        for _ in range(4):
-            w.setData4f(r, g, b, a)
-
-
-#: The outline of a 28-sided disc, taken off one ``Circle`` and reused.
-_DISC_VERTS = None
-
-
-def _disc() -> Mesh:
-    """A lamp disc -- a fresh mesh each time, since each lamp is recoloured on
-    its own node. Only the first is built through ``Circle``: that class spins
-    a helper Entity to find its points and leaves the inner one behind in
-    ``scene.entities`` every time, which is ten stray entities a race."""
-    global _DISC_VERTS
-    if _DISC_VERTS is None:
-        _DISC_VERTS = [Vec3(v) for v in
-                       Circle(resolution=28, mode="ngon").vertices]
-    return Mesh(vertices=list(_DISC_VERTS), mode="ngon")
+    def show(self, on: bool):
+        self.a.show(on)
+        self.b.show(on)
 
 
 class HUD:
-    # Tower geometry, shared with the result card so the two tables read as
-    # the same table.
-    ROW_H = 0.058
-    TOWER_W = 0.470
-    COL_POS, COL_BAR, COL_NAME, COL_GAP, COL_BEST = 0.026, 0.0555, 0.072, 0.275, 0.388
-    #: A time penalty rides beside the best lap as its own tag. Amber and
-    #: slim, not a full-height red block: on a broadcast tower a pending
-    #: penalty is a small marker against the driver, and the red of this
-    #: overlay already belongs to the wordmark and the section rules -- a
-    #: solid red box beside every lap time fought all of it.
-    COL_PEN = 0.428
-    PEN_W, PEN_H = 0.066, 0.024
+    TOWER_W = 0.205
+    ROW_H = 0.0245
+    HEAD_H = 0.066
+    CHY_W = 0.400
+    LOW_H = 0.098            # height of the chyron
+    SPD_W, SPD_H = 0.400, 0.126
+    MAP_W, MAP_H = 0.230, 0.180
+    #: Seconds a row takes to slide most of the way to its new place.
+    SLIDE_RATE = 12.0
+    #: Tower chips: padding either side of the text, and the gap to the
+    #: tower and between two chips.
+    CHIP_PAD = 0.0055
+    CHIP_GAP = 0.003
+    #: Race-control box: narrowest it gets, and the widest it may grow to
+    #: (also held clear of the tower and its chips).
+    FLAG_W_MIN, FLAG_W_MAX = 0.40, 1.10
+    #: Its slide: how far up it starts and goes (off the top of the screen),
+    #: and the seconds the slide takes.
+    FLAG_HIDE_DY, FLAG_SLIDE_T = 0.10, 0.22
 
-    def __init__(self, track: Track, total_laps: int, mode: str = "gp"):
+    def __init__(self, track: Track, total_laps: int, mode: str = "gp",
+                 rows: int = 20):
         self.track = track
         self.total_laps = total_laps
-        #: Qualifying has no race distance and no result card; its lap
-        #: counter counts up, and the lap block carries a live delta.
         self.quali = mode == "quali"
-        # The UI plane spans x in [-aspect/2, +aspect/2], so a panel pinned at a
-        # fixed x is only in the right place at one aspect ratio. Panels are
-        # placed relative to the edge they belong to, and the whole HUD is
-        # rebuilt if the ratio changes, because the plates are baked into one
-        # merged mesh in root coordinates and cannot be moved afterwards.
+        self.n_rows = rows
         self._aspect = float(window.aspect_ratio)
         self.edge = self._aspect / 2.0
-        self.margin = config.HUD_MARGIN
+        self.margin = max(config.HUD_MARGIN, 0.026)
         self.circuit, self.full_name, self.country = caption(track.name)
-        self.font = pick_font()
         self.root = Entity(parent=camera.ui)
-        self._rpm = 0.0
-        self._shown = -1
-        self._lit = -1
-        #: Static text -- every label that never changes -- is collected here
-        #: during the build and then flattened into one node. Ursina gives each
-        #: Text its own node, its own draw call and its own shader bind; the
-        #: HUD had ~55 of them sitting idle every frame. Merged, they are one.
-        self._static_txt: list = []
 
-        self._batch = _QuadBatch()
-        self._dyn = _DynQuads()
-        # Collect static text only from the widgets that are on screen for the
-        # whole race. The flag, spectator strip and the two end cards are
-        # toggled and mostly hidden, so their labels cost nothing where they
-        # sit and must not be baked into an always-visible node.
-        self._collect_static = True
-        self._build_session_bar()
+        # What never changes after the build, and what changes every frame:
+        # a new value re-uploads only the live buffers.
+        self.S = ShapeLayer("hud_static")
+        self.D = ShapeLayer("hud_live")
+        self.T = TextLayer("hud_text")
+        self.L = TextLayer("hud_text_live")
+        self._rpm = 0.0
+        self._lit = -1
+        self._last_seen = None
+        self._flash_until = -1.0
+        self._flash_col = WHITE
+
         self._build_tower()
-        self._build_laptime()
-        self._build_telemetry()
-        self._build_minimap(track)
-        self._collect_static = False
-        self._build_flag()
+        self._build_chyron()
+        self._build_speed()
         if config.SHOW_KEY_HINTS:
             self._build_keys()
-        self._batch.build(self.root)
-        self._dyn.build(self.root)
-        self._freeze_static_text()
+        self.S.build(self.root, sort=0)
+        self.D.build(self.root, sort=1)
+        self.T.build(self.root, sort=20)
+        self.L.build(self.root, sort=21)
+
+        self._build_minimap(track)
         self._build_lights()
+        self._build_flag()
+        self._build_yellow_frame()
         self._build_spectator()
         self._build_finish()
         self._build_pause()
 
-    # -- primitives -----------------------------------------------------
-    def _txt(self, s, *, size=1.0, col=WHITE, pos=(0, 0), origin=(-0.5, 0),
-             parent=None, z=-0.1, static=True):
-        t = Text(s, parent=parent if parent is not None else self.root,
-                 font=self.font, scale=size, color=col, origin=origin,
-                 position=(pos[0], pos[1], z))
-        if static and self._collect_static:
-            self._static_txt.append(t)
-        return t
-
-    def _freeze_static_text(self):
-        """Bake every collected static label into one merged, static node.
-
-        Ursina attaches a live ``TextNode`` per label -- its own scene-graph
-        node, its own draw call, its own shader bind, re-evaluated every frame
-        for text that never changes. ``TextNode.generate()`` turns each into
-        plain glyph geometry; reparented under one holder and flattened, the
-        whole set -- same font page, same shader -- collapses to a single
-        Geom. Nothing about what is drawn changes.
-        """
-        from panda3d.core import TransparencyAttrib
-        from ursina.shaders.text_shader import text_shader
-
-        holder = Entity(parent=self.root, name="hud_static_text")
-        shdr = getattr(text_shader, "_shader", None)
-        if shdr is not None:
-            holder.setShader(shdr)
-            for k, v in text_shader.default_input.items():
-                holder.setShaderInput(k, v)
-        holder.setTransparency(TransparencyAttrib.MAlpha)
-
-        for t in self._static_txt:
-            for tnp in list(getattr(t, "text_nodes", [])):
-                try:
-                    geom = tnp.node().generate()
-                except Exception:
-                    continue
-                np = holder.attachNewNode(geom)
-                np.setMat(tnp.getMat(self.root))
-            destroy_tree(t)
-        self._static_txt = []
-        holder.flattenStrong()
-
-    def _root_xy(self, e) -> tuple[float, float]:
-        """Offset of an anchor entity from the HUD root, however deep it sits.
-
-        The batch bakes plates in root coordinates, so it needs the anchor's
-        position *relative to the root*, not to its own parent. Reading just
-        ``parent.x`` put the tower's position blocks -- anchored to a row
-        inside the tower -- at the row's local offset from the screen centre:
-        a pair of grey boxes floating over the car.
-        """
-        x = y = 0.0
-        while e is not None and e is not self.root:
-            x += float(e.x)
-            y += float(e.y)
-            e = e.parent
-        return x, y
-
-    def _plate(self, parent, w, h, pos, col=GLASS, angle=0.0):
-        """A static panel. angle=0 is a rectangle; the session bar leans."""
-        z = pos[2] if len(pos) > 2 else 0.1
-        px, py = self._root_xy(parent)
-        self._batch.add(px - self._batch.ox + pos[0],
-                        py - self._batch.oy + pos[1], z, w, h, angle, col)
-
-    def _rect(self, parent, w, h, pos, col, z=0.06):
-        """A static axis-aligned block, batched with the plates."""
-        px, py = self._root_xy(parent)
-        self._batch.add(px - self._batch.ox + pos[0],
-                        py - self._batch.oy + pos[1], z, w, h, 0.0, col)
-
-    def _dyn_quad(self, parent, w, h, pos, col, z=0.03):
-        """A block that only ever changes colour, merged into ``_dyn``."""
-        px, py = self._root_xy(parent)
-        return self._dyn.add(px + pos[0], py + pos[1], z, w, h, col)
-
-    @staticmethod
-    def _quad(parent, w, h, pos, col, z=0.03, origin=(0, 0)):
-        """A block whose colour or size changes at runtime: its own entity."""
-        return Entity(parent=parent, model="quad", color=col, origin=origin,
-                      scale=(w, h), position=(pos[0], pos[1], z))
-
-    # -- session bar (top-left) ------------------------------------------
-    def _build_session_bar(self):
-        """One leaning strip: wordmark, lap, circuit, clock, edge to edge.
-
-        Every segment is a parallelogram of the same height and slant, laid
-        end to end, so the red tile runs straight into the lap counter the way
-        a broadcast lower-third does -- no seam, no gap.
-        """
-        H = 0.068
-        s = math.tan(math.radians(SLANT_DEG)) * H / 2   # the lean, in x
-        b = Entity(parent=self.root,
-                   position=(-self.edge + self.margin + s, 0.455, 0))
-        x = 0.0
-        # The wordmark tile, in the slot the broadcast keeps for the F1 logo.
-        # Short form here -- the full name does not fit the tile at a legible
-        # size, and the menu still carries it in full.
-        w = 0.096
-        self._plate(b, w, H, (x + w / 2, 0, 0.1), col=RED, angle=SLANT_DEG)
-        # Drawn several times at sub-pixel offsets: this font has no bold
-        # weight, and a wordmark is the one piece of type on screen that has to
-        # carry at a glance.
-        for dx, dy in ((0.0, 0.0), (0.0009, 0.0), (-0.0009, 0.0),
-                       (0.0, 0.0007), (0.0, -0.0007)):
-            self._txt("F-AI", size=1.25, pos=(x + w / 2 + dx, -0.001 + dy),
-                      origin=(0, 0), parent=b)
-        x += w
-        # Lap counter.
-        w = 0.165
-        self._plate(b, w, H, (x + w / 2, 0, 0.1), angle=SLANT_DEG)
-        self._txt(spaced("lap"), size=0.56, col=GREY, pos=(x + 0.020, 0.0),
-                  parent=b)
-        self.lap = self._txt("1/3", size=1.55, pos=(x + w - 0.024, -0.003),
-                             origin=(0.5, 0), parent=b, static=False)
-        x += w
-        # Circuit.
-        self._plate(b, 0.012, H * 0.62, (x, 0, 0.05), col=GLASS_HI,
-                    angle=SLANT_DEG)
-        w = 0.268
-        self._plate(b, w, H, (x + w / 2, 0, 0.1), angle=SLANT_DEG)
-        self._txt(self.circuit, size=1.12, pos=(x + 0.020, 0.011), parent=b)
-        sub = self.country if self.full_name.upper() == self.circuit \
-            else f"{self.country}  ·  {self.full_name.upper()}"
-        self._txt(sub, size=0.50, col=GREY, pos=(x + 0.017, -0.016), parent=b)
-        x += w
-        # Session clock.
-        self._plate(b, 0.012, H * 0.62, (x, 0, 0.05), col=GLASS_HI,
-                    angle=SLANT_DEG)
-        w = 0.150
-        self._plate(b, w, H, (x + w / 2, 0, 0.1), angle=SLANT_DEG)
-        self._txt(spaced("session"), size=0.50, col=GREY,
-                  pos=(x + 0.020, 0.014), parent=b)
-        self.clock = self._txt("00:00", size=1.0, pos=(x + 0.020, -0.014),
-                               parent=b, static=False)
-        self._bar_bottom = 0.455 - H / 2
-
-    # -- timing tower (left) ----------------------------------------------
+    # -- tower (top-left) ------------------------------------------------------
     def _build_tower(self):
+        S, D, T, L = self.S, self.D, self.T, self.L
         W, RH = self.TOWER_W, self.ROW_H
-        top = self._bar_bottom - 0.012
-        t = Entity(parent=self.root, position=(-self.edge + self.margin, top, 0))
-        # Column header.
-        hh = 0.026
-        self._plate(t, W, hh, (W / 2, -hh / 2, 0.1), col=pal.rgb(12, 12, 18, 232))
-        y = -hh / 2
-        for label, x, org in ((spaced("pos"), self.COL_POS, (0, 0)),
-                              (spaced("driver"), self.COL_NAME, (-0.5, 0)),
-                              (spaced("gap"), self.COL_GAP, (0.5, 0)),
-                              (spaced("best lap"), self.COL_BEST, (0.5, 0))):
-            self._txt(label, size=0.46, col=GREY_DIM, pos=(x, y), origin=org,
-                      parent=t)
+        x0 = -self.edge + self.margin
+        top = 0.5 - self.margin
+        hh = self.HEAD_H
+        self._tx0 = x0
+        S.rect(x0, top - hh, W, hh, BG)
+        # The mark where the broadcast keeps its logo (logo.py).
+        self._logo(self.root, x0 + 0.050, top - 0.024, 0.030)
+        # Qualifying is a fixed number of timed laps too, so both count laps.
+        T.label("QUALIFYING" if self.quali else "LAP", x0 + 0.012,
+                top - 0.057, 0.0084 if self.quali else 0.0094,
+                weight="semibold", col=GREY, track=0.0012)
+        self.t_head = L.label("1/3", x0 + W - 0.012, top - 0.059, 0.0170,
+                              weight="bold", align="right", cap=8, mono=True)
+        # Status strip: green racing, yellow under a yellow flag, a
+        # chequer at the finish.
+        sy = top - hh - 0.005
+        self.strip = D.rect(x0, sy, W, 0.005, STRIP_IDLE)
+        self.strip_chq = []
+        n_chq = 16
+        cw = W / n_chq
+        for k in range(n_chq):
+            for j in (0, 1):
+                col = WHITE if (k + j) % 2 == 0 else INK
+                sq = D.rect(x0 + k * cw, sy + j * 0.0025, cw, 0.0025, col)
+                sq.show(False)
+                self.strip_chq.append(sq)
+        # Column caption: what the right-hand column is showing.
+        my = sy - 0.017
+        S.rect(x0, my, W, 0.017, BG)
+        self.t_mode = L.label("INTERVAL", x0 + W - 0.010, my + 0.0055, 0.0068,
+                              weight="semibold", align="right", col=DIM, cap=8,
+                              track=0.0010)
+        self._rows_top = my
+        # Slots: the position numbers stay put; the cars move between them.
+        self.slots = []
+        for k in range(self.n_rows):
+            yb = my - (k + 1) * RH
+            S.rect(x0, yb, W, RH, BG_ROW if k % 2 == 0 else BG_ROW2)
+            S.rect(x0, yb, 0.026, RH, RED if k == 0 else BG)
+            lab = T.label(str(k + 1), x0 + 0.013, yb + RH / 2 - 0.0053, 0.0106,
+                          weight="bold", align="center", cap=2)
+            self.slots.append(lab)
+        S.rect(x0, my - self.n_rows * RH - 0.0015, W, 0.0015, RULE)
+        # Car rows, all built in the first slot and moved down to theirs.
+        y0 = my - RH
+        cy = y0 + RH / 2
+        # Chips hang off the row's right edge (see _layout_chips).
+        cx0 = x0 + W + self.CHIP_GAP
+        self._chip_x0 = cx0
+        self._chip_h = RH - 0.007
         self.rows = []
-        for r in range(2):
-            cy = -hh - RH / 2 - r * (RH + 0.003)
-            row = Entity(parent=t, position=(0, cy, 0))
-            bg = self._quad(row, W, RH, (W / 2, 0), GLASS, z=0.08)
-            self._rect(row, 0.052, RH, (self.COL_POS, 0), PANEL_HI, z=0.07)
-            pos = self._txt("", size=1.3, pos=(self.COL_POS, -0.002),
-                            origin=(0, 0), parent=row, static=False)
-            bar = self._quad(row, 0.007, RH, (self.COL_BAR, 0), TEAM_YOU, z=0.05)
-            tla = self._txt("", size=1.08, pos=(self.COL_NAME, 0.009), parent=row,
-                            static=False)
-            name = self._txt("", size=0.46, col=GREY, pos=(self.COL_NAME, -0.015),
-                             parent=row, static=False)
-            gap = self._txt("", size=0.92, pos=(self.COL_GAP, -0.001),
-                            origin=(0.5, 0), parent=row, static=False)
-            best = self._txt("", size=0.78, pos=(self.COL_BEST, -0.001),
-                             origin=(0.5, 0), parent=row, static=False)
-            pen = Entity(parent=row, position=(self.COL_PEN, 0, 0),
-                         enabled=False)
-            self._quad(pen, self.PEN_W, self.PEN_H, (0, 0), AMBER, z=0.04)
-            pen_txt = self._txt("", size=0.58, pos=(0, -0.0005), origin=(0, 0),
-                                col=INK, parent=pen, static=False)
-            self.rows.append(dict(row=row, bg=bg, pos=pos, bar=bar, tla=tla,
-                                  name=name, gap=gap, best=best, pen=pen,
-                                  pen_txt=pen_txt))
+        for r in range(self.n_rows):
+            row = dict(
+                hl=D.rect(x0 + 0.026, y0, W - 0.026, RH, HILITE),
+                bar=D.rect(x0 + 0.030, y0 + RH * 0.2, 0.0034, RH * 0.6, TEAM_YOU),
+                fast=D.disc(x0 + 0.0865, cy, 0.0030, PURPLE, seg=10),
+                up=D.tri([(x0 + 0.0925, cy - 0.0030), (x0 + 0.0985, cy - 0.0030),
+                          (x0 + 0.0955, cy + 0.0034)], GREEN),
+                dn=D.tri([(x0 + 0.0925, cy + 0.0030), (x0 + 0.0985, cy + 0.0030),
+                          (x0 + 0.0955, cy - 0.0034)], RED),
+                pen_bg=D.rect(cx0, y0 + 0.0035, 0.034, self._chip_h, AMBER),
+                st_bg=D.rect(cx0, y0 + 0.0035, 0.030, self._chip_h, DRS_GREEN),
+                tla=L.label("", x0 + 0.039, cy - 0.0053, 0.0106, weight="bold",
+                            cap=3, track=0.0006),
+                chg=L.digits("", x0 + 0.1005, cy - 0.0035, 0.0072,
+                             weight="semibold", align="left", cap=2),
+                gap=L.digits("", x0 + W - 0.008, cy - 0.0048, 0.0096,
+                             weight="regular", cap=9),
+                word=L.label("", x0 + W - 0.008, cy - 0.0043, 0.0080,
+                             weight="semibold", align="right", cap=8, col=GREY,
+                             track=0.0008),
+                pen=L.label("", cx0 + self.CHIP_PAD, cy - 0.0040, 0.0080,
+                            weight="bold", col=INK, cap=6),
+                st=L.label("", cx0 + self.CHIP_PAD, cy - 0.0040, 0.0078,
+                           weight="bold", col=INK, cap=4),
+                key=None, dy=0.0, target=0.0, shown=False, state={},
+                chip_y=y0 + 0.0035)
+            for k in ("hl", "bar", "fast", "up", "dn", "pen_bg", "st_bg"):
+                row[k].show(False)
+            row["base"] = {k: (row[k].x, row[k].y)
+                           for k in ("tla", "chg", "gap", "word", "pen", "st")}
+            self.rows.append(row)
+        self._row_of: dict = {}
 
-    # -- lap-time block (top-right) ---------------------------------------
-    def _build_laptime(self):
-        W = 0.340
-        top = 0.455 + 0.034
-        r = Entity(parent=self.root,
-                   position=(self.edge - self.margin - W, top, 0))
-        self._plate(r, W, 0.200, (W / 2, -0.100, 0.1))
-        # Header strip with a red tag, the way the onboard "LAP TIME" graphic
-        # is captioned.
-        self._rect(r, W, 0.026, (W / 2, -0.013), pal.rgb(12, 12, 18, 232), z=0.08)
-        self._rect(r, 0.118, 0.026, (0.059, -0.013), RED, z=0.07)
-        self._txt(spaced("lap time"), size=0.50, pos=(0.059, -0.013),
-                  origin=(0, 0), parent=r)
-        # Qualifying: the live gap to the ghost lap at this point on the lap,
-        # green when ahead of it.
-        self.delta = self._txt("", size=0.62, pos=(W - 0.016, -0.013),
-                               origin=(0.5, 0), parent=r, static=False)
-        # Current, big and amber, the sector lights beneath it.
-        self._txt(spaced("current"), size=0.52, col=GREY, pos=(0.016, -0.059),
-                  parent=r)
-        self.cur = self._txt(lap_time(None), size=1.5, col=AMBER,
-                             pos=(W - 0.016, -0.061), origin=(0.5, 0), parent=r,
-                             static=False)
-        self.sectors = []
-        bw = (W - 0.032 - 0.016) / 3
+    def _logo(self, parent, cx, cy, h, mono=None, sort=15, z=0.0):
+        """The drawn F-AI mark, centred on (cx, cy), *h* tall."""
+        from panda3d.core import TransparencyAttrib
+
+        from . import logo
+        tex = logo.texture(96, mono=mono)
+        w = h * tex.get_x_size() / tex.get_y_size()
+        e = Entity(parent=parent, model="quad", scale=(w, h),
+                   position=(cx, cy, z))
+        e.set_texture(tex, 10)
+        e.set_transparency(TransparencyAttrib.M_alpha)
+        e.set_depth_test(False)
+        e.set_depth_write(False)
+        e.set_bin("fixed", sort)
+        return e
+
+    # -- driver chyron (bottom-right) -------------------------------------------
+    def _build_chyron(self):
+        S, D, L = self.S, self.D, self.L
+        W, H = self.CHY_W, self.LOW_H
+        # In the bottom-right corner, out of the way of the telemetry, which
+        # sits in the middle where the eye already is.
+        x0 = self.edge - self.margin - W
+        y0 = -0.5 + self.margin
+        name_h, time_h = 0.032, 0.050
+        sec_h = H - name_h - time_h
+        yn = y0 + sec_h + time_h
+        self._chy = (x0, y0, W, H)
+        # Name strip: a white position block, the team mark, the name.
+        S.rect(x0, yn, W, name_h, BG)
+        S.rect(x0, yn, 0.034, name_h, WHITE)
+        self.c_bar = D.rect(x0 + 0.034, yn, 0.005, name_h, TEAM_YOU)
+        self.c_pos = L.label("1", x0 + 0.017, yn + name_h / 2 - 0.0072,
+                             0.0144, weight="bold", align="center",
+                             col=INK, cap=2)
+        self.c_name = L.label("PLAYER", x0 + 0.049, yn + name_h / 2 - 0.0068,
+                              0.0136, weight="bold", cap=14, track=0.0008)
+        self.c_lap = L.label("", x0 + W - 0.012, yn + name_h / 2 - 0.0054,
+                             0.0105, weight="semibold", align="right", col=GREY,
+                             cap=14, track=0.0010)
+        # Time row: the running time, big; the time to beat at the right.
+        yt = y0 + sec_h
+        S.rect(x0, yt, W, time_h, BG_ROW)
+        self.c_time = L.digits("", x0 + 0.016 + 8 * 0.0, yt + 0.013, 0.0270,
+                               weight="bold", align="left", cap=9)
+        self.c_time_word = L.label("", x0 + 0.016, yt + 0.013, 0.0230,
+                                   weight="bold", cap=8)
+        self.c_delta_bg = D.rect(x0 + 0.172, yt + 0.013, 0.078, 0.024, GREEN)
+        self.c_delta = L.digits("", x0 + 0.244, yt + 0.0195, 0.0118,
+                                weight="bold", col=WHITE, cap=8)
+        self.c_target = L.digits("", x0 + W - 0.014, yt + 0.027, 0.0150,
+                                 weight="semibold", cap=9)
+        self.c_target_who = L.label("", x0 + W - 0.014, yt + 0.010, 0.0090,
+                                    weight="semibold", align="right", col=GREY,
+                                    cap=18, track=0.0010)
+        # Sector bars.
+        S.rect(x0, y0, W, sec_h, BG_ROW)
+        gap = 0.005
+        bw = (W - 0.032 - 2 * gap) / 3
+        self.c_sectors = []
         for k in range(3):
-            cx = 0.016 + bw / 2 + k * (bw + 0.008)
-            self.sectors.append(self._dyn_quad(r, bw, 0.011, (cx, -0.104),
-                                               SECTOR_COL["off"], z=0.05))
-            self._txt(f"S{k + 1}", size=0.40, col=GREY_DIM,
-                      pos=(cx - bw / 2, -0.118), parent=r)
-        self._rect(r, W - 0.032, 0.0015, (W / 2, -0.127), GLASS_HI, z=0.07)
-        self._txt(spaced("last"), size=0.52, col=GREY, pos=(0.016, -0.147),
-                  parent=r)
-        self.last = self._txt(lap_time(None), size=1.0, pos=(W - 0.016, -0.147),
-                              origin=(0.5, 0), parent=r, static=False)
-        self._txt(spaced("best"), size=0.52, col=GREY, pos=(0.016, -0.181),
-                  parent=r)
-        self.best = self._txt(lap_time(None), size=1.0, col=PURPLE,
-                              pos=(W - 0.016, -0.181), origin=(0.5, 0), parent=r,
-                              static=False)
+            self.c_sectors.append(D.rect(x0 + 0.016 + k * (bw + gap),
+                                         y0 + sec_h / 2 - 0.003, bw, 0.006,
+                                         SECTOR_COL["off"]))
 
-    # -- onboard telemetry (bottom-centre) --------------------------------
-    BAR_H = 0.096            # throttle / brake bar travel
-
-    def _build_telemetry(self):
-        W, H = 0.400, 0.150
-        s = Entity(parent=self.root, position=(0, -0.375, 0))
-        self._plate(s, W, H, (0, 0, 0.1))
-        self._rect(s, W, 0.004, (0, H / 2 - 0.002), RED, z=0.07)
-
-        # Shift lights across the top, lit left to right with the revs.
-        self.leds = []
-        pitch = 0.019
-        for k in range(N_LEDS):
-            x = (k - (N_LEDS - 1) / 2) * pitch
-            self.leds.append(self._dyn_quad(s, 0.015, 0.008, (x, 0.058), LED_OFF,
-                                            z=0.04))
-        self._led_col = ([LED_GREEN] * 4 + [LED_RED] * 4 + [LED_BLUE] * 4)
-
-        # Speed: one Text per digit on a fixed pitch. Bahnschrift's figures are
-        # not tabular -- a single Text changes width on almost every update and
-        # the number visibly breathes. Each digit centred in its own slot
-        # cannot. The slots are laid out around x = 0 for however many digits
-        # are in use, so the block only re-centres crossing 10 or 100.
-        self.digits = [Text("", parent=s, font=self.font, scale=2.7, color=WHITE,
-                            origin=(0, 0), position=(0, 0.004, -0.1))
-                       for _ in range(3)]
-        self._txt(spaced("km/h"), size=0.50, col=GREY, pos=(0, -0.041),
-                  origin=(0, 0), parent=s)
-        # Steering, a travelling block on a bar.
-        self._rect(s, 0.130, 0.008, (0, -0.062), GLASS_HI, z=0.06)
-        self._rect(s, 0.002, 0.014, (0, -0.062), GREY_DIM, z=0.05)
-        self.st_dot = self._quad(s, 0.010, 0.014, (0, -0.062), WHITE, z=0.03)
-
-        # Throttle and brake, vertical bars filling upward from a shared floor.
-        self._rect(s, 0.0015, 0.100, (-0.100, -0.006), GLASS_HI, z=0.06)
-        for name, col, x, lab in (("p_thr", GREEN, -0.160, "thr"),
-                                  ("p_brk", RED, -0.130, "brk")):
-            self._rect(s, 0.020, self.BAR_H, (x, -0.006), pal.rgb(58, 60, 76, 200),
-                       z=0.06)
-            setattr(self, name, self._quad(s, 0.020, 0.001, (x, -0.054), col,
-                                           z=0.03, origin=(0, -0.5)))
-            self._txt(spaced(lab), size=0.36, col=GREY_DIM, pos=(x, -0.066),
-                      origin=(0, 0), parent=s)
-
-        # Gear, with the driver-aid and slip badges beside it.
-        self._rect(s, 0.0015, 0.100, (0.092, -0.006), GLASS_HI, z=0.06)
-        self.gear = self._txt("N", size=2.1, pos=(0.126, 0.008), origin=(0, 0),
-                              parent=s, static=False)
-        self._txt(spaced("gear"), size=0.44, col=GREY, pos=(0.126, -0.041),
-                  origin=(0, 0), parent=s)
-        self.aid_txt = self._txt("", size=0.44, pos=(0.172, 0.018), origin=(0, 0),
-                                 parent=s, static=False)
-        self.slip_txt = self._txt("", size=0.44, col=AMBER, pos=(0.172, -0.014),
-                                  origin=(0, 0), parent=s, static=False)
-
-    # -- track map (bottom-right) -----------------------------------------
-    def _build_minimap(self, track: Track):
-        lo, hi = track.bounds()
-        span = float(max(hi[0] - lo[0], hi[1] - lo[1])) or 1.0
-        self._mm_scale = 0.18 / span
-        self._mm_cx = (hi[0] + lo[0]) / 2
-        self._mm_cz = (hi[1] + lo[1]) / 2
-
-        W, H = 0.270, 0.250
-        m = Entity(parent=self.root,
-                   position=(self.edge - self.margin - W / 2, -0.325, 0))
-        self.minimap = m
-        self._plate(m, W, H, (0, 0, 0.1))
-        self._rect(m, W, 0.004, (0, H / 2 - 0.002), RED, z=0.07)
-        # Legend, bottom-left corner of the map.
-        for k, (lab, col) in enumerate(((" YOU", TEAM_YOU), (" AI", TEAM_AI))):
-            x = -W / 2 + 0.020 + k * 0.058
-            Entity(parent=m, model="circle", scale=0.010, color=col,
-                   position=(x, -H / 2 + 0.018, -0.02))
-            self._txt(lab, size=0.44, col=GREY, pos=(x + 0.006, -H / 2 + 0.018),
-                      parent=m)
-
-        # Decimated. The centreline has over a thousand samples; drawn into a
-        # widget 0.2 units across that is a thick line segment per one-fifth of
-        # a pixel. ~180 points traces the same shape.
-        step = max(1, len(track.center) // config.MINIMAP_POINTS)
-        pts = [Vec3(*self._to_mm(p), 0) for p in track.center[::step]]
-        pts.append(pts[0])
-        Entity(parent=m, model=Mesh(vertices=pts, mode="line", thickness=3),
-               color=WHITE, z=-0.01, y=0.008)
-        s, t = track.center[0], track.normal[0]
-        half = span * 0.035
-        Entity(parent=m, color=RED, z=-0.02, y=0.008,
-               model=Mesh(vertices=[Vec3(*self._to_mm(s - t * half), 0),
-                                    Vec3(*self._to_mm(s + t * half), 0)],
-                          mode="line", thickness=6))
-        # The AI under the player's dot rather than over it: when the two are
-        # together the one you are driving is the one you need to see.
-        self.mm_ghost = Entity(parent=m, model="circle", scale=0.017,
-                               color=TEAM_AI, position=(0, 0, -0.03),
-                               enabled=False)
-        self.mm_dot = Entity(parent=m, model="circle", scale=0.020,
-                             color=TEAM_YOU, position=(0, 0, -0.04))
-
-    def _to_mm(self, xz):
-        """Track world (x, z) -> minimap-local (u, v)."""
-        u = (float(xz[0]) - self._mm_cx) * self._mm_scale
-        v = (float(xz[1]) - self._mm_cz) * self._mm_scale
-        return float(u), float(v)
-
-    # -- flags, lower-third, start lights, keys ----------------------------
-    def _build_flag(self):
-        """A marshal's flag: OFF TRACK on yellow; WRONG WAY, LAP INVALID and
-        penalties on red."""
-        f = Entity(parent=self.root,
-                   position=(-self.edge + self.margin + 0.160, -0.410, 0),
-                   enabled=False)
-        self.flag = f
-        self.flag_plate = Entity(parent=f, model=skew_quad(0.320, 0.050),
-                                 color=YELLOW, position=(0, 0, 0.05))
-        self.flag_txt = self._txt("", size=0.86, col=INK, pos=(0.004, 0),
-                                  origin=(0, 0), parent=f)
-
-    def _build_spectator(self):
-        """The lower-third that comes up when the camera is on the AI."""
-        c = Entity(parent=self.root,
-                   position=(-self.edge + self.margin, -0.410, 0), enabled=False)
-        self.spectator = c
-        self._batch = _QuadBatch(c.x, c.y)
-        self._plate(c, 0.070, 0.072, (0.035, 0, 0.1), col=RED)
-        self._txt("AI", size=1.35, pos=(0.035, -0.002), origin=(0, 0), parent=c)
-        self._plate(c, 0.330, 0.072, (0.070 + 0.165, 0, 0.1))
-        self._txt("AI DRIVER", size=1.1, pos=(0.086, 0.011), parent=c)
-        self._txt(spaced("onboard") + "   ·   "
-                  + spaced("ghost lap" if self.quali else "trained policy"),
-                  size=0.46, col=GREY, pos=(0.086, -0.017), parent=c)
-        Entity(parent=c, model="circle", scale=0.011, color=RED,
-               position=(0.382, 0.011, -0.02))
-        self._txt(spaced("live"), size=0.44, col=RED, pos=(0.366, 0.011),
-                  origin=(0.5, 0), parent=c)
-        self._batch.build(c)
-        self._batch = _QuadBatch()
-
-    def _build_lights(self):
-        """Five round lamps on a gantry. They come on one by one and go out
-        together.
-
-        Each lamp is its own ``Circle`` mesh, and it is recoloured with
-        ``model.setColorScale`` (see ``_lamp``), not ``entity.color``:
-        assigning ``.color`` on a nested ``Circle`` renders grey -- only a
-        colour scale straight on the mesh node takes.
-        """
-        self._gantry_y0 = 0.150
-        g = Entity(parent=self.root, position=(0, self._gantry_y0, 0),
-                   enabled=False)
-        self.gantry = g
-        Entity(parent=g, model="quad", color=pal.rgb(12, 12, 18),
-               scale=(0.470, 0.120), position=(0, 0, 0.03))
-        Entity(parent=g, model="quad", color=RED,
-               scale=(0.470, 0.005), position=(0, 0.060, 0.02))
-        self.lamps = []
-        for k in range(5):
-            x = (k - 2) * 0.088
-            Entity(parent=g, model=_disc(), color=pal.rgb(34, 34, 42),
-                   scale=0.088, position=(x, 0, 0.01))
-            lamp = Entity(parent=g, model=_disc(), scale=0.070,
-                          position=(x, 0, 0.0))
-            self._lamp(lamp, LAMP_OFF)
-            self.lamps.append(lamp)
-
-    @staticmethod
-    def _lamp(lamp, col):
-        """Colour one lamp. A colour scale on the mesh node -- ``.color`` on a
-        nested Circle does not render."""
-        m = lamp.model
-        m.setColorScaleOff()
-        m.setColorScale(col)
-        lamp._lit_col = col
+    # -- telemetry (bottom-centre) ---------------------------------------------
+    def _build_speed(self):
+        """Speed, gear, revs and pedals, big, in the middle of the bottom
+        edge -- right under the car, where a glance from the road finds it."""
+        S, D, T, L = self.S, self.D, self.T, self.L
+        W, H = self.SPD_W, self.SPD_H
+        x0, x1 = -W / 2, W / 2
+        y0 = -0.5 + self.margin
+        head = 0.028
+        S.rect(x0, y0 + H - head, W, head, BG)
+        self.s_bar = D.rect(x0, y0 + H - head, 0.006, head, TEAM_YOU)
+        self.s_name = L.label("PLAYER", x0 + 0.018, y0 + H - head / 2 - 0.0058,
+                              0.0116, weight="bold", cap=14, track=0.0012)
+        self.s_aid = L.label("", x1 - 0.014, y0 + H - head / 2 - 0.0055,
+                             0.0108, weight="bold", align="right", col=AMBER,
+                             cap=10, track=0.0010)
+        self.s_slip = L.label("", x1 - 0.100, y0 + H - head / 2 - 0.0055,
+                              0.0108, weight="bold", align="right", col=AMBER,
+                              cap=10, track=0.0010)
+        body = H - head
+        S.rect(x0, y0, W, body, BG_ROW)
+        # Rev lights across the top of the body.
+        lw = (W - 0.030) / N_LEDS
+        self.leds = [D.rect(x0 + 0.015 + k * lw + 0.0010, y0 + body - 0.014,
+                            lw - 0.0020, 0.0075, LED_OFF)
+                     for k in range(N_LEDS)]
+        # Throttle and brake, filling upwards, with their labels under them.
+        self.bar_h = body - 0.040
+        self._bar_y = y0 + 0.020
+        for name, col, x, lab in (("p_thr", GREEN, x0 + 0.016, "THR"),
+                                  ("p_brk", RED, x0 + 0.044, "BRK")):
+            S.rect(x, self._bar_y, 0.013, self.bar_h, pal.rgb(54, 56, 70, 220))
+            setattr(self, name, D.rect(x, self._bar_y, 0.013, self.bar_h, col))
+            T.label(lab, x + 0.0065, y0 + 0.008, 0.0066, weight="semibold",
+                    align="center", col=DIM, track=0.0004)
+        # Speed, in fixed digit cells so it does not breathe; the unit beside.
+        self.s_speed = L.digits("0", x0 + 0.232, y0 + 0.022, 0.054,
+                                weight="bold", cap=3)
+        T.label("KM/H", x0 + 0.240, y0 + 0.022, 0.0120, weight="semibold",
+                col=GREY, track=0.0016)
+        # Gear, in its own block.
+        gw = 0.070
+        gx = x1 - 0.014 - gw
+        S.rect(gx, y0 + 0.010, gw, body - 0.030, BG_HI)
+        self.s_gear = L.label("N", gx + gw / 2, y0 + 0.024, 0.040,
+                              weight="bold", align="center", cap=1)
+        T.label("GEAR", gx + gw / 2, y0 + 0.013, 0.0070, weight="semibold",
+                align="center", col=DIM, track=0.0010)
 
     def _build_keys(self):
-        """The key legend, as keycaps rather than a line of text."""
-        y = -0.481
-        self._rect(self.root, 4.0, 0.038, (0, y), pal.rgb(12, 12, 18, 228), z=0.2)
-        # Estimated widths; they only set the spacing.
-        cw = 0.0072
-        items = []
-        for key, label in KEYS:
-            tw = 0.012 + 0.0080 * len(key)
-            items.append((key, label, tw, cw * len(label)))
-        total = sum(tw + 0.008 + lw for _, _, tw, lw in items) + 0.030 * (len(items) - 1)
-        x = -total / 2
-        for key, label, tw, lw in items:
-            self._rect(self.root, tw, 0.024, (x + tw / 2, y), KEYCAP, z=0.15)
-            self._txt(key, size=0.50, pos=(x + tw / 2, y), origin=(0, 0))
-            self._txt(label, size=0.50, col=GREY, pos=(x + tw + 0.008, y))
-            x += tw + 0.008 + lw + 0.030
+        line = "     ".join(f"{k} {v}" for k, v in KEYS)
+        self.T.label(line, 0.0, 0.5 - self.margin - 0.012, 0.0090,
+                     weight="semibold", align="center", col=GREY,
+                     track=0.0008)
 
-    # -- cards ----------------------------------------------------------
+    # -- track map (bottom-left) -------------------------------------------------
+    def _build_minimap(self, track: Track):
+        lo, hi = track.bounds()
+        W, H = self.MAP_W, self.MAP_H
+        span = float(max((hi[0] - lo[0]) / W, (hi[1] - lo[1]) / H)) or 1.0
+        self._mm_scale = 0.84 / span
+        self._mm_cx = (hi[0] + lo[0]) / 2
+        self._mm_cz = (hi[1] + lo[1]) / 2
+        x0 = -self.edge + self.margin
+        y0 = -0.5 + self.margin
+        self._mm_o = (x0 + W / 2, y0 + H / 2)
+        m = Entity(parent=self.root)
+        self.minimap = m
+        S = ShapeLayer("map_shapes")
+        S.round_rect(x0, y0, W, H, 0.010, BG_SOFT)
+        step = max(1, len(track.center) // config.MINIMAP_POINTS)
+        pts = [self._to_mm(p) for p in track.center[::step]]
+        S.polyline(pts, 0.0085, pal.rgb(8, 8, 12, 210))
+        S.polyline(pts, 0.0034, pal.rgb(235, 235, 240))
+        # Start/finish, across the line.
+        s, n = track.center[0], track.normal[0]
+        a = self._to_mm(s - n * 30.0)
+        b = self._to_mm(s + n * 30.0)
+        S.polyline([a, b], 0.0040, RED, closed=False)
+        S.build(m, sort=4)
+        # The yellow-flag stretches, lit over the track line: one short
+        # piece per ~20 m of lap, shown where a zone covers it.
+        Y = ShapeLayer("map_yellow")
+        k = max(1, int(round(20.0 / max(float(np.median(track.seg_len)), 0.5))))
+        n = len(track.center)
+        self._mm_yel = []
+        spans = []
+        for i in range(0, n, k):
+            j = min(i + k, n) % n
+            mid = float(track.arclen[i]) + 0.5 * k * float(np.median(track.seg_len))
+            spans.append((self._to_mm(track.center[i]),
+                          self._to_mm(track.center[j]), mid % float(track.length)))
+        # A dark band under a wider yellow one: the cars' dots are drawn over
+        # the track and used to hide a narrow highlight. All the dark first,
+        # so one piece's band never cuts the next one's yellow.
+        dark = [Y.polyline([a, b], 0.0150, pal.rgb(8, 8, 12, 235), closed=False)
+                for a, b, _m in spans]
+        for (a, b, mid), d in zip(spans, dark):
+            seg = _Pair(d, Y.polyline([a, b], 0.0105, YELLOW, closed=False))
+            seg.show(False)
+            self._mm_yel.append((mid, seg))
+        Y.build(m, sort=5)
+        self.mm_Y = Y
+        self._mm_zones = ()
+        self._mm_L = float(track.length)
+        # The field's dots: one layer, moved every frame; the player on top.
+        F = ShapeLayer("map_dots")
+        self.mm_others = []
+        for _ in range(max(self.n_rows, 2)):
+            ring = F.disc(0, 0, 0.0070, INK, seg=10)
+            dot = F.disc(0, 0, 0.0050, TEAM_AI, seg=10)
+            ring.show(False)
+            dot.show(False)
+            self.mm_others.append((ring, dot))
+        self.mm_ring = F.disc(0, 0, 0.0110, INK, seg=16)
+        self.mm_dot = F.disc(0, 0, 0.0080, TEAM_YOU, seg=16)
+        F.build(m, sort=6)
+        self.mm_S = F
+        # Ring then dot, car by car: placed in one write (ShapeBatch).
+        self.mm_batch = ShapeBatch([s for pair in self.mm_others for s in pair])
+        self._mm_xy = np.full((2 * len(self.mm_others), 2), np.nan, np.float32)
+
+    def _to_mm(self, xz):
+        u = (float(xz[0]) - self._mm_cx) * self._mm_scale + self._mm_o[0]
+        v = (float(xz[1]) - self._mm_cz) * self._mm_scale + self._mm_o[1]
+        return (u, v)
+
+    # -- start lights -----------------------------------------------------------
+    def _build_lights(self):
+        """Five columns, two lamps each, on black: the broadcast's own start
+        graphic. They come on column by column and go out together."""
+        self._gantry_y0 = 0.0
+        g = Entity(parent=self.root, enabled=False)
+        self.gantry = g
+        S = ShapeLayer("lights")
+        uw, uh, gap = 0.060, 0.124, 0.010
+        total = 5 * uw + 4 * gap
+        top = 0.5 - self.margin - 0.050
+        self.lamps = []
+        for k in range(5):
+            x = -total / 2 + k * (uw + gap)
+            S.round_rect(x, top - uh, uw, uh, 0.008, pal.rgb(8, 8, 10, 242))
+            col = []
+            for j in (0, 1):
+                cy = top - uh / 2 + (0.028 if j == 0 else -0.028)
+                glow = S.disc(x + uw / 2, cy, 0.030, LAMP_GLOW, seg=20)
+                glow.show(False)
+                lamp = S.disc(x + uw / 2, cy, 0.0205, LAMP_OFF, seg=24)
+                col.append((glow, lamp))
+            self.lamps.append(col)
+        S.build(g, sort=8)
+        self.g_S = S
+        self._lit_n = -1
+
+    # -- in a yellow sector: the screen's edge pulses --------------------------
+    YF_T = 0.016            # frame thickness (screen height = 1)
+
+    def _build_yellow_frame(self):
+        f = Entity(parent=self.root, enabled=False)
+        self.yframe = f
+        S = ShapeLayer("yframe")
+        e, h, t = self.edge, 0.5, self.YF_T
+        self._yf = [S.rect(-e, h - t, 2 * e, t, YELLOW),
+                    S.rect(-e, -h, 2 * e, t, YELLOW),
+                    S.rect(-e, -h + t, t, 2 * h - 2 * t, YELLOW),
+                    S.rect(e - t, -h + t, t, 2 * h - 2 * t, YELLOW)]
+        S.build(f, sort=2)
+        self.yf_S = S
+        self._yf_t = 0.0
+        self._yf_on = False
+
+    def _animate_yellow_frame(self, on: bool, dt: float):
+        if not on:
+            if self._yf_on:
+                self._yf_on = False
+                self.yframe.enabled = False
+            return
+        if not self._yf_on:
+            self._yf_on = True
+            self.yframe.enabled = True
+        self._yf_t += dt
+        a = 0.42 + 0.30 * math.sin(self._yf_t * 2.0 * math.pi * 1.8)
+        r, g, b, _a = _rgba(YELLOW)
+        for sh in self._yf:
+            sh.color = (r, g, b, a)
+        self.yf_S.flush()
+
+    # -- race control (top-centre) ----------------------------------------------
+    def _build_flag(self):
+        """The stewards' box, top centre. It is as wide as what it is saying
+        (_fit_flag): the longest messages name a car and a reason, and a
+        fixed box either clipped them or sat half-empty for "OFF TRACK"."""
+        f = Entity(parent=self.root, enabled=False)
+        self.flag = f
+        S = ShapeLayer("flag")
+        W, H = self.FLAG_W_MIN, 0.058
+        self._flag_h = H
+        self._flag_y0 = y0 = 0.5 - self.margin - H - 0.004
+        # Wide enough to clear the tower and its chips either side.
+        clear = self.edge - self.margin - self.TOWER_W - 0.095
+        self._flag_wmax = max(self.FLAG_W_MIN, min(self.FLAG_W_MAX, 2 * clear))
+        x0 = -W / 2
+        self.flag_bg = S.rect(x0, y0, W, H, BG)
+        self.flag_sq = S.rect(x0, y0, H, H, YELLOW)
+        self.flag_rule = S.rect(x0 + H, y0 + H - 0.0016, W - H, 0.0016, RULE)
+        S.build(f, sort=10)
+        self.flag_S = S
+        T = TextLayer("flag_text")
+        self._flag_txt_size = 0.0136
+        self.flag_head = T.label("RACE CONTROL", x0 + H + 0.014, y0 + H - 0.019,
+                                 0.0090, weight="semibold", col=GREY,
+                                 track=0.0016, cap=34)
+        self.flag_txt = T.label("", x0 + H + 0.014, y0 + 0.012,
+                                self._flag_txt_size, weight="bold", cap=96,
+                                track=0.0006)
+        self.flag_icon = T.label("!", x0 + H / 2, y0 + H / 2 - 0.011, 0.022,
+                                 weight="bold", align="center", col=INK, cap=1)
+        T.build(f, sort=30)
+        self.flag_T = T
+        self._flag_key = None
+        self._flag_dy = self.FLAG_HIDE_DY
+
+    def _set_flag(self, key):
+        flag, style, head = key
+        self._flag_key = key
+        self.flag_head.set(head)
+        self.flag_txt.set(flag)
+        self._fit_flag()
+        self.flag_sq.color = FLAG_COL.get(style, YELLOW)
+        self.flag_icon.set(FLAG_ICON.get(style, "!"))
+        self.flag_S.flush()
+        self.flag_T.flush()
+
+    def _animate_flag(self, want, dt: float):
+        """The race-control box drops in from above the screen and goes
+        back up when it is done; a new message sends the old one up first
+        and comes down with the new one. A change to the heading alone (the
+        queue's "N MORE" counting down) is made in place."""
+        hide = self.FLAG_HIDE_DY
+        shown = self._flag_dy < hide and self.flag.enabled
+        cur = self._flag_key
+        if want is not None and not shown:
+            self._set_flag(want)                       # in from the top
+            self.flag.enabled = True
+            target = 0.0
+        elif want is None:
+            target = hide
+        elif cur is not None and want[:2] == cur[:2]:
+            if want[2] != cur[2]:
+                self._set_flag(want)
+            target = 0.0
+        else:
+            target = hide                              # out, then the new one
+            if self._flag_dy >= hide - 1e-4:
+                self._set_flag(want)
+                target = 0.0
+        step = hide / self.FLAG_SLIDE_T * dt
+        d = target - self._flag_dy
+        self._flag_dy += max(-step, min(step, d))
+        # Eased: fast to start, settling at either end.
+        f = self._flag_dy / hide
+        self.flag.y = hide * (f * f * (3.0 - 2.0 * f))
+        if self._flag_dy >= hide - 1e-4 and want is None and self.flag.enabled:
+            self.flag.enabled = False
+            self._flag_key = None
+
+    def _fit_flag(self):
+        """Size the race-control box to its text, centred; a line too long
+        even for the widest box is set smaller rather than run out of it."""
+        H, y0 = self._flag_h, self._flag_y0
+        pad_l, pad_r = 0.014, 0.020
+        room = self._flag_wmax - H - pad_l - pad_r
+        lab = self.flag_txt
+        lab.resize(self._flag_txt_size)
+        if lab.width > room:
+            lab.resize(self._flag_txt_size * room / lab.width)
+        text_w = max(lab.width, self.flag_head.width)
+        W = min(self._flag_wmax, max(self.FLAG_W_MIN, H + pad_l + text_w + pad_r))
+        x0 = -W / 2
+        self.flag_bg.set_rect(x0, y0, W, H)
+        self.flag_sq.set_rect(x0, y0, H, H)
+        self.flag_rule.set_rect(x0 + H, y0 + H - 0.0016, W - H, 0.0016)
+        self.flag_head.move(x0 + H + pad_l, self.flag_head.y)
+        lab.move(x0 + H + pad_l, lab.y)
+        self.flag_icon.move(x0 + H / 2, self.flag_icon.y)
+
+    # -- spectator tag ----------------------------------------------------------
+    def _build_spectator(self):
+        """The red tag over the chyron: whose onboard this is (G), and that
+        the camera is looking back (X). As wide as what it says."""
+        c = Entity(parent=self.root, enabled=False)
+        self.spectator = c
+        x0, y0, W, H = self._chy
+        S = ShapeLayer("spect")
+        self._spect_y = y0 + H + 0.006
+        self.spect_bg = S.rect(x0, self._spect_y, 0.190, 0.024, RED)
+        S.disc(x0 + 0.014, y0 + H + 0.018, 0.0036, WHITE, seg=12)
+        S.build(c, sort=10)
+        self.spect_S = S
+        T = TextLayer("spect_text")
+        self._spect_size = 0.0098
+        self.spect_lab = T.label("", x0 + 0.024, y0 + H + 0.0133,
+                                 self._spect_size, weight="bold",
+                                 track=0.0012, cap=64)
+        T.build(c, sort=30)
+        self.spect_T = T
+        self._spect_text = None
+
+    def _fit_spectator(self, text: str):
+        x0, _y0, W, _H = self._chy
+        lab = self.spect_lab
+        lab.set(text)
+        lab.resize(self._spect_size)
+        room = W - 0.024 - 0.012
+        if lab.width > room:
+            lab.resize(self._spect_size * room / lab.width)
+        self.spect_bg.set_rect(x0, self._spect_y, 0.024 + lab.width + 0.012, 0.024)
+        self.spect_S.flush()
+        self.spect_T.flush()
+
+    # -- cards ------------------------------------------------------------------
+    def _card_header(self, S, T, x0, top, W, title, parent, sort):
+        S.rect(x0, top - 0.048, W, 0.048, INK)
+        S.rect(x0, top - 0.048, 0.110, 0.048, RED)
+        self._logo(parent, x0 + 0.055, top - 0.024, 0.027,
+                   mono=(255, 255, 255, 255), sort=sort)
+        T.label(title, x0 + 0.126, top - 0.032, 0.0165, weight="bold",
+                track=0.0016)
+
     def _build_finish(self):
         """Result card: the classification, built once and hidden."""
-        f = Entity(parent=self.root, position=(0, 0.03, -0.2), enabled=False)
+        f = Entity(parent=self.root, z=-0.2, enabled=False)
         self.finish = f
-        W, H = 0.820, 0.390
-        self._batch = _QuadBatch(f.x, f.y)
-        # Opaque: a result card is a statement, not an overlay.
-        self._plate(f, W, H, (0, 0, 0.1), col=INK)
-        self._rect(f, W, 0.030, (0, H / 2 - 0.015), pal.rgb(12, 12, 18), z=0.08)
-        self._rect(f, 0.150, 0.030, (-W / 2 + 0.075, H / 2 - 0.015), RED, z=0.07)
-        self._txt(spaced("race result"), size=0.52, pos=(-W / 2 + 0.075, H / 2 - 0.015),
-                  origin=(0, 0), parent=f)
-        self._txt(self.circuit, size=1.7, pos=(-W / 2 + 0.036, 0.112), parent=f)
-        self._txt(f"{self.country}  ·  {self.total_laps} LAPS", size=0.52, col=GREY,
-                  pos=(-W / 2 + 0.036, 0.076), parent=f)
-        # Classification, on the tower's columns, spread to the wider card.
-        x0 = -W / 2 + 0.036
-        cols = dict(pos=x0 + 0.026, bar=x0 + 0.0555, name=x0 + 0.072,
-                    best=x0 + 0.470, gap=x0 + 0.720)
-        hy = 0.040
-        for label, x, org in ((spaced("pos"), cols["pos"], (0, 0)),
-                              (spaced("driver"), cols["name"], (-0.5, 0)),
-                              (spaced("best lap"), cols["best"], (0.5, 0)),
-                              (spaced("gap"), cols["gap"], (0.5, 0))):
-            self._txt(label, size=0.46, col=GREY_DIM, pos=(x, hy), origin=org,
-                      parent=f)
+        S, D, T = ShapeLayer("fin"), ShapeLayer("fin_live"), TextLayer("fin_text")
+        n = self.n_rows
+        RH = 0.0300 if n > 10 else 0.050
+        W = 0.800
+        H = 0.170 + n * RH
+        x0, top = -W / 2, H / 2
+        S.rect(x0, top - H, W, H, pal.rgb(14, 14, 20, 246))
+        self._card_header(S, T, x0, top, W,
+                          "QUALIFYING RESULT" if self.quali else "RACE RESULT",
+                          f, 42)
+        T.label(self.full_name.upper(), x0 + W - 0.018, top - 0.031, 0.0110,
+                weight="semibold", align="right", col=GREY, track=0.0012)
+        laps = f"{self.total_laps} LAP" + ("S" if self.total_laps != 1 else "")
+        T.label(f"{self.country}  ·  {laps}", x0 + 0.018,
+                top - 0.072, 0.0100, weight="semibold", col=GREY,
+                track=0.0012)
+        cols = dict(pos=x0 + 0.036, bar=x0 + 0.060, tla=x0 + 0.072,
+                    name=x0 + 0.130, team=x0 + 0.300, best=x0 + 0.560,
+                    gap=x0 + W - 0.024)
+        hy = top - 0.100
+        for lab, x, al in (("POS", cols["pos"], "center"),
+                           ("DRIVER", cols["tla"], "left"),
+                           ("TEAM", cols["team"], "left"),
+                           ("BEST LAP", cols["best"], "right"),
+                           ("GAP" if self.quali else "TIME / GAP",
+                            cols["gap"], "right")):
+            T.label(lab, x, hy, 0.0080, weight="semibold", align=al, col=DIM,
+                    track=0.0014)
         self.fin_rows = []
-        RH = 0.062
-        for r in range(2):
-            cy = hy - 0.020 - RH / 2 - r * (RH + 0.004)
-            row = Entity(parent=f, position=(0, cy, 0))
-            bg = self._quad(row, W - 0.060, RH, (0, 0), PANEL_HI, z=0.06)
-            pos = self._txt("", size=1.3, pos=(cols["pos"], -0.002), origin=(0, 0),
-                            parent=row)
-            bar = self._quad(row, 0.007, RH, (cols["bar"], 0), TEAM_YOU, z=0.04)
-            tla = self._txt("", size=1.1, pos=(cols["name"], 0.010), parent=row)
-            name = self._txt("", size=0.46, col=GREY, pos=(cols["name"], -0.015),
-                             parent=row)
-            best = self._txt("", size=1.05, pos=(cols["best"], -0.001),
-                             origin=(0.5, 0), parent=row)
-            gap = self._txt("", size=0.90, pos=(cols["gap"], -0.001),
-                            origin=(0.5, 0), parent=row)
-            pen = Entity(parent=row, position=(cols["best"] + 0.086, 0, 0),
-                         enabled=False)
-            self._quad(pen, 0.078, 0.028, (0, 0), AMBER, z=0.04)
-            pen_txt = self._txt("", size=0.66, pos=(0, -0.0005), origin=(0, 0),
-                                col=INK, parent=pen)
-            self.fin_rows.append(dict(bg=bg, pos=pos, bar=bar, tla=tla, name=name,
-                                      best=best, gap=gap, pen=pen,
-                                      pen_txt=pen_txt))
-        self._rect(f, W - 0.060, 0.0015, (0, -H / 2 + 0.058), PANEL_HI, z=0.05)
-        self._txt(spaced("enter") + "   or   " + spaced("esc")
-                  + "        BACK TO MENU", size=0.60, col=GREY,
-                  pos=(x0, -H / 2 + 0.032), parent=f)
-        self._batch.build(f)
-        self._batch = _QuadBatch()
+        y = hy - 0.008
+        size = 0.0110 if n > 10 else 0.016
+        for r in range(n):
+            yb = y - RH
+            bg = D.rect(x0 + 0.018, yb + 0.001, W - 0.036, RH - 0.002,
+                        BG_ROW if r % 2 == 0 else BG_ROW2)
+            bar = D.rect(cols["bar"], yb + RH * 0.2, 0.0045, RH * 0.6, TEAM_YOU)
+            pen_bg = D.rect(cols["best"] + 0.012, yb + 0.005, 0.050, RH - 0.010,
+                            AMBER)
+            pen_bg.show(False)
+            cy = yb + RH / 2
+            self.fin_rows.append(dict(
+                bg=bg, bar=bar, pen_bg=pen_bg,
+                pos=T.label("", cols["pos"], cy - size * 0.5, size, weight="bold",
+                            align="center", cap=2),
+                tla=T.label("", cols["tla"], cy - size * 0.5, size, weight="bold",
+                            cap=3),
+                name=T.label("", cols["name"], cy - size * 0.42, size * 0.85,
+                             weight="semibold", col=GREY, cap=16),
+                team=T.label("", cols["team"], cy - size * 0.42, size * 0.85,
+                             weight="semibold", col=GREY, cap=16),
+                best=T.label("", cols["best"], cy - size * 0.45, size * 0.92,
+                             weight="semibold", align="right", cap=10,
+                             mono=True),
+                gap=T.label("", cols["gap"], cy - size * 0.45, size * 0.92,
+                            weight="bold", align="right", cap=12, mono=True),
+                pen=T.label("", cols["best"] + 0.037, cy - size * 0.38,
+                            size * 0.75, weight="bold", align="center", col=INK,
+                            cap=5)))
+            y = yb
+        S.rect(x0 + 0.018, top - H + 0.040, W - 0.036, 0.0015, RULE)
+        T.label("ENTER  /  ESC     BACK TO MENU", x0 + 0.018, top - H + 0.016,
+                0.0096, weight="semibold", col=GREY, track=0.0014)
+        S.build(f, sort=40)
+        D.build(f, sort=41)
+        T.build(f, sort=45)
+        self.fin_S, self.fin_D, self.fin_T = S, D, T
+        self._fin_key = None
 
     def _build_pause(self):
-        """The pause card: a short menu, picked with W/S and ENTER.
-
-        A grand prix can be restarted from here -- the same race again from
-        the grid, without going back through the menus. Qualifying has
-        nothing to restart: every lap is already a fresh attempt.
-        """
+        """The pause card: a short menu, picked with W/S and ENTER."""
         self.pause_items = (("resume", "RESUME"),
                             *(() if self.quali else (("restart", "RESTART RACE"),)),
                             ("exit", "EXIT TO MENU"))
         n = len(self.pause_items)
-        W = 0.560
-        H = 0.221 + 0.036 * n + 0.032
-        top = H / 2
-        p = Entity(parent=self.root, position=(0, 0.03, -0.25), enabled=False)
+        W = 0.500
+        H = 0.205 + 0.042 * n
+        x0, top = -W / 2, H / 2 + 0.03
+        p = Entity(parent=self.root, z=-0.25, enabled=False)
         self.pause = p
-        self._batch = _QuadBatch(p.x, p.y)
-        self._plate(p, W, H, (0, 0, 0.1), col=INK)
-        self._rect(p, W, 0.030, (0, top - 0.015), pal.rgb(12, 12, 18), z=0.08)
-        self._rect(p, 0.120, 0.030, (-W / 2 + 0.060, top - 0.015), RED, z=0.07)
-        self._txt(spaced("paused"), size=0.52, pos=(-W / 2 + 0.060, top - 0.015),
-                  origin=(0, 0), parent=p)
-        self._txt(self.circuit, size=1.7, pos=(-W / 2 + 0.030, top - 0.085),
-                  parent=p)
-        session = ("QUALIFYING" if self.quali
-                   else f"GRAND PRIX  ·  {self.total_laps} LAPS")
-        self._txt(f"{self.country}  ·  {session}", size=0.52, col=GREY,
-                  pos=(-W / 2 + 0.030, top - 0.121), parent=p)
-        self._rect(p, W - 0.060, 0.0015, (0, top - 0.155), PANEL_HI, z=0.05)
+        S, T = ShapeLayer("pause"), TextLayer("pause_text")
+        S.rect(x0, top - H, W, H, pal.rgb(14, 14, 20, 246))
+        self._card_header(S, T, x0, top, W, "PAUSED", p, 52)
+        T.label(self.circuit, x0 + 0.024, top - 0.098, 0.026, weight="bold",
+                track=0.0010)
+        session = (f"{'QUALIFYING' if self.quali else 'GRAND PRIX'}  ·  "
+                   f"{self.total_laps} LAPS")
+        T.label(f"{self.full_name.upper()}  ·  {session}", x0 + 0.024,
+                top - 0.124, 0.0098, weight="semibold", col=GREY,
+                track=0.0012)
+        S.rect(x0 + 0.024, top - 0.146, W - 0.048, 0.0015, RULE)
         self._pause_y = []
         self.pause_rows = []
+        self._pause_hl = []
         for k, (_, label) in enumerate(self.pause_items):
-            y = top - 0.185 - 0.036 * k
+            y = top - 0.188 - 0.042 * k
             self._pause_y.append(y)
-            self.pause_rows.append(self._txt(label, size=0.70, col=GREY,
-                                             pos=(-W / 2 + 0.042, y), parent=p))
-        hint_y = top - 0.185 - 0.036 * n - 0.004
-        self._txt(spaced("w/s") + "   SELECT      " + spaced("enter")
-                  + "   CONFIRM      " + spaced("esc") + "   RESUME      "
-                  + "P   HIDE",
-                  size=0.44, col=GREY_DIM, pos=(-W / 2 + 0.030, hint_y),
-                  parent=p)
-        self._batch.build(p)
-        self._batch = _QuadBatch()
-        # The cursor: a red tab beside the row, the menu's own marker.
-        self._pause_cursor = Entity(parent=p, model="quad", color=RED,
-                                    scale=(0.005, 0.022),
-                                    position=(-W / 2 + 0.028, self._pause_y[0],
-                                              -0.05))
+            hl = S.rect(x0 + 0.024, y - 0.012, W - 0.048, 0.036, BG_HI)
+            cur = S.rect(x0 + 0.024, y - 0.012, 0.006, 0.036, RED)
+            hl.show(False)
+            cur.show(False)
+            self._pause_hl.append((hl, cur))
+            self.pause_rows.append(T.label(label, x0 + 0.044, y - 0.0005,
+                                           0.0150, weight="bold", col=GREY,
+                                           track=0.0012))
+        T.label("W/S  SELECT     ENTER  CONFIRM     ESC  RESUME     P  HIDE",
+                x0 + 0.024, top - H + 0.020, 0.0088, weight="semibold",
+                col=DIM, track=0.0012)
+        S.build(p, sort=50)
+        T.build(p, sort=55)
+        self.pause_S, self.pause_T = S, T
         self._pause_sel = -1
 
     def _set_pause_sel(self, sel: int):
         if sel == self._pause_sel:
             return
         self._pause_sel = sel
-        self._pause_cursor.y = self._pause_y[sel]
         for k, row in enumerate(self.pause_rows):
-            self._col(row, WHITE if k == sel else GREY)
+            on = k == sel
+            row.color = WHITE if on else GREY
+            self._pause_hl[k][0].show(on)
+            self._pause_hl[k][1].show(on)
+        self.pause_S.flush()
+        self.pause_T.flush()
 
-    # -- per-frame update ------------------------------------------
-    @staticmethod
-    def _set(entity, value: str):
-        """Assigning Text.text rebuilds the glyph mesh, which costs about as
-        much as the whole physics step. Most of these strings are identical
-        frame to frame, so only write the ones that actually changed.
-
-        The ones that do change -- the running lap time and the speed, every
-        frame -- are not rebuilt either. Ursina's setter throws the whole text
-        away: three fresh TextNodes (tag parsing leaves two empty ones in
-        front), a shader and its inputs bound on each, and every one of those
-        a new render state for Panda to compose and later garbage-collect.
-        For a single line with no tags, all that changes is the string and the
-        horizontal offset ``Text.align`` derives from its width, so the
-        existing node is handed the new string and moved, which draws exactly
-        what the rebuild would.
-        """
-        if entity.text == value:
-            return
-        nodes = entity.text_nodes
-        if (nodes and "\n" not in value and entity.start_tag not in value
-                and entity.end_tag not in value and not entity.images):
-            node = nodes[-1].node()
-            node.setText(value)
-            w = node.calcWidth(value)
-            # Text.align, for one line: every node of the text is shifted by
-            # the first line's width times (half + origin_x), in node scale.
-            k = w * (0.5 + entity.origin[0])
-            for tn in nodes:
-                tn.setX(-k * tn.getScale()[0])
-            entity.raw_text = value
-            return
-        entity.text = value
-
-    @staticmethod
-    def _col(entity, col):
-        if entity.color != col:
-            entity.color = col
-
-    DIGIT_PITCH = 0.039          # the widest glyph at scale 2.7 (0.0144 * 2.7)
-
-    def _set_speed(self, kmh: float):
-        text = f"{max(0.0, kmh):0.0f}"[-3:]
-        n = len(text)
-        if n != self._shown:      # only re-centre when the digit count changes
-            self._shown = n
-            for i, d in enumerate(self.digits):
-                d.x = (i - (n - 1) / 2) * self.DIGIT_PITCH
-        for i, d in enumerate(self.digits):
-            self._set(d, text[i] if i < n else "")
-
-    def _set_row(self, row, entry, leader: bool, opaque: bool = False):
-        self._set(row["pos"], str(entry["pos"]))
-        self._col(row["bar"], entry["col"])
-        self._set(row["tla"], entry["tla"])
-        self._set(row["name"], entry["name"])
-        self._set(row["best"], lap_time(entry["best"]))
-        self._col(row["best"], PURPLE if entry.get("purple") else WHITE)
-        self._set(row["gap"], entry["gap"])
-        self._col(row["gap"], WHITE if leader else GREY)
-        pen = entry.get("pen") or 0.0
-        show_pen = pen > 0.05
-        if row["pen"].enabled != show_pen:
-            row["pen"].enabled = show_pen
-        if show_pen:
-            self._set(row["pen_txt"], pen_tag(pen))
-        if opaque:
-            self._col(row["bg"], pal.rgb(48, 48, 64) if leader else PANEL_HI)
-        else:
-            self._col(row["bg"], GLASS_HI if leader else GLASS)
-
+    # -- per-frame update -----------------------------------------------------
     def stale(self) -> bool:
-        """True when the window's shape has changed under the layout.
-
-        The panels are anchored to the screen edges at build time and the
-        plates are baked into one merged mesh, so a new ratio means a rebuild
-        rather than a nudge. Cheap enough: it happens when someone presses F.
-        """
+        """True when the window's shape has changed under the layout."""
         return abs(float(window.aspect_ratio) - self._aspect) > 1e-3
+
+    def _place_row(self, row, dy: float):
+        """Move a car row's pieces to *dy* below the first slot."""
+        if dy == row["dy"] and row.get("_placed"):
+            return
+        row["dy"] = dy
+        row["_placed"] = True
+        for k in ("hl", "bar", "fast", "up", "dn", "pen_bg", "st_bg"):
+            row[k].move(0.0, dy)
+        for k, (bx, by) in row["base"].items():
+            row[k].move(bx, by + dy)
+
+    def _set_row(self, row, e, leader: bool):
+        st = row["state"]
+        player = bool(e.get("player"))
+        col = e.get("col", TEAM_AI)
+        if st.get("col") != col:
+            st["col"] = col
+            row["bar"].color = col
+        # The player's row is lit white; the car being watched (G), red,
+        # the colour of the onboard card that names it.
+        hl = "me" if player else "watch" if e.get("watched") else ""
+        if st.get("hl") != hl:
+            st["hl"] = hl
+            row["hl"].show(bool(hl))
+            if hl:
+                row["hl"].color = HILITE if player else WATCH_HI
+            row["tla"].color = INK if player else WHITE
+        row["tla"].set(e["tla"])
+        gap = e.get("gap", "")
+        word = bool(e.get("word"))
+        gcol = (INK if player else
+                (PURPLE if (self.quali and leader and e.get("purple")) else
+                 WHITE if leader or hl or gap.startswith("+") else GREY))
+        if word:
+            row["gap"].set("")
+            row["word"].set(gap, INK if player else GREY)
+        else:
+            row["word"].set("")
+            row["gap"].set(gap, gcol)
+        row["fast"].show(bool(e.get("purple")) and not self.quali)
+        ch = int(e.get("change", 0) or 0)
+        row["up"].show(ch > 0)
+        row["dn"].show(ch < 0)
+        row["chg"].set(str(min(abs(ch), 99)) if ch else "",
+                       GREEN if ch > 0 else RED)
+        pen = e.get("pen") or 0.0
+        pen_txt = pen_tag(pen) if pen > 0.05 else ""
+        status = e.get("status", "")
+        if st.get("chips") != (pen_txt, status):
+            st["chips"] = (pen_txt, status)
+            row["pen_bg"].show(bool(pen_txt))
+            row["pen"].set(pen_txt)
+            row["st_bg"].show(bool(status))
+            if status:
+                # A car out of the race for now is what brought the yellow
+                # out (it is the stricken car): its chip is the yellow flag.
+                row["st_bg"].color = (DRS_GREEN if status == "DRS" else
+                                      YELLOW if status in ("OUT", "STOP")
+                                      else WHITE)
+            row["st"].set(status)
+            self._layout_chips(row)
+
+    def _layout_chips(self, row):
+        """The chips hang off the row's right edge, each as wide as its text,
+        in a fixed order -- penalty, then DRS or OUT. One alone sits against
+        the tower; a second is pushed out beside the first."""
+        x = self._chip_x0
+        dy = row["dy"] or 0.0
+        for bg, k in ((row["pen_bg"], "pen"), (row["st_bg"], "st")):
+            lab = row[k]
+            if not lab.text:
+                continue
+            w = lab.width + 2 * self.CHIP_PAD
+            bg.set_rect(x, row["chip_y"], w, self._chip_h)
+            by = row["base"][k][1]
+            row["base"][k] = (x + self.CHIP_PAD, by)
+            lab.move(x + self.CHIP_PAD, by + dy)
+            x += w + self.CHIP_GAP
+
+    def _update_tower(self, standings, dt: float, gap_mode: str):
+        RH = self.ROW_H
+        live = set()
+        for k, e in enumerate(standings[:self.n_rows]):
+            key = e.get("key", e["tla"])
+            live.add(key)
+            r = self._row_of.get(key)
+            if r is None:
+                # A car the tower has not shown yet takes a free row, placed
+                # straight into its slot (no slide in from the top).
+                used = set(self._row_of.values())
+                r = next(j for j in range(len(self.rows)) if j not in used)
+                self._row_of[key] = r
+                self.rows[r]["dy"] = None
+                self.rows[r]["_placed"] = False
+            row = self.rows[r]
+            target = -k * RH
+            row["target"] = target
+            if not row["shown"]:
+                row["shown"] = True
+                row["bar"].show(True)
+                self._place_row(row, target)
+            # The same entry as last frame (the tower is rebuilt ten times a
+            # second, not sixty) needs nothing rewritten.
+            if row.get("entry") is not e:
+                row["entry"] = e
+                self._set_row(row, e, leader=k == 0)
+        for key in [k for k in self._row_of if k not in live]:
+            row = self.rows[self._row_of.pop(key)]
+            row["shown"] = False
+            for k in ("hl", "bar", "fast", "up", "dn", "pen_bg", "st_bg"):
+                row[k].show(False)
+            for k in ("tla", "chg", "gap", "word", "pen", "st"):
+                row[k].set("")
+            row["state"] = {}
+            row["entry"] = None
+        # Slide rows towards their slots.
+        a = min(1.0, self.SLIDE_RATE * dt)
+        for row in self.rows:
+            if not row["shown"] or row["dy"] is None:
+                continue
+            d = row["target"] - row["dy"]
+            if abs(d) > 1e-5:
+                self._place_row(row, row["target"] if abs(d) < 0.0006
+                                else row["dy"] + d * a)
+        self.t_mode.set("TIME" if self.quali else
+                        "LEADER" if gap_mode == "leader" else "INTERVAL")
 
     def update(self, *, speed_kmh, speed_frac, lap, cur_t, last_t, best_t,
                session_t, sectors, standings, lights=-1, gantry_dy=0.0,
@@ -860,133 +935,222 @@ class HUD:
                throttle=0.0, brake=0.0, steer=0.0, slip=0.0, tc_cut=0.0,
                esc_cut=0.0, tc_off=False, dt=1.0 / 60.0, finished=False,
                paused=False, pause_sel=0, delta=None, cur_invalid=False,
-               last_invalid=False, flag_style="warn"):
-        # -- session bar ---------------------------------------------
-        # Past the last lap the car is on an in-lap, not on lap 4 of 3, and
-        # clamping to "3/3" made a car still circulating look like it was on
-        # its final tour for ever. Qualifying has no distance to count to.
-        self._set(self.lap, "OUT" if lap == 0
-                  else str(lap) if self.quali
-                  else "FIN" if lap > self.total_laps
-                  else f"{lap}/{self.total_laps}")
-        m, s = divmod(int(session_t), 60)
-        self._set(self.clock, f"{m:02d}:{s:02d}")
+               last_invalid=False, flag_style="warn", flag_head="RACE CONTROL",
+               field_dots=None, strip="idle", gap_mode="interval",
+               me_name="PLAYER", me_col=TEAM_YOU, me_pos=None,
+               target_label=None, target_t=None, spect_label=None,
+               results=None, yellow_zones=(), yellow_here=False):
+        # -- tower --------------------------------------------------------------
+        self.t_head.set("FINISH" if lap > self.total_laps
+                        else "OUT" if lap == 0 and self.quali
+                        else f"{lap}/{self.total_laps}")
+        self._update_tower(standings, dt, gap_mode)
+        chq = strip == "chequered"
+        if getattr(self, "_strip", None) != strip:
+            self._strip = strip
+            for sq in self.strip_chq:
+                sq.show(chq)
+            self.strip.show(not chq)
+            if not chq:
+                self.strip.color = STRIP_COL.get(strip, STRIP_IDLE)
 
-        # -- lap time + sectors --------------------------------------
-        self._set(self.cur, lap_time(cur_t))
-        self._set(self.last, lap_time(last_t))
-        self._set(self.best, lap_time(best_t))
-        # Green when the lap just completed *is* the best -- the timing-tower
-        # cue for a personal best that has not yet been beaten.
-        # Red for a deleted lap, the running one included: the time is still
-        # shown, so the driver can see what the off cost them.
-        self._col(self.cur, RED if cur_invalid else AMBER)
-        self._col(self.last, RED if last_invalid
-                  else GREEN if last_t is not None and best_t is not None
-                  and abs(last_t - best_t) < 1e-6 else WHITE)
-        if delta is None:
-            self._set(self.delta, "")
+        # -- chyron -------------------------------------------------------------
+        me = None
+        for e in standings:
+            if bool(e.get("player")) != bool(spectating):
+                me = e
+                break
+        if spectating and spect_label is not None:
+            me = next((e for e in standings if e.get("watched")), me)
+        self.c_bar.color = me_col
+        self.c_name.set(me_name)
+        self.c_pos.set(str(me_pos if me_pos is not None
+                           else me["pos"] if me else 1))
+        if self.quali and lap == 0:
+            self.c_lap.set("OUT LAP")
         else:
-            self._set(self.delta, delta_time(delta))
-            self._col(self.delta, GREEN if delta < 0 else RED)
-        for block, (_, status) in zip(self.sectors, sectors):
-            self._col(block, SECTOR_COL.get(status, SECTOR_COL["off"]))
+            self.c_lap.set("FINISHED" if lap > self.total_laps
+                           else f"LAP {lap}/{self.total_laps}")
 
-        # -- tower ----------------------------------------------------
-        for k, row in enumerate(self.rows):
-            if k < len(standings):
-                row["row"].enabled = True
-                self._set_row(row, standings[k], leader=k == 0)
-            else:
-                row["row"].enabled = False
+        # A lap just completed holds on screen in full, in its colour, the way
+        # the broadcast freezes the chyron as the car crosses the line.
+        if last_t is not None and last_t != self._last_seen:
+            if self._last_seen is not None or lap > 1:
+                session_best = min((e["best"] for e in standings
+                                    if e.get("best") is not None), default=None)
+                if last_invalid:
+                    self._flash_col = RED
+                elif best_t is not None and abs(last_t - best_t) < 1e-6:
+                    self._flash_col = (PURPLE if session_best is not None
+                                       and last_t <= session_best + 1e-6
+                                       else GREEN)
+                else:
+                    self._flash_col = YELLOW
+                self._flash_until = session_t + 3.0
+            self._last_seen = last_t
+        if finished:
+            self._chy_time(lap_time(last_t), WHITE)
+        elif lap == 0 and self.quali:
+            self._chy_time(None, GREY, word="OUT LAP")
+        elif session_t < self._flash_until and last_t is not None:
+            self._chy_time(lap_time(last_t), self._flash_col)
+        else:
+            self._chy_time(tenths(cur_t), RED if cur_invalid else WHITE)
 
-        # -- telemetry ----------------------------------------------
-        self._set_speed(speed_kmh)
+        if delta is not None and not finished:
+            self.c_delta_bg.show(True)
+            self.c_delta_bg.color = GREEN if delta < 0 else RED
+            self.c_delta.set(delta_time(delta))
+        else:
+            self.c_delta_bg.show(False)
+            self.c_delta.set("")
+        if target_t is not None or target_label is not None:
+            self.c_target.set(lap_time(target_t) if target_t is not None else "",
+                              WHITE)
+            self.c_target_who.set(target_label or "")
+        else:
+            self.c_target.set(lap_time(best_t),
+                              PURPLE if me and me.get("purple") else WHITE)
+            self.c_target_who.set("BEST LAP")
+        for bar, (_, status) in zip(self.c_sectors, sectors):
+            bar.color = SECTOR_COL.get(status, SECTOR_COL["off"])
+
+        # -- speed graphic --------------------------------------------------
+        self.s_bar.color = me_col
+        self.s_name.set(me_name)
+        self.s_speed.set(f"{max(0.0, speed_kmh):0.0f}"[-3:])
         gear, within = gear_of(speed_frac)
-        self._set(self.gear, str(gear) if speed_kmh > 2.0 else "N")
-        # Smoothed the way the engine note is, so the strip does not flicker
-        # on the gear change.
-        target = 0.30 + 0.70 * within
+        self.s_gear.set(str(gear) if speed_kmh > 2.0 else "N")
+        target = 0.25 + 0.75 * within if speed_kmh > 2.0 else 0.0
         self._rpm += (target - self._rpm) * min(1.0, 9.0 * dt)
         lit = int(self._rpm * N_LEDS + 0.5)
         if lit != self._lit:
             self._lit = lit
             for k, led in enumerate(self.leds):
-                self._col(led, self._led_col[k] if k < lit else LED_OFF)
-        self.p_thr.scale_y = max(0.001, self.BAR_H * throttle)
-        self.p_brk.scale_y = max(0.001, self.BAR_H * brake)
-        self.st_dot.x = steer * 0.060
-
+                led.color = LED_ON[k] if k < lit else LED_OFF
+        self.p_thr.stretch(1.0, max(0.002, throttle), oy=self._bar_y)
+        self.p_brk.stretch(1.0, max(0.002, brake), oy=self._bar_y)
         deg = math.degrees(slip)
         if deg > 6.0:
-            self._set(self.slip_txt, f"SLIP {deg:0.0f}°")
-            self._col(self.slip_txt, AMBER if deg < 14 else RED)
+            self.s_slip.set(f"SLIP {deg:0.0f}°", AMBER if deg < 14 else RED)
         else:
-            self._set(self.slip_txt, "")
+            self.s_slip.set("")
         if tc_off:
-            self._set(self.aid_txt, "AIDS OFF")
-            self._col(self.aid_txt, RED)
+            self.s_aid.set("AIDS OFF", RED)
         elif esc_cut > 0.02:
-            # "ESP", not "ESC": ESC is the pause key, and an indicator sharing
-            # a name with a key is a needless thing to explain to a visitor.
-            self._set(self.aid_txt, "ESP")
-            self._col(self.aid_txt, GREEN)
+            self.s_aid.set("ESP", GREEN)
+        elif tc_cut > 0.05:
+            self.s_aid.set("TC", AMBER)
         else:
-            self._set(self.aid_txt, "TC" if tc_cut > 0.05 else "")
-            self._col(self.aid_txt, AMBER)
+            self.s_aid.set("")
 
-        # -- map ------------------------------------------------------
-        if ghost_xz is None:
-            if self.mm_ghost.enabled:
-                self.mm_ghost.enabled = False
-        else:
-            if not self.mm_ghost.enabled:
-                self.mm_ghost.enabled = True
-            u, v = self._to_mm(ghost_xz)
-            self.mm_ghost.position = (u, v + 0.008, -0.03)
+        # -- map ------------------------------------------------------------
+        dots = field_dots or ([] if ghost_xz is None else [(ghost_xz, TEAM_AI)])
+        xy = self._mm_xy
+        xy[:] = np.nan
+        n = min(len(dots), len(self.mm_others))
+        if n:
+            p = np.array([d[0] for d in dots[:n]], np.float32)
+            p[:, 0] = (p[:, 0] - self._mm_cx) * self._mm_scale + self._mm_o[0]
+            p[:, 1] = (p[:, 1] - self._mm_cz) * self._mm_scale + self._mm_o[1]
+            xy[0:2 * n:2] = p
+            xy[1:2 * n:2] = p
+            for k in range(n):
+                self.mm_others[k][1].color = dots[k][1]
+        self.mm_batch.place(xy)
+        self._animate_yellow_frame(bool(yellow_here), dt)
+        zones = tuple(tuple(z) for z in yellow_zones)
+        if zones != self._mm_zones:
+            self._mm_zones = zones
+            L = self._mm_L
+            for mid, seg in self._mm_yel:
+                seg.show(any((mid - a) % L <= (b - a) % L for a, b in zones))
+            self.mm_Y.flush()
         if car_xz is not None:
             u, v = self._to_mm(car_xz)
-            self.mm_dot.position = Vec3(u, v + 0.008, -0.04)
+            self.mm_dot.move(u, v)
+            self.mm_ring.move(u, v)
 
-        # -- start lights -------------------------------------------
-        # ``lights`` is the lamp count 0-5, or -1 when the gantry is off
-        # screen. ``gantry_dy`` slides it down into place and later up and away.
+        # -- start lights -----------------------------------------------------
         show = lights >= 0
         if self.gantry.enabled != show:
             self.gantry.enabled = show
         if show:
             self.gantry.y = self._gantry_y0 + gantry_dy
-            for k, lamp in enumerate(self.lamps):
-                col = LAMP_ON if k < lights else LAMP_OFF
-                if getattr(lamp, "_lit_col", None) != col:
-                    self._lamp(lamp, col)
+            if lights != self._lit_n:
+                self._lit_n = lights
+                for k, col in enumerate(self.lamps):
+                    on = k < lights
+                    for glow, lamp in col:
+                        lamp.color = LAMP_ON if on else LAMP_OFF
+                        glow.show(on)
+                self.g_S.flush()
 
-        # -- flag / lower-third (one slot, bottom-left) ----------------
-        if self.spectator.enabled != spectating:
-            self.spectator.enabled = spectating
+        # -- race control / spectator ------------------------------------------
+        tag = spect_label or ""
+        if self.spectator.enabled != bool(tag):
+            self.spectator.enabled = bool(tag)
+        if tag and tag != self._spect_text:
+            self._spect_text = tag
+            self._fit_spectator(tag)
         show_flag = bool(flag) and not spectating
-        if self.flag.enabled != show_flag:
-            self.flag.enabled = show_flag
-        if show_flag:
-            self._set(self.flag_txt, flag)
-            # A penalty is amber, a rule broken outright is red, a warning is
-            # the marshal's yellow -- the same three the tower and the sector
-            # lights already use.
-            plate, ink = FLAG_COL.get(flag_style, FLAG_COL["warn"])
-            self._col(self.flag_plate, plate)
-            self._col(self.flag_txt, ink)
+        self._animate_flag((flag, flag_style, flag_head) if show_flag else None,
+                           dt)
 
-        # -- cards ----------------------------------------------------
+        # -- cards --------------------------------------------------------------
         if self.finish.enabled != finished:
             self.finish.enabled = finished
         if finished:
-            for k, row in enumerate(self.fin_rows):
-                if k < len(standings):
-                    self._set_row(row, standings[k], leader=k == 0, opaque=True)
+            self._update_results(results if results is not None else standings)
         if self.pause.enabled != paused:
             self.pause.enabled = paused
         if paused:
             self._set_pause_sel(pause_sel)
+
+        self.D.flush()
+        self.L.flush()
+        self.mm_S.flush()
+
+    def _chy_time(self, digits, col, word=None):
+        if word is not None:
+            self.c_time.set("")
+            self.c_time_word.set(word, col)
+        else:
+            self.c_time_word.set("")
+            self.c_time.set(digits, col)
+
+    def _update_results(self, rows):
+        key = tuple((e.get("tla"), e.get("gap"), e.get("pen"), e.get("best"))
+                    for e in rows)
+        if key == self._fin_key:
+            return
+        self._fin_key = key
+        for k, row in enumerate(self.fin_rows):
+            on = k < len(rows)
+            row["bg"].show(on)
+            row["bar"].show(on)
+            if not on:
+                for f in ("pos", "tla", "name", "team", "best", "gap", "pen"):
+                    row[f].set("")
+                row["pen_bg"].show(False)
+                continue
+            e = rows[k]
+            row["pos"].set(str(e["pos"]))
+            row["bar"].color = e["col"]
+            row["tla"].set(e["tla"])
+            row["name"].set(e.get("name", "").upper())
+            row["team"].set(e.get("team", "").upper())
+            row["best"].set(lap_time(e.get("best")),
+                            PURPLE if e.get("purple") else WHITE)
+            row["gap"].set(e.get("result", e.get("gap", "")),
+                           WHITE if k == 0 else GREY)
+            pen = e.get("pen") or 0.0
+            row["pen_bg"].show(pen > 0.05)
+            row["pen"].set(pen_tag(pen) if pen > 0.05 else "")
+            row["bg"].color = BG_HI if e.get("player") else (
+                BG_ROW if k % 2 == 0 else BG_ROW2)
+        self.fin_D.flush()
+        self.fin_T.flush()
 
     def destroy(self):
         destroy_tree(self.root)

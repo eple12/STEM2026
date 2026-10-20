@@ -146,7 +146,10 @@ class HUD:
     FLAG_HIDE_DY, FLAG_SLIDE_T = 0.10, 0.22
 
     def __init__(self, track: Track, total_laps: int, mode: str = "gp",
-                 rows: int = 20):
+                 rows: int = 20, assist: str = ""):
+        #: The player's driving assists, as the short word the box carries
+        #: ("AUTO", "AUTO STEER", ...); empty: no box.
+        self.assist = assist
         self.track = track
         self.total_laps = total_laps
         self.quali = mode == "quali"
@@ -172,6 +175,8 @@ class HUD:
         self._build_tower()
         self._build_chyron()
         self._build_speed()
+        if assist:
+            self._build_assist()
         if config.SHOW_KEY_HINTS:
             self._build_keys()
         self.S.build(self.root, sort=0)
@@ -388,6 +393,44 @@ class HUD:
                               weight="bold", align="center", cap=1)
         T.label("GEAR", gx + gw / 2, y0 + 0.013, 0.0070, weight="semibold",
                 align="center", col=DIM, track=0.0010)
+
+    # -- assist (left of the telemetry) -------------------------------------------
+    ASSIST_W, ASSIST_H = 0.150, 0.058
+
+    def _build_assist(self):
+        """A small box beside the telemetry for the assisted driver: the road
+        across, the racing line on it, and where A / D has put the car. One
+        word of text."""
+        S, D, L = self.S, self.D, self.L
+        W, H = self.ASSIST_W, self.ASSIST_H
+        x1 = -self.SPD_W / 2 - 0.010
+        x0 = x1 - W
+        y0 = -0.5 + self.margin
+        head = 0.024
+        S.rect(x0, y0 + H - head, W, head, BG)
+        D.rect(x0, y0 + H - head, 0.006, head, TEAM_YOU)
+        L.label(self.assist, x0 + 0.016, y0 + H - head / 2 - 0.0052, 0.0108,
+                weight="bold", cap=12, track=0.0012, col=WHITE)
+        S.rect(x0, y0, W, H - head, BG_ROW)
+        self._a_x = x0 + 0.014
+        self._a_w = W - 0.028
+        self._a_y = y0 + 0.010
+        S.rect(self._a_x, self._a_y + 0.0065, self._a_w, 0.0045, BG_HI)
+        S.rect(self._a_x - 0.003, self._a_y, 0.003, 0.018, RED)
+        S.rect(self._a_x + self._a_w, self._a_y, 0.003, 0.018, RED)
+        self.a_line = D.rect(self._a_x, self._a_y - 0.001, 0.0025, 0.020, GREY)
+        self.a_car = D.rect(self._a_x, self._a_y - 0.002, 0.008, 0.022, GREEN)
+
+    def _update_assist(self, view):
+        """*view*: (fraction across the road of the racing line, of the car's
+        line), 0 = left edge, 1 = right edge."""
+        line, car = view
+        x, w, y = self._a_x, self._a_w, self._a_y
+        line = min(max(line, 0.0), 1.0)
+        car = min(max(car, 0.0), 1.0)
+        self.a_line.set_rect(x + line * w - 0.00125, y - 0.001, 0.0025, 0.020)
+        self.a_car.set_rect(x + car * w - 0.004, y - 0.002, 0.008, 0.022)
+        self.a_car.color = AMBER if car < 0.05 or car > 0.95 else GREEN
 
     def _build_keys(self):
         line = "     ".join(f"{k} {v}" for k, v in KEYS)
@@ -929,7 +972,7 @@ class HUD:
         self.t_mode.set("TIME" if self.quali else
                         "LEADER" if gap_mode == "leader" else "INTERVAL")
 
-    def update(self, *, speed_kmh, speed_frac, lap, cur_t, last_t, best_t,
+    def update(self, *, manual_gear=None, manual_revs=0.0, speed_kmh, speed_frac, lap, cur_t, last_t, best_t,
                session_t, sectors, standings, lights=-1, gantry_dy=0.0,
                flag="", spectating=False, car_xz=None, ghost_xz=None,
                throttle=0.0, brake=0.0, steer=0.0, slip=0.0, tc_cut=0.0,
@@ -939,7 +982,8 @@ class HUD:
                field_dots=None, strip="idle", gap_mode="interval",
                me_name="PLAYER", me_col=TEAM_YOU, me_pos=None,
                target_label=None, target_t=None, spect_label=None,
-               results=None, yellow_zones=(), yellow_here=False):
+               results=None, yellow_zones=(), yellow_here=False,
+               assist_view=None):
         # -- tower --------------------------------------------------------------
         self.t_head.set("FINISH" if lap > self.total_laps
                         else "OUT" if lap == 0 and self.quali
@@ -1020,8 +1064,10 @@ class HUD:
         self.s_name.set(me_name)
         self.s_speed.set(f"{max(0.0, speed_kmh):0.0f}"[-3:])
         gear, within = gear_of(speed_frac)
-        self.s_gear.set(str(gear) if speed_kmh > 2.0 else "N")
-        target = 0.25 + 0.75 * within if speed_kmh > 2.0 else 0.0
+        if manual_gear is not None:
+            gear, within = manual_gear, manual_revs
+        self.s_gear.set(str(gear) if speed_kmh > 2.0 or manual_gear else "N")
+        target = 0.25 + 0.75 * within if speed_kmh > 2.0 or manual_gear else 0.0
         self._rpm += (target - self._rpm) * min(1.0, 9.0 * dt)
         lit = int(self._rpm * N_LEDS + 0.5)
         if lit != self._lit:
@@ -1043,6 +1089,9 @@ class HUD:
             self.s_aid.set("TC", AMBER)
         else:
             self.s_aid.set("")
+
+        if self.assist and assist_view is not None:
+            self._update_assist(assist_view)
 
         # -- map ------------------------------------------------------------
         dots = field_dots or ([] if ghost_xz is None else [(ghost_xz, TEAM_AI)])

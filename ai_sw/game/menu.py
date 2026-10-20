@@ -16,7 +16,7 @@ from __future__ import annotations
 import numpy as np
 from ursina import Entity, Mesh, Text, Vec3, camera
 
-from . import config, teams
+from . import config, settings, teams
 from . import palette as pal
 from .trackdata import Track, load_track
 
@@ -121,7 +121,8 @@ class ModeMenu:
 
     def __init__(self, on_pick, on_quit, laps: int = config.TOTAL_LAPS,
                  initial: str | None = None, level: int = teams.DEFAULT_LEVEL,
-                 on_level=None):
+                 on_level=None, on_settings=None):
+        self.on_settings = on_settings
         self.on_pick = on_pick
         self.on_quit = on_quit
         self.on_level = on_level or (lambda lv: None)
@@ -171,7 +172,7 @@ class ModeMenu:
         self._build_level()
         self._build_controls()
         self._txt("A / D  CHOOSE          W / S  SESSION  ·  DIFFICULTY"
-                  "          ENTER  CONTINUE          ESC  QUIT",
+                  "          ENTER  CONTINUE          O  SETTINGS          ESC  QUIT",
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
         self._refresh()
 
@@ -274,6 +275,8 @@ class ModeMenu:
             self._refresh()
         elif key in ("enter", "space"):
             self.on_pick(MODES[self.sel][0])
+        elif key == "o" and self.on_settings is not None:
+            self.on_settings()
         elif key == "escape":
             self.on_quit()
 
@@ -290,7 +293,8 @@ class StartMenu:
                  on_back=None, mode: str | None = None,
                  laps: int = config.TOTAL_LAPS, level: int = teams.DEFAULT_LEVEL,
                  quali: dict | None = None, on_watch=None,
-                 grid="quali", on_grid=None):
+                 grid="quali", on_grid=None, on_settings=None):
+        self.on_settings = on_settings
         self.names = names
         #: Grand prix start: "quali" or a slot 1..20 (A / D), kept in the
         #: session through ``on_grid``.
@@ -443,6 +447,7 @@ class StartMenu:
                   + ("          A / D   START POSITION"
                      if self.mode == GRAND_PRIX else "")
                   + (f"          G   {watch}" if self.on_watch else "")
+                  + ("          O   SETTINGS" if self.on_settings else "")
                   + "          ESC   " + ("BACK" if self.on_back else "QUIT"),
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
 
@@ -610,6 +615,8 @@ class StartMenu:
             self.on_start(self.names[self.sel])
         elif key == "g" and self.on_watch is not None:
             self.on_watch(self.names[self.sel])
+        elif key == "o" and self.on_settings is not None:
+            self.on_settings()
         elif key == "escape":
             (self.on_back or self.on_quit)()
 
@@ -617,5 +624,94 @@ class StartMenu:
         if self._outline is not None:
             destroy_tree(self._outline)
             self._outline = None
+        destroy_tree(self.root)
+        self.root = None
+
+
+# --- settings --------------------------------------------------------------
+class SettingsMenu:
+    """The session's rules and aids (game/settings.py), one row each, ON or OFF.
+    W / S pick a row, A / D or ENTER flip it, ESC saves and goes back. Never
+    reachable during a race."""
+
+    TOP, PITCH, ROW_H, W = 0.215, 0.068, 0.062, 1.62
+
+    def __init__(self, on_back):
+        self.on_back = on_back
+        self.font = pick_font()
+        self.sel = 0
+        self.root = Entity(parent=camera.ui)
+        _base_screen(self, "settings")
+        self.rows = []
+        for k, (name, title, what) in enumerate(settings.ROWS):
+            y = self.TOP - k * self.PITCH - self.ROW_H / 2
+            bg = Entity(parent=self.root, model="quad", color=PANEL,
+                        scale=(self.W, self.ROW_H), position=(0, y, 0.3))
+            bar = Entity(parent=self.root, model="quad", color=RED,
+                         scale=(0.008, self.ROW_H), position=(-self.W / 2 - 0.004, y, 0.25))
+            t = self._txt(title, size=1.05, col=WHITE, pos=(-0.77, y + 0.014))
+            d = self._txt(what, size=0.62, col=GREY_DIM, pos=(-0.77, y - 0.017))
+            box = Entity(parent=self.root, model="quad", color=PANEL_HI,
+                         scale=(0.17, 0.044), position=(0.69, y, 0.2))
+            val = self._txt("", size=0.95, col=WHITE, pos=(0.69, y), origin=(0, 0))
+            self.rows.append(dict(name=name, bg=bg, bar=bar, title=t, desc=d, box=box, val=val))
+        self._txt("W / S   SELECT          A / D   OFF · ON          ESC   SAVE AND BACK"
+                  "          (settings cannot be changed during a race)",
+                  size=0.72, col=GREY, pos=(-0.80, -0.482))
+        self._refresh()
+
+    def _txt(self, s, *, size=1.0, col=WHITE, pos=(0, 0), origin=(-0.5, 0), z=-0.1):
+        return Text(s, parent=self.root, font=self.font, scale=size, color=col,
+                    origin=origin, position=(pos[0], pos[1], z))
+
+    def _refresh(self):
+        for k, r in enumerate(self.rows):
+            val = getattr(settings.current, r["name"])
+            on = bool(val)
+            focus = k == self.sel
+            r["bg"].color = PANEL_HI if focus else PANEL
+            r["bar"].enabled = focus
+            r["title"].color = WHITE if focus else GREY
+            r["desc"].color = GREY if focus else GREY_DIM
+            r["box"].color = RED if on else (PANEL if focus else PANEL_HI)
+            if isinstance(val, float):
+                r["box"].color = RED if focus else PANEL_HI
+                r["val"].text = f"{val:.1f}x"
+                r["val"].color = WHITE
+            else:
+                r["val"].text = "ON" if on else "OFF"
+                r["val"].color = WHITE if on else GREY
+
+    def _flip(self, to=None):
+        name = self.rows[self.sel]["name"]
+        cur = getattr(settings.current, name)
+        if isinstance(cur, float):
+            step = 0.1 if to else -0.1 if to is False else 0.0
+            setattr(settings.current, name, round(min(4.0, max(0.5, cur + step)), 1))
+            self._refresh()
+            return
+        cur = bool(cur)
+        setattr(settings.current, name, (not cur) if to is None else to)
+        self._refresh()
+
+    def on_key(self, key: str):
+        n = len(self.rows)
+        if key in ("down arrow", "s", "down arrow hold", "s hold"):
+            self.sel = (self.sel + 1) % n
+            self._refresh()
+        elif key in ("up arrow", "w", "up arrow hold", "w hold"):
+            self.sel = (self.sel - 1) % n
+            self._refresh()
+        elif key in ("right arrow", "d"):
+            self._flip(True)
+        elif key in ("left arrow", "a"):
+            self._flip(False)
+        elif key in ("enter", "space"):
+            self._flip()
+        elif key in ("escape", "o"):
+            settings.save()
+            self.on_back()
+
+    def destroy(self):
         destroy_tree(self.root)
         self.root = None

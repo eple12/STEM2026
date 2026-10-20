@@ -127,8 +127,10 @@ def _worker(conn, setup: dict):
     import gc
 
     try:
-        from . import grandprix
+        from . import grandprix, settings
         from .trackdata import load_track
+
+        settings.apply(setup.get("settings"))
 
         track = load_track(setup["circuit"])
         # Spectating: twenty AI drivers, nobody driven from the game.
@@ -262,11 +264,12 @@ class FieldClient:
     def __init__(self, circuit: str, level: int, laps: int, seed: int = 0,
                  player_time: float | None = None, spectate: bool = False,
                  player_grid: int | None = None):
+        from . import settings
         ctx = mp.get_context("spawn")
         self.conn, child = ctx.Pipe(duplex=True)
         setup = dict(circuit=circuit, level=level, laps=laps, seed=seed,
                      player_time=player_time, spectate=spectate,
-                     player_grid=player_grid)
+                     player_grid=player_grid, settings=settings.to_dict())
         self.proc = ctx.Process(target=_entry, args=(child, setup), daemon=True,
                                 name="aisw-field")
         self.proc.start()

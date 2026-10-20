@@ -29,7 +29,7 @@ import math
 
 import numpy as np
 
-from . import config, drivenet
+from . import config, drivenet, raceai
 from .vehicle import Controls, Vehicle
 
 
@@ -178,12 +178,15 @@ class PlanFollower:
         self.drive = None
         self._drv_n = 0
         self._drv_a = (0.0, 0.0)
+        #: For a network that also decides (onenet): the decision observation,
+        #: rebuilt on a decision tick and held in between.
+        self._dec_obs = np.zeros(raceai.OBS_DIM, np.float32)
 
     def controls(self, vehicle: Vehicle, k: int, f: float,
                  offset: float = 0.0, d_off: float = 0.0, dd_off: float = 0.0,
                  v_cap: float = math.inf, pace: float = 1.0,
                  hold_speed: bool = False, flat_out: bool = False,
-                 v_min: float = 0.0) -> Controls:
+                 v_min: float = 0.0, free=None) -> Controls:
         """Follow the line ``offset`` metres right of the plan.
 
         ``d_off``/``dd_off`` are the offset's first and second derivative
@@ -192,11 +195,19 @@ class PlanFollower:
         scales the plan's own speeds (a driver who commits less).
         ``hold_speed`` ignores the plan's speed and keeps the current one -- a
         missed braking point.
+
+        ``free`` is what a *free* network is given instead of the above, which
+        have had the traffic rules applied: ``(offset, d_off, dd_off, v_cap,
+        percept)`` with the lane as it was asked for, only a yellow flag's
+        speed limit, and ``percept()`` for the cars around (drivenet.perceive).
+        Hand-built and rule-bound networks ignore it.
         """
         drv = self.drive
+        if drv is not None and not getattr(drv, "free", False):
+            free = None
         if drv is not None and not drv.needs_teacher:
             return self._net_controls(drv, vehicle, k, f, offset, d_off, dd_off, v_cap,
-                                      pace, hold_speed, flat_out, v_min)
+                                      pace, hold_speed, flat_out, v_min, free)
         cfg = config
         pl = self.plan
         Lp = pl.L
@@ -309,21 +320,37 @@ class PlanFollower:
             # decides what is actually driven (its own, or this one).
             if self._drv_n <= 0:
                 self._drv_a = drv.act(
-                    drivenet.features(self, vehicle, k, f, offset, d_off, dd_off, v_cap,
-                                      pace, hold_speed, flat_out, v_min, self._drv_a),
+                    self._features(vehicle, k, f, offset, d_off, dd_off, v_cap, pace,
+                                   hold_speed, flat_out, v_min, free),
                     (ctl.steer, ctl.throttle - ctl.brake))
                 self._drv_n = drivenet.REPEAT
             self._drv_n -= 1
             return drivenet.to_controls(self._drv_a, Controls)
         return ctl
 
+    def _features(self, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
+                  flat_out, v_min, free):
+        """The network's input: from the orders as given, or -- for a free
+        network -- from the lane as asked for and what is around."""
+        percept = None
+        if free is not None:
+            offset, d_off, dd_off, v_cap, look = free
+            percept = look()
+        elif getattr(self.drive, "free", False):
+            percept = drivenet.NO_CARS          # alone: nothing in view
+        x = drivenet.features(self, vehicle, k, f, offset, d_off, dd_off, v_cap, pace,
+                              hold_speed, flat_out, v_min, self._drv_a, percept)
+        if getattr(self.drive, "one", False):
+            x = np.concatenate([x, self._dec_obs])
+        return x
+
     def _net_controls(self, drv, vehicle, k, f, offset, d_off, dd_off, v_cap, pace,
-                      hold_speed, flat_out, v_min):
+                      hold_speed, flat_out, v_min, free=None):
         """The network drives: a new decision every ``REPEAT`` ticks, held between."""
         if self._drv_n <= 0:
-            self._drv_a = drv.act(drivenet.features(
-                self, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
-                flat_out, v_min, self._drv_a))
+            self._drv_a = drv.act(self._features(vehicle, k, f, offset, d_off, dd_off,
+                                                 v_cap, pace, hold_speed, flat_out, v_min,
+                                                 free))
             self._drv_n = drivenet.REPEAT
         self._drv_n -= 1
         return drivenet.to_controls(self._drv_a, Controls)

@@ -92,13 +92,15 @@ class EngineSound:
             self.audio = None
 
     def update(self, speed: float, max_speed: float, throttle: float,
-               dt: float, muted: bool = False) -> None:
+               dt: float, muted: bool = False, revs: float | None = None) -> None:
         if not self.enabled:
             return
         # Fake a gearbox: revs climb through a gear then drop on the shift.
         # The same gearbox the HUD's gear readout uses (see ui.gear_of).
         from .ui import gear_of
         _, within = gear_of(speed / max_speed)
+        if revs is not None:
+            within = min(1.0, revs)
         target = 0.22 + 0.78 * (0.30 + 0.70 * within) + 0.18 * throttle
         self._rpm += (target - self._rpm) * min(1.0, 7.0 * dt)
 

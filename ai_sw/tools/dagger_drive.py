@@ -58,6 +58,10 @@ class Hook:
 
     def __init__(self, net, beta, rng, record):
         self.net, self.beta, self.rng, self.record = net, beta, rng, record
+        #: The student sees the cars around (and is not held to the traffic
+        #: rules); the teacher's answer is still the rules'. A teacher alone
+        #: (no net) is recorded in the free form, to be learned from.
+        self.free = net.free if net is not None else True
         self.obs, self.lab = [], []
 
     def act(self, x, teacher):
@@ -208,8 +212,13 @@ def cmd_train(args):
     net = build_net()
     if args.init:
         z = np.load(args.init)
+        from game import drivenet
         for i, m in enumerate([m for m in net if hasattr(m, "weight")]):
-            m.weight.data = torch.tensor(z[f"W{i}"].T.copy())
+            W = z[f"W{i}"]
+            if i == 0 and W.shape[0] < drivenet.OBS_DIM:
+                # A network from before it saw the cars: the new inputs start at zero.
+                W = np.vstack([W, np.zeros((drivenet.OBS_DIM - W.shape[0], W.shape[1]), W.dtype)])
+            m.weight.data = torch.tensor(W.T.copy())
             m.bias.data = torch.tensor(z[f"b{i}"].copy())
     opt = torch.optim.Adam(net.parameters(), lr=args.lr)
     it0, counter = 0, args.seed0

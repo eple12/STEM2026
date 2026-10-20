@@ -8,9 +8,12 @@ import random
 import numpy as np
 from ursina import Ursina, Vec3, camera, held_keys, time, window
 
-from . import config, grandprix, teams
+from . import assist as assist_mod
+from . import config, grandprix, settings, teams
 from . import palette as pal
 from . import post
+from . import mozaleds
+from . import wheel as wheel_mod
 from .car import Car, lerp_pose
 from .freecam import FreeCam
 from .ghost import Ghost
@@ -169,7 +172,15 @@ class Game:
             self._hud_rows = len(self.quali_field) + (0 if spectate else 1)
         else:
             self._hud_rows = 2
-        self.hud = HUD(self.track, laps, mode, rows=self._hud_rows)
+        self.hud = HUD(self.track, laps, mode, rows=self._hud_rows,
+                       assist=self._assist_word(track_name, spectate))
+        #: The player's assists (settings screen): auto steering / pedals and the
+        #: lane choice. None when neither is on, or the circuit has no plan.
+        self.assist = None
+        self._dt = 1.0 / 60.0
+        st = settings.current
+        if (st.auto_steer or st.auto_pedals) and not spectate and assist_mod.available(track_name):
+            self.assist = assist_mod.Assist(self.track, self.surface, self.level)
         #: Snapshot columns, and each AI car's dot colour on the map.
         self._C = SNAP_COLS
         self._dot_col = {}
@@ -698,7 +709,12 @@ class Game:
         self._aim_camera()
 
     # -- input ----------------------------------------------------
+    def _manual_on(self) -> bool:
+        st = settings.current
+        return st.manual_gearbox and not st.auto_pedals
+
     def read_controls(self) -> Controls:
+        self.vehicle.manual = self._manual_on()
         if self.state == COUNTDOWN:
             return Controls()
         if self.freecam.enabled:
@@ -714,8 +730,38 @@ class Game:
         down = held_keys["s"] or held_keys["down arrow"]
         steer = (held_keys["d"] or held_keys["right arrow"]) - \
                 (held_keys["a"] or held_keys["left arrow"])
-        return Controls(throttle=float(up), brake=float(down),
-                        steer=float(steer), handbrake=bool(held_keys["space"]))
+        ctl = Controls(throttle=float(up), brake=float(down),
+                       steer=float(steer), handbrake=bool(held_keys["space"]))
+        # Steering wheel + pedals (MOZA etc.): analogue values; a key that is
+        # held still wins so the keyboard keeps working with the wheel plugged in.
+        wh = wheel_mod.shared()
+        if wh.connected:
+            if not (up or down):
+                ctl.throttle, ctl.brake = wh.throttle, wh.brake
+            if not steer:
+                ctl.steer = max(-1.0, min(1.0, wh.steer * settings.current.steer_sens))
+                ctl.analog_steer = True
+            ctl.handbrake = ctl.handbrake or wh.pressed("handbrake")
+        if self.assist is not None:
+            cap = math.inf
+            if self.assist.pedals and self.gp is not None:
+                near = [v for i, v in self.gp.proxies.items()
+                        if i != self.field.player and not self.gp._ghost.get(i, False)]
+                cap = assist_mod.leader_cap(self.vehicle, near)
+            ctl = self.assist.controls(self.vehicle, ctl, self._dt, cap)
+        return ctl
+
+    @staticmethod
+    def _assist_word(track_name: str, spectate: bool) -> str:
+        """The one word the HUD's assist box carries, or '' for no box."""
+        st = settings.current
+        if spectate or not (st.auto_steer or st.auto_pedals):
+            return ""
+        if not assist_mod.available(track_name):
+            return ""
+        if st.auto_steer and st.auto_pedals:
+            return "AUTO"
+        return "AUTO STEER" if st.auto_steer else "AUTO PEDALS"
 
     def _cooldown_controls(self) -> Controls:
         """The autopilot drives the car from the flag onwards, and keeps going.
@@ -769,6 +815,9 @@ class Game:
             self.world.destroy()
 
     def on_key(self, key: str):
+        if key in ("e", "z", "gear up", "gear down") and self.vehicle.manual:
+            self.vehicle.shift(1 if key in ("e", "gear up") else -1)
+            return
         if key == "f":
             on = self.freecam.toggle()
             # The car is hidden in the bonnet view; flying away from it with
@@ -790,6 +839,9 @@ class Game:
             return
         if self.state == PAUSED and self._pause_key(key):
             return
+        if self.assist is not None and self.assist.steer and key == "q":
+            self.assist.center()            # back onto the racing line
+            return
         if key == "c":
             self.cam_idx = (self.cam_idx + 1) % len(config.CAM_MODES)
             # The bonnet camera sits inside the car, which would clip messily
@@ -810,7 +862,7 @@ class Game:
             pass                              # one car to watch: nothing to cycle
         elif key == "g" and self.gp is not None:
             # Watch the car ahead, then the one ahead of that, and on round
-            # the running order until it comes back to you; SHIFT+G steps
+            # the running order until it comes back to you; SHIFT+G goes straight home;
             # back the way it came (see _next_watch). Its onboard is the
             # chase, as for the ghost.
             back = any(held_keys[k] for k in ("shift", "left shift",
@@ -1014,6 +1066,7 @@ class Game:
                 self.session_time = 0.0
                 self.lap_start = 0.0
 
+        self._dt = dt
         ctl = self.read_controls()
         self._ctl = ctl
         scraped = False
@@ -1088,7 +1141,9 @@ class Game:
         self.impacts.muted = self.muted
         self.impacts.scrape(self.vehicle.speed, scraped, dt)
         self.sound.update(heard.speed, config.MAX_SPEED,
-                          throttle, dt, muted=self.muted)
+                          throttle, dt, muted=self.muted,
+                          revs=(heard.revs_in(heard.gear, heard.speed)
+                                if heard is self.vehicle and self._manual_on() else None))
         post.update(min(1.0, heard.speed / config.MAX_SPEED), dt)
         self._draw_hud(i)
 
@@ -1246,7 +1301,7 @@ class Game:
             # anchors to the screen edges when it is built, so it is rebuilt.
             self.hud.destroy()
             self.hud = HUD(self.track, self.total_laps, self.mode,
-                           rows=self._hud_rows)
+                           rows=self._hud_rows, assist=self.hud.assist)
             self.hud.root.enabled = not self.hud_hidden
             self._tower_t = -1.0
         # While spectating, the readouts follow the watched car -- its speed,
@@ -1335,7 +1390,15 @@ class Game:
         dots = None
         if self.gp is not None:
             dots = [(p.pos, self._dot_col[k]) for k, p in self.gp.proxies.items()]
+        man = self._manual_on() and not spectating
+        leds = mozaleds.shared()
+        if leds is not None:
+            leds.set_fraction(self.hud._rpm if not spectating else 0.0,
+                              blink=self.hud._rpm > 0.97)
         self.hud.update(
+            manual_gear=v.gear if man else None,
+            manual_revs=v.revs_in(v.gear, v.speed) if man else 0.0,
+            assist_view=self.assist.view() if self.assist is not None else None,
             speed_kmh=v.speed * 3.6,
             speed_frac=min(1.0, v.speed / config.MAX_SPEED),
             lap=show_lap,
@@ -1460,8 +1523,8 @@ class Game:
         """G: the car one place ahead of the one being watched (of the
         player, to begin with), skipping the player, the leader wrapping to
         the last car -- and home once that comes round to a car already
-        seen, which a full lap of the order does. SHIFT+G retraces the
-        cars seen, back to the player.
+        seen, which a full lap of the order does. SHIFT+G goes straight
+        back to the player's own car.
 
         Kept as a history rather than counted from the order each press,
         so a pass between presses cannot make the cycle land on home (or
@@ -1479,9 +1542,8 @@ class Game:
             # Down the order (P1, P2, P3 ...); SHIFT+G back up it.
             return order[(j + (-1 if back else 1)) % len(order)]
         if back:
-            if hist:
-                hist.pop()
-            return hist[-1] if hist else None
+            hist.clear()                  # straight home, to the player's own car
+            return None
         if snap is None:
             return None
         rows = snap["rows"]
@@ -1789,6 +1851,8 @@ def update():
     global TRANSITION
     from .recorder import RECORDER
     RECORDER.tick()
+    for k in wheel_mod.poll_keys(menu=MENU is not None):     # wheel buttons act as key presses
+        input(k)
     if TRANSITION is not None:
         TRANSITION.tick()
         if TRANSITION.done:
@@ -1979,7 +2043,15 @@ def _show_modes():
     _set_menu(None)
     _set_menu(ModeMenu(on_pick=_pick_mode, on_quit=application.quit,
                        laps=SESSION["laps"], initial=SESSION["mode"],
-                       level=SESSION["level"], on_level=_set_level))
+                       level=SESSION["level"], on_level=_set_level,
+                       on_settings=lambda: _show_settings(_show_modes)))
+
+
+def _show_settings(back):
+    """The settings screen; ESC goes back to the screen it was opened from."""
+    from .menu import SettingsMenu
+    _set_menu(None)
+    _set_menu(SettingsMenu(on_back=back))
 
 
 def _set_level(level: int):
@@ -2011,7 +2083,8 @@ def _show_circuits():
         level=SESSION["level"],
         quali=SESSION["quali"],
         grid=SESSION["grid"],
-        on_grid=lambda g: SESSION.update(grid=g)))
+        on_grid=lambda g: SESSION.update(grid=g),
+        on_settings=lambda: _show_settings(_show_circuits)))
 
 
 def _build_menu(progress=None):
@@ -2054,6 +2127,7 @@ def main(argv=None):
     p.add_argument("--selftest", type=float, default=0.0,
                    help="run for N seconds with an autopilot, then quit")
     args = p.parse_args(argv)
+    settings.load()
 
     from . import frameloop
     frameloop.prepare()

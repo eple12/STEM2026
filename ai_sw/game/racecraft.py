@@ -35,11 +35,12 @@ The layers, each measured in ``tools/race_sim.py`` before it stayed:
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
 
-from . import config
+from . import config, drivenet
 from .mintime_driver import Plan, PlanFollower, _wrap
 from .vehicle import Controls, Vehicle
 
@@ -64,6 +65,11 @@ LOOK_NODES = 90
 #: the track and across it (body length / width plus a margin).
 GAP_ALONG = config.CAR_BODY_LENGTH + 1.5
 GAP_ACROSS = config.CAR_BODY_WIDTH + 0.6
+#: A car this close ahead (m) in the lane, with the car below its own pace, holds it up.
+HELD_GAP = 30.0
+#: Seconds all four wheels may be beyond the white line before the recovery routine takes
+#: a free (network-driven) car over.
+FREE_OFF_T = float(os.environ.get("FORMULA_FREE_OFF_T", 0.6))
 #: Wheel centres kept this far inside the white line by a lane.
 EDGE_ROOM = config.WHEEL_HALF_TRACK + 0.25
 #: Decelerations the planner assumes it can count on (m/s^2) -- less on the
@@ -477,6 +483,8 @@ class RaceDriver:
         #: leader cap, the yellow flag, recovery -- stay the rules' own.
         self.policy = None
         self.pace_mult = 1.0
+        self._slow_behind = False
+        self._ctx = None
         #: Tick of the last lane decision (a lane change, or the start of a dive
         #: down the inside): how long ago the car committed to where it is.
         self.lane_tick = 0
@@ -1125,16 +1133,23 @@ class RaceDriver:
             # The lane change is done: hold the new lane outright, so the
             # wrapped lap distance can never read it as not yet started.
             self.lane = (s1, d1, s1, d1)
+        free, teach = self._modes()
         if self.ticks % self.frame.think_every and self._held is not None:
             # Between decisions: the same caps, the lane followed from where
             # the car is now. The tracker itself runs every tick.
-            cap, pace, flat = self._held
+            cap, pace, flat, yc = self._held
             d, dd, ddd = self._offset_at(me.s)
             d = self._clip_offset(k, d)
             if self.lane[0] == self.lane[2]:
                 dd = ddd = 0.0
-            return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt)
+            fin = (d, dd, ddd, yc, me, field) if free else None
+            if free and teach:
+                d_t = self._room(me, field, k, d)
+                if d_t != d:
+                    d, dd, ddd = d_t, 0.0, 0.0
+            return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt, fin)
         before = None
+        self._ctx = (vehicle, k, f)
         if self.ticks % self.frame.plan_every == 0:
             if self.watch is not None and hasattr(self.watch, "before"):
                 # What the decision is made FROM -- taken ahead of it, or it
@@ -1147,17 +1162,25 @@ class RaceDriver:
         self.yellow = self._yellow(me, field)
         d, dd, ddd = self._offset_at(me.s)
         d = self._clip_offset(k, d)
-        d_free = d
-        d = self._room(me, field, k, d)
-        if d != d_free:
-            # Someone alongside: hold the edge of the room left, and let the
-            # next plan move off from here rather than from the old lane.
-            if self.abs_lane is not None:
-                self._end_attack(me, cooldown=2.5)
-            dd = ddd = 0.0
-            self.lane = (me.s, d, me.s, d)
-            self.target = d
-        cap = min(self._leader_cap(me, field, d), self._yellow_cap(me))
+        d_free, dd_free, ddd_free = d, dd, ddd
+        if teach:
+            d = self._room(me, field, k, d)
+            if d != d_free:
+                dd = ddd = 0.0
+                if not free:
+                    # Someone alongside: hold the edge of the room left, and
+                    # let the next plan move off from here rather than from the
+                    # old lane.
+                    if self.abs_lane is not None:
+                        self._end_attack(me, cooldown=2.5)
+                    self.lane = (me.s, d, me.s, d)
+                    self.target = d
+        # The following gap the rules would keep. A free network is not held to
+        # it -- it is worked out all the same, for who the leader is and how
+        # long it has been held up, which the decision layer looks at.
+        lead = self._leader_cap(me, field, d)
+        yc = self._yellow_cap(me)
+        cap = min(lead, yc)
         pace = self.pace_lap
         if self.yellow:
             # A stricken car ahead: lift, as a marshal's yellow flag asks, so
@@ -1175,20 +1198,54 @@ class RaceDriver:
         # Held up: the car ahead is costing real speed, not just sitting there.
         own = self.plan.at(self.plan.v, k, f) * pace
         held = self.leader is not None and cap < 0.985 * own
-        if d or self.lane[1] != self.lane[3] or self.abs_lane is not None:
+        # Whatever drives the car, is it in fact behind a car and slower than its
+        # own pace? (What the following rule would call held up is only that when
+        # the rule binds.)
+        self._slow_behind = False
+        if self.leader is not None and me.v < 0.96 * own:
+            lead_view = next((o for o in field if o.idx == self.leader), None)
+            self._slow_behind = (lead_view is not None
+                                 and 0.0 < self.frame.ds(me.s, lead_view.s) < HELD_GAP)
+        if free and not teach:
+            held = self._slow_behind
+        if teach and (d or self.lane[1] != self.lane[3] or self.abs_lane is not None):
             # A shifted line, or one changing lanes, must also brake for its
             # own curvature.
             cap = min(cap, self._offset_cap(me))
         flat = vehicle.drag_scale < 0.99 and not self.yellow
-        self._held = (cap, pace, flat)
+        self._held = (cap, pace, flat, yc)
         self._is_held = held
         if self.watch is not None and self.ticks % self.frame.plan_every == 0:
             self.watch(self, me, field, rule_pace, before)
-        return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt)
+        fin = (d_free, dd_free, ddd_free, yc, me, field) if free else None
+        return self._drive(vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt, fin)
 
-    def _drive(self, vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt):
+    def one_input(self, me: CarView, field: list[CarView]) -> np.ndarray:
+        """The input of a network that both decides and drives (onenet), now:
+        the driver's observation from the lane as it stands, and the decision
+        observation the follower holds."""
+        vehicle, k, f = self._ctx
+        d, dd, ddd = self._offset_at(me.s)
+        d = self._clip_offset(k, d)
+        yc = self._yellow_cap(me)
+        free = (d, dd, ddd, yc, lambda: drivenet.perceive(self, me, field))
+        return self.follow._features(vehicle, k, f, d, dd, ddd, yc,
+                                     self.pace_lap * self.pace_mult, False, False, 0.0, free)
+
+    def _modes(self) -> tuple[bool, bool]:
+        """(free, teach): whether a network that sees the cars around drives
+        this car -- then the rules below the decision layer (following gap, room,
+        lane curvature, braking envelope) do not bind it, and are worked out only
+        when a trainer wants them as the teacher's answer -- and whether those
+        rules' answer is wanted."""
+        drv = self.follow.drive
+        free = drv is not None and getattr(drv, "free", False)
+        return free, (not free) or drv.needs_teacher
+
+    def _drive(self, vehicle, me, k, f, d, dd, ddd, cap, pace, flat, dt, fin=None):
         """The per-tick part: timers, a missed braking point, the braking
-        envelope, and the tracker."""
+        envelope, and the tracker. *fin*, for a free network: the lane as asked
+        for, the yellow flag's cap, and the car and field it is looking at."""
         if self._is_held:
             self.held_t += dt
         else:
@@ -1207,13 +1264,17 @@ class RaceDriver:
             # A missed braking point: hold the speed it arrived with a moment
             # too long.
             self.late_left -= dt
-        if flat:
+        free = None
+        if fin is not None:
+            d_f, dd_f, ddd_f, yc, view, others = fin
+            free = (d_f, dd_f, ddd_f, yc, lambda: drivenet.perceive(self, view, others))
+        if flat and (fin is None or self.follow.drive.needs_teacher):
             # In a tow or with DRS the car can out-run the plan's straight-line
             # speed; let it, as far as it can still brake for what is coming.
             cap = min(cap, self._brake_envelope(me, pace))
         return self.follow.controls(vehicle, k, f, offset=d, d_off=dd,
                                     dd_off=ddd, v_cap=cap, pace=pace,
-                                    hold_speed=late, flat_out=flat)
+                                    hold_speed=late, flat_out=flat, free=free)
 
     def _brake_envelope(self, me: CarView, pace: float) -> float:
         """Fastest speed from which every corner ahead can still be braked
@@ -1317,7 +1378,10 @@ class RaceDriver:
         queued = self.leader is not None
         self.slow_t = self.slow_t + dt if (me.v < 3.0 and not queued) else 0.0
         head = self._heading_err(vehicle, me)
-        why = ("off" if self.off_t > 0.6 else "slow" if self.slow_t > 1.0
+        # A network that drives itself is given time to bring the car back on the
+        # road (it is rewarded for it); the recovery routine is the fallback.
+        off_limit = FREE_OFF_T if self._modes()[0] else 0.6
+        why = ("off" if self.off_t > off_limit else "slow" if self.slow_t > 1.0
                else "spun" if abs(head) > 1.2 and me.v < 30.0 else "")
         if why:
             self.rec_cause = why

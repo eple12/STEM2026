@@ -20,7 +20,13 @@ What the network is given is only what a driver sees and what a plan says:
   what lets it keep to the road instead of the line when the line and the road
   disagree (a lane change, a car alongside);
 * the order it is driving to -- the line offset, its slope and curvature, the
-  speed cap, the pace, hold and flat-out flags.
+  speed cap, the pace, hold and flat-out flags;
+* the other cars (``perceive``) -- the one ahead in its way and whoever is
+  alongside. With these a network is *free*: nothing but a yellow flag's speed
+  limit stands between the lane it was told to take and the wheels -- no
+  following-gap rule, no room rule -- so keeping off the car in front and out of
+  the car alongside is the network's own business. A network without them
+  (``OBS_DIM_V1`` inputs) runs under those rules as before.
 
 None of it is circuit-specific, so one set of weights drives every circuit at
 every plan grip. The network decides every ``REPEAT`` ticks (30 Hz) and the
@@ -49,8 +55,19 @@ NAMES = (
     + tuple(f"dv{int(d)}" for d in AHEAD)
     + tuple(f"force{int(d)}" for d in FORCE_AHEAD)
     + tuple(f"room_{s}{int(d)}" for d in EDGE_AHEAD for s in ("r", "l")))
-OBS_DIM = len(NAMES)
+OBS_DIM_V1 = len(NAMES)
+#: The other cars as the network sees them (see ``perceive``).
+PERCEPT = ("ahead_gap", "ahead_closing", "ahead_lat", "ahead_accel", "ahead_valid",
+           "right_lat", "right_along", "left_lat", "left_along")
+N_PERCEPT = len(PERCEPT)
+OBS_DIM = OBS_DIM_V1 + N_PERCEPT
 ACT_DIM = 2
+#: A car this far ahead (m) and this close across (m) is "in the way"; one this
+#: far along (m) and across is "alongside".
+AHEAD_RANGE = 150.0
+AHEAD_ACROSS = 3.5
+SIDE_ALONG = 14.0
+SIDE_ACROSS = 6.0
 
 
 def _clip(x: float, lo: float, hi: float) -> float:
@@ -61,10 +78,55 @@ def _wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
+#: What ``perceive`` returns with no car near.
+NO_CARS = np.array([2.0, 0, 0, 0, 0, 1.5, 0, 1.5, 0], np.float32)
+
+
+def perceive(driver, me, field) -> np.ndarray:
+    """What the cars around show a driver: the nearest one ahead in its way (gap,
+    closing speed, how far across, its braking) and the nearest alongside on
+    each side (how far across the gap between bodies is, how far along)."""
+    fr = driver.frame
+    out = np.zeros(N_PERCEPT, np.float32)
+    out[0] = 2.0
+    out[5] = out[7] = 1.5
+    best = None
+    right = left = None
+    width = config.CAR_BODY_WIDTH
+    for o in field:
+        if o.idx == me.idx or o.ghost:
+            continue
+        gap = fr.ds(me.s, o.s)
+        across = o.n - me.n
+        if 0.0 < gap < AHEAD_RANGE and abs(across) < AHEAD_ACROSS                 and (best is None or gap < best[0]):
+            best = (gap, o, across)
+        if abs(gap) < SIDE_ALONG and 0.0 < abs(across) < SIDE_ACROSS:
+            if across > 0.0:
+                if right is None or across < right[0]:
+                    right = (across, gap)
+            elif left is None or -across < left[0]:
+                left = (-across, gap)
+    if best is not None:
+        gap, o, across = best
+        out[0] = _clip(gap / 100.0, 0.0, 2.0)
+        out[1] = _clip((o.v - me.v) / 30.0, -2.0, 2.0)
+        out[2] = _clip(across / 3.0, -1.5, 1.5)
+        out[3] = _clip(o.a / 10.0, -2.0, 2.0)
+        out[4] = 1.0
+    if right is not None:
+        out[5] = _clip((right[0] - width) / 4.0, -0.5, 1.5)
+        out[6] = _clip(right[1] / SIDE_ALONG, -1.0, 1.0)
+    if left is not None:
+        out[7] = _clip((left[0] - width) / 4.0, -0.5, 1.5)
+        out[8] = _clip(left[1] / SIDE_ALONG, -1.0, 1.0)
+    return out
+
+
 def features(fol, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
-             flat_out, v_min, last) -> np.ndarray:
-    """The network's input (see NAMES). ``fol`` is the PlanFollower the driver
-    runs: it brings the plan and, as ``fol.track``, the road."""
+             flat_out, v_min, last, percept=None) -> np.ndarray:
+    """The network's input (see NAMES, then PERCEPT when *percept* is given).
+    ``fol`` is the PlanFollower the driver runs: it brings the plan and, as
+    ``fol.track``, the road."""
     cfg = config
     pl = fol.plan
     Lp = pl.L
@@ -91,7 +153,7 @@ def features(fol, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
     v_at = at(Lp["v"], k, f)
     ff = (at(Lp["fd"], k, f) - at(Lp["fb"], k, f)) * pace * pace / cfg.BRAKE_FORCE
 
-    out = np.empty(OBS_DIM, np.float32)
+    out = np.empty(OBS_DIM_V1, np.float32)
     out[0] = _clip(lat / 3.0, -2.0, 2.0)
     out[1] = _clip(head / 0.5, -2.0, 2.0)
     out[2] = _clip(vehicle.yaw_rate / 1.0, -2.0, 2.0)
@@ -140,6 +202,8 @@ def features(fol, vehicle, k, f, offset, d_off, dd_off, v_cap, pace, hold_speed,
         out[j] = _clip((tr.w_right[kp] - n_here - cfg.BODY_HALF_WIDTH) / 6.0, -2.0, 2.0)
         out[j + 1] = _clip((tr.w_left[kp] + n_here - cfg.BODY_HALF_WIDTH) / 6.0, -2.0, 2.0)
         j += 2
+    if percept is not None:
+        out = np.concatenate([out, percept])
     return out
 
 
@@ -160,8 +224,11 @@ class DriveNet:
         self.n = int(w["layers"])
         self.W = [np.asarray(w[f"W{i}"], np.float32) for i in range(self.n)]
         self.b = [np.asarray(w[f"b{i}"], np.float32) for i in range(self.n)]
-        if self.W[0].shape[0] != OBS_DIM or self.W[-1].shape[1] != ACT_DIM:
+        if self.W[0].shape[0] not in (OBS_DIM_V1, OBS_DIM) or self.W[-1].shape[1] != ACT_DIM:
             raise ValueError("drivenet weights do not match the observation")
+        #: Sees the other cars, so drives without the following-gap and room
+        #: rules (racecraft.RaceDriver).
+        self.free = self.W[0].shape[0] == OBS_DIM
 
     @classmethod
     def load(cls, path):

@@ -113,6 +113,7 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--races", type=int, default=0, help="also run this many whole races")
     ap.add_argument("--laps", type=int, default=3)
+    ap.add_argument("--race-seed0", type=int, default=100, help="seed of the first whole race")
     ap.add_argument("--policy", default=None)
     ap.add_argument("--all-cars", action="store_true",
                     help="the policy drives every car, not just the ego")
@@ -131,7 +132,7 @@ def main():
         result["scenarios"] = summarise(reps)
         result["episodes"] = reps
         if args.races:
-            races = [(args.circuits[i % len(args.circuits)], 100 + i, args.laps, args.policy, args.all_cars)
+            races = [(args.circuits[i % len(args.circuits)], args.race_seed0 + i, args.laps, args.policy, args.all_cars)
                      for i in range(args.races)]
             rr = list(ex.map(_race, races))
             result["races"] = summarise_races(rr)

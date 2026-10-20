@@ -69,7 +69,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 
-from . import config
+from . import config, settings
 
 #: Seconds after a contact during which a trip off the road is excused.
 EXCUSE_T = 1.5
@@ -175,6 +175,8 @@ class RaceControl:
     # -- track limits --------------------------------------------------------
     def excursion(self, car: int, exc) -> None:
         """Judge one settled trip off the track."""
+        if not settings.current.pen_track_limits:
+            return
         rec = self.cars[car]
         t = exc.t1
         if exc.t0 - rec.last_contact < EXCUSE_T:
@@ -214,6 +216,8 @@ class RaceControl:
         for c, o in ((a, b), (b, a)):
             self.cars[c].last_contact = t
             self.cars[c].last_contact_with = o
+        if not settings.current.pen_collision:
+            return
         key = (min(a, b), max(a, b))
         if t - self._pair_t.get(key, -1e9) < PAIR_GAP_T:
             self._pair_t[key] = t
@@ -271,6 +275,8 @@ class RaceControl:
     # -- yellow flags ------------------------------------------------------
     def yellow_pass(self, t: float, passer: int, passed: int) -> None:
         """*passer* went by *passed* (a racing car) in a yellow zone."""
+        if not settings.current.pen_yellow:
+            return
         for p in self._yellow_passes:
             if p[1] == passer and p[2] == passed:
                 return
@@ -281,7 +287,7 @@ class RaceControl:
     def yellow_slow(self, t: float, car: int, over: float, secs: float) -> None:
         """*car* has left a yellow zone after *secs* in it, of which *over*
         seconds (after the grace to get down to the limit) were above it."""
-        if secs < YELLOW_MIN_T or over < YELLOW_OVER_T:
+        if secs < YELLOW_MIN_T or over < YELLOW_OVER_T or not settings.current.pen_yellow:
             return
         rec = self.cars[car]
         rec.yellow_warnings += 1

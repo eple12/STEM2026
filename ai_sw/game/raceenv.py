@@ -27,7 +27,9 @@ tools/race_metrics.py.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -50,7 +52,7 @@ PAST_ZONE = 250.0
 
 REWARD = {
     "progress": 1.0,       # per 100 m advanced
-    "place": 1.0,          # per place gained (lost: minus)
+    "place": 2.0,          # per place gained (lost: minus)
     "contact": -1.0,       # per contact above contact.HIT_IMPULSE
     "steward": -4.0,       # per warning or penalty the stewards give the car
     "penalty_s": -0.5,     # per second of time penalty
@@ -58,9 +60,13 @@ REWARD = {
     "strike": -0.5,        # per track-limits strike
     "switch": -0.05,       # per 3.5 m of lane change asked for
     # What a spectator calls unnatural, though no steward does:
-    "queue": -0.6,         # per second held up behind a car with open road beside
-    "kerb": -1.0,          # per second with two wheels or more on the kerb or beyond
+    "queue": -2.0,         # per second held up behind a car with open road beside
+    # Riding the kerb is the racing line's own business, not a fault.
+    "kerb": 0.0,           # per second with two wheels or more on the kerb or beyond
 }
+
+if os.environ.get("RACEAI_REWARD"):
+    REWARD.update(json.loads(os.environ["RACEAI_REWARD"]))
 
 #: The slower car's pace in the tow scene, drawn from this range (the ego drives
 #: 1.0): a car 1.5% slower than the one behind it is never caught in the few
@@ -315,7 +321,7 @@ class Referee:
             self.racing_s[i] += 3 * DT
             if e.vehicle.grip_scale < KERB_GRIP:
                 self.kerb_s[i] += 3 * DT
-            if d._is_held and e.vehicle.speed > 15.0 and free_side(fld, i):
+            if d._slow_behind and e.vehicle.speed > 15.0 and free_side(fld, i):
                 self.queue_s[i] += 3 * DT
         for i in range(n):
             for j in range(i + 1, n):
@@ -536,6 +542,17 @@ class RaceEnv:
         for _ in range(fld.frame.plan_every):
             fld.step(DT)
             self.ref.update()
+        rewards, parts = self.reward_step()
+        ego = fld.cars[self.sc.egos[0]]
+        done = fld.t >= self.sc.max_t
+        if ego.limits.progress is not None and self.ref.start_progress is not None:
+            done = done or (ego.limits.progress - self.ref.start_progress[ego.idx]
+                            >= self.sc.goal)
+        return self._obs(), rewards, done, {"parts": parts, "t": fld.t}
+
+    def reward_step(self):
+        """The egos' rewards for what has happened since the last call:
+        ``(rewards, parts)`` per ego."""
         rewards, parts = {}, {}
         for i in self.sc.egos:
             now, prev = self._snapshot(i), self._prev[i]
@@ -554,9 +571,4 @@ class RaceEnv:
             parts[i] = p
             rewards[i] = float(sum(p.values()))
             self._prev[i] = now
-        ego = fld.cars[self.sc.egos[0]]
-        done = fld.t >= self.sc.max_t
-        if ego.limits.progress is not None and self.ref.start_progress is not None:
-            done = done or (ego.limits.progress - self.ref.start_progress[ego.idx]
-                            >= self.sc.goal)
-        return self._obs(), rewards, done, {"parts": parts, "t": fld.t}
+        return rewards, parts

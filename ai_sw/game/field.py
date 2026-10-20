@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from . import config
+from . import config, settings
 from .contact import HIT_IMPULSE, collide, overlap
 from .racecontrol import YELLOW_GRACE_T, YELLOW_TOL, Message, RaceControl
 from .racecraft import CarView, RaceDriver, TrackFrame
@@ -279,12 +279,14 @@ class Field:
         ahead = (gap > 0.0) & ok[None, :]
         np.fill_diagonal(ahead, False)
         tow = ahead & (gap < SLIP_RANGE) & (np.abs(lat) < SLIP_WIDTH)
+        if not settings.current.slipstream:
+            tow[:] = False
         best = np.where(tow, 1.0 - gap / SLIP_RANGE, 0.0).max(axis=1)
         fr = self.frame
         curv = self._curv
         for c, (e, me) in enumerate(zip(self.cars, views)):
             straight = curv[fr.node(me.s)] < 1.0 / DRS_RADIUS
-            drs = (straight and e.laps >= DRS_FROM_LAP and me.racing
+            drs = (settings.current.drs and straight and e.laps >= DRS_FROM_LAP and me.racing
                    and bool((ahead[c] & (gap[c] < DRS_GAP * V[c])).any()))
             e.vehicle.drag_scale = (1.0 - SLIP_DRAG * float(best[c])) * \
                 (DRS_DRAG if drs else 1.0)
@@ -405,6 +407,10 @@ class Field:
             "yellow"))
 
     def _yellow(self, views, dt: float):
+        if not settings.current.yellow_flags:
+            self.rc.yellow = []
+            self.frame.yellow = []
+            return
         L = self.frame.L
         zones = []
         since = self.__dict__.setdefault("_yellow_since", {})

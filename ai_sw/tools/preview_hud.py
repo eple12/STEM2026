@@ -29,7 +29,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--circuit", default=config.DEFAULT_TRACK)
     ap.add_argument("--size", type=int, nargs=2, default=(1600, 900))
+    ap.add_argument("--assist", action="store_true", help="auto steering and pedals on (the assist box)")
     args = ap.parse_args()
+    if args.assist:
+        from game import settings
+        settings.current.auto_steer = settings.current.auto_pedals = True
 
     app = Ursina(title="FORMULA-AI", size=tuple(args.size), vsync=False,
                  development_mode=False)

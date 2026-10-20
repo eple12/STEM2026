@@ -12,6 +12,8 @@ race simulated headless is the race the player gets.
 """
 from __future__ import annotations
 
+from pathlib import Path
+
 from dataclasses import dataclass
 
 import numpy as np
@@ -45,6 +47,31 @@ def drive_net():
             print(f"drive AI: no network at {path} ({exc.__class__.__name__}); the follower drives")
             _DRIVE[path] = None
     return _DRIVE[path]
+
+
+_ONE = {}
+
+
+def one_net(level: int = 0):
+    """The network that both decides and drives (onenet.OneNet) if
+    ``config.ONE_AI`` asks for it and the weights are there, else None. At the top
+    difficulty it is the one trained with no speed to keep to
+    (``config.ONE_AI_TOP_POLICY``) when that file is there; at the others the one
+    that follows the plan's pace (the level's pace is what makes a level). Loaded
+    once per process."""
+    if config.ONE_AI != "rl":
+        return None
+    path = config.ONE_AI_POLICY
+    if level >= max(teams.DIFFICULTY) and Path(config.ONE_AI_TOP_POLICY).exists():
+        path = config.ONE_AI_TOP_POLICY
+    if path not in _ONE:
+        try:
+            from .onenet import OneNet
+            _ONE[path] = OneNet.load(path)
+        except (OSError, ValueError, KeyError) as exc:
+            print(f"one AI: no network at {path} ({exc.__class__.__name__}); the two networks drive")
+            _ONE[path] = None
+    return _ONE[path]
 
 
 def race_policy():
@@ -171,8 +198,14 @@ def build(track, level: int, laps: int, seed: int = 0, player: bool = True,
             drv = RaceDriver(track, frame, plans(s.skill.plan), s.skill,
                              np.random.default_rng(seed * 100 + idx))
             drv.idx = idx
-            drv.policy = race_policy()
-            drv.follow.drive = drive_net()
+            one = one_net(level)
+            if one is not None:
+                from .onenet import OnePolicy
+                drv.policy = OnePolicy(one)
+                drv.follow.drive = one
+            else:
+                drv.policy = race_policy()
+                drv.follow.drive = drive_net()
             name, tla = s.driver.name, s.driver.tla
         e = Entrant(idx=idx, name=name, team=s.team.name, color=s.team.color,
                     vehicle=v, surface=surf, driver=drv,

@@ -1,0 +1,18 @@
+{
+  "device": 0,
+  "steer": "X",
+  "throttle": "Z",
+  "brake": "R",
+  "invert": {
+    "steer": false,
+    "throttle": false,
+    "brake": false
+  },
+  "deadzone": 0.02,
+  "steer_range": 1.0,
+  "buttons": {
+    "handbrake": 1
+  },
+  "pedal_rest": {},
+  "leds": true
+}

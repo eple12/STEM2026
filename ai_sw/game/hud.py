@@ -788,6 +788,7 @@ class HUD:
         """The pause card: a short menu, picked with W/S and ENTER."""
         self.pause_items = (("resume", "RESUME"),
                             *(() if self.quali else (("restart", "RESTART RACE"),)),
+                            ("settings", "SETTINGS"),
                             ("exit", "EXIT TO MENU"))
         n = len(self.pause_items)
         W = 0.500

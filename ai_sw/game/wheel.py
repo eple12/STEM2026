@@ -184,7 +184,8 @@ def shared() -> Wheel:
     return _shared
 
 
-def poll_keys(menu: bool = False) -> list[str]:
+def poll_keys(menu: bool = False, racing: bool = False,
+              ingame: bool = False) -> list[str]:
     """Once per frame: read the wheel and return the keys its buttons just pressed."""
     w = shared()
     prev = getattr(w, "_prev_buttons", 0)
@@ -206,6 +207,10 @@ def poll_keys(menu: bool = False) -> list[str]:
         keys.append("c")
     w._layer_used = False
     keys += [k for i, k in KEY_BUTTONS.items() if new >> i & 1]
+    if ingame:                       # in a session X is ESC (pause / back)
+        keys = ["escape" if k == "x" else k for k in keys]
+    if racing:                       # driving: A looks back instead of ENTER
+        keys = ["x" if k == "enter" else k for k in keys]
     if menu and new >> 1 & 1:        # B is the handbrake in a race, "back" in menus
         keys.append("escape")
     return keys

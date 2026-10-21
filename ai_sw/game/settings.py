@@ -14,6 +14,8 @@ import json
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+from . import config
+
 PATH = Path.home() / ".formula-ai" / "settings.json"
 
 
@@ -37,6 +39,10 @@ class Settings:
     pen_track_limits: bool = True     # cutting a corner, running wide
     pen_collision: bool = True        # causing a collision
     pen_yellow: bool = True           # overtaking or speeding under yellow
+    #: Driver aids of the player's car; live (T toggles all three in a race).
+    traction_control: bool = config.TRACTION_CONTROL
+    abs_enabled: bool = config.ABS_ENABLED
+    steer_assist: bool = config.STEER_ASSIST
     #: Manual gearbox for the player's car (paddles / E and Z); off = automatic.
     manual_gearbox: bool = False
     #: Steering wheel sensitivity: 1.0 = lock to lock as the wheel is set in
@@ -50,6 +56,9 @@ ROWS = (
     ("steer_sens", "STEERING SENSITIVITY", "wheel only: more = less turn of the wheel for the same steering (0.5x - 4.0x)"),
     ("auto_steer", "AUTO STEERING", "the car steers along the line; steer yourself (A / D) any time to take over, Q back to the line"),
     ("auto_pedals", "AUTO PEDALS", "throttle and brake are automatic until you press W / S yourself"),
+    ("traction_control", "TRACTION CONTROL", "stops the rear wheels spinning under power (T toggles all aids in a race)"),
+    ("abs_enabled", "ABS", "stops the wheels locking under braking"),
+    ("steer_assist", "STEERING ASSIST", "countersteers a slide for you"),
     ("yellow_flags", "YELLOW FLAGS", "a stricken car brings out a yellow and everyone slows down"),
     ("drs", "DRS", "drag reduction within a second of the car ahead on a straight"),
     ("slipstream", "SLIPSTREAM", "the tow behind another car"),
@@ -57,6 +66,11 @@ ROWS = (
     ("pen_collision", "PENALTY · COLLISIONS", "time penalties for causing a collision"),
     ("pen_yellow", "PENALTY · YELLOW FLAGS", "time penalties for overtaking or speeding under yellow"),
 )
+
+#: Rows that may be changed from the pause card during a race; the rest are
+#: fixed when the session starts (the field runs in its own process).
+LIVE = frozenset({"manual_gearbox", "steer_sens", "traction_control",
+                  "abs_enabled", "steer_assist"})
 
 current = Settings()
 

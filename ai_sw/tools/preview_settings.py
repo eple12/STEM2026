@@ -46,7 +46,13 @@ def main():
             menu["m"].on_key("s")
         elif f == 12:
             shoot("settings.png")
-        elif f == 14:
+            menu["m"].destroy()
+            menu["m"] = SettingsMenu(on_back=lambda: None, in_race=True)
+            for _ in range(11):
+                menu["m"].on_key("s")
+        elif f == 17:
+            shoot("settings_race.png")
+        elif f == 19:
             application.quit()
 
     import __main__

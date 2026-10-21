@@ -715,6 +715,10 @@ class Game:
 
     def read_controls(self) -> Controls:
         self.vehicle.manual = self._manual_on()
+        st = settings.current
+        self.vehicle.traction_control = st.traction_control
+        self.vehicle.abs_enabled = st.abs_enabled
+        self.vehicle.steer_assist = st.steer_assist
         if self.state == COUNTDOWN:
             return Controls()
         if self.freecam.enabled:
@@ -789,6 +793,9 @@ class Game:
         import gc
 
         from .ui import destroy_tree
+        if self._settings_ui is not None:
+            self._settings_ui.destroy()
+            self._settings_ui = None
 
         gc.unfreeze()
         self.sound.stop()
@@ -814,7 +821,13 @@ class Game:
         else:
             self.world.destroy()
 
+    _settings_ui = None
+    _card_was_hidden = False
+
     def on_key(self, key: str):
+        if self._settings_ui is not None:
+            self._settings_ui.on_key(key)       # the settings screen has the keys
+            return
         if key in ("e", "z", "gear up", "gear down") and self.vehicle.manual:
             self.vehicle.shift(1 if key in ("e", "gear up") else -1)
             return
@@ -905,9 +918,10 @@ class Game:
         elif key == "t":
             # One switch for all the driver aids: at an exhibition nobody wants
             # to reason about TC vs ABS vs steering assist separately.
-            v = self.vehicle
-            on = not v.traction_control
-            v.traction_control = v.abs_enabled = v.steer_assist = on
+            st = settings.current
+            on = not st.traction_control
+            st.traction_control = st.abs_enabled = st.steer_assist = on
+            settings.save()
         elif self.state == INTRO:
             # Any key at all skips the film. Somebody on their fifth lap of the
             # evening should not have to remember which one.
@@ -947,11 +961,27 @@ class Game:
                 self._resume()
             elif action == "restart" and self.on_restart is not None:
                 self.on_restart()
+            elif action == "settings":
+                self._open_settings()
             elif action == "exit":
                 self._leave()
         else:
             return False
         return True
+
+    def _open_settings(self):
+        from .menu import SettingsMenu
+        self._card_was_hidden = self.pause_card_hidden
+        self.pause_card_hidden = True
+        self.hud.root.enabled = False           # the settings screen covers the HUD
+        self._settings_ui = SettingsMenu(on_back=self._close_settings, in_race=True)
+
+    def _close_settings(self):
+        if self._settings_ui is not None:
+            self._settings_ui.destroy()
+            self._settings_ui = None
+        self.pause_card_hidden = self._card_was_hidden
+        self.hud.root.enabled = not self.hud_hidden
 
     def _resume(self):
         self.state = self._resume_state
@@ -1851,7 +1881,10 @@ def update():
     global TRANSITION
     from .recorder import RECORDER
     RECORDER.tick()
-    for k in wheel_mod.poll_keys(menu=MENU is not None):     # wheel buttons act as key presses
+    racing = (MENU is None and GAME is not None and GAME._settings_ui is None
+              and GAME.state in (COUNTDOWN, RACING))
+    ingame = MENU is None and GAME is not None
+    for k in wheel_mod.poll_keys(menu=MENU is not None, racing=racing, ingame=ingame):     # wheel buttons act as key presses
         input(k)
     if TRANSITION is not None:
         TRANSITION.tick()

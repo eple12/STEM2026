@@ -131,7 +131,8 @@ class ModeMenu:
         self.sel = keys.index(initial) if initial in keys else 0
         self.levels = sorted(teams.DIFFICULTY)
         self.level = level if level in teams.DIFFICULTY else teams.DEFAULT_LEVEL
-        self.row = 0                 # 0: session cards, 1: difficulty
+        self.row = 0                 # 0: session cards, 1: difficulty, 2: SETTINGS
+        self._hover = False
         self.root = Entity(parent=camera.ui)
         _base_screen(self, "racing")
 
@@ -140,6 +141,15 @@ class ModeMenu:
         Entity(parent=self.root, model="quad", color=RED,
                scale=(0.30, 0.006), position=(-0.65, 0.275, 0.15))
         self._txt(spaced("main menu"), size=0.8, col=GREY, pos=(-0.80, 0.245))
+        # SETTINGS: a button (click it, or W / S down to it and ENTER).
+        self.set_btn = Entity(parent=self.root, model="quad", color=PANEL_HI,
+                              scale=(0.26, 0.052), position=(0.67, 0.372, 0.2),
+                              collider="box")
+        self.set_btn.on_click = lambda: self.on_settings and self.on_settings()
+        self.set_btn.on_mouse_enter = lambda: setattr(self, "_hover", True) or self._refresh()
+        self.set_btn.on_mouse_exit = lambda: setattr(self, "_hover", False) or self._refresh()
+        self.set_txt = self._txt("SETTINGS", size=1.0, col=WHITE, pos=(0.67, 0.372),
+                                 origin=(0, 0))
 
         H = self.CARD_H
         self.cards = []
@@ -172,7 +182,7 @@ class ModeMenu:
         self._build_level()
         self._build_controls()
         self._txt("A / D  CHOOSE          W / S  SESSION  ·  DIFFICULTY"
-                  "          ENTER  CONTINUE          O  SETTINGS          ESC  QUIT",
+                  "          ENTER  CONTINUE          O  SETTINGS (OR CLICK THE BUTTON)          ESC  QUIT",
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
         self._refresh()
 
@@ -255,12 +265,17 @@ class ModeMenu:
             b["name"].color = WHITE if on else GREY if below else GREY_DIM
         self.lv_cursor.enabled = focus
         self.lv_head.color = WHITE if focus else GREY_DIM
+        lit = self.row == 2 or self._hover
+        self.set_btn.color = RED if lit else PANEL_HI
 
     def on_key(self, key: str):
         n = len(MODES)
         if key in ("down arrow", "s", "up arrow", "w"):
-            self.row = 1 - self.row
+            step = 1 if key in ("down arrow", "s") else -1
+            self.row = (self.row + step) % (3 if self.on_settings else 2)
             self._refresh()
+        elif self.row == 2 and key in ("enter", "space"):
+            self.on_settings()
         elif key in ("right arrow", "d", "left arrow", "a",
                      "right arrow hold", "d hold", "left arrow hold", "a hold"):
             step = 1 if key.startswith(("right", "d")) else -1
@@ -268,7 +283,7 @@ class ModeMenu:
                 if key.endswith("hold"):
                     return
                 self.sel = (self.sel + step) % n
-            else:
+            elif self.row == 1:
                 k = self.levels.index(self.level)
                 self.level = self.levels[min(max(k + step, 0), len(self.levels) - 1)]
                 self.on_level(self.level)
@@ -630,33 +645,38 @@ class StartMenu:
 
 # --- settings --------------------------------------------------------------
 class SettingsMenu:
-    """The session's rules and aids (game/settings.py), one row each, ON or OFF.
-    W / S pick a row, A / D or ENTER flip it, ESC saves and goes back. Never
-    reachable during a race."""
+    """The session's rules and aids (game/settings.py), one row each.
+    W / S pick a row, A / D or ENTER change it, ESC saves and goes back. Opened
+    from the main menu, or from the pause card in a race (``in_race``), where
+    only the live rows (settings.LIVE) can be changed."""
 
     TOP, PITCH, ROW_H, W = 0.215, 0.068, 0.062, 1.62
+    VISIBLE = 9
 
-    def __init__(self, on_back):
+    def __init__(self, on_back, in_race: bool = False):
         self.on_back = on_back
+        self.in_race = in_race
         self.font = pick_font()
         self.sel = 0
+        self.first = 0
         self.root = Entity(parent=camera.ui)
         _base_screen(self, "settings")
         self.rows = []
-        for k, (name, title, what) in enumerate(settings.ROWS):
-            y = self.TOP - k * self.PITCH - self.ROW_H / 2
+        for name, title, what in settings.ROWS:
             bg = Entity(parent=self.root, model="quad", color=PANEL,
-                        scale=(self.W, self.ROW_H), position=(0, y, 0.3))
+                        scale=(self.W, self.ROW_H), position=(0, 0, 0.3))
             bar = Entity(parent=self.root, model="quad", color=RED,
-                         scale=(0.008, self.ROW_H), position=(-self.W / 2 - 0.004, y, 0.25))
-            t = self._txt(title, size=1.05, col=WHITE, pos=(-0.77, y + 0.014))
-            d = self._txt(what, size=0.62, col=GREY_DIM, pos=(-0.77, y - 0.017))
+                         scale=(0.008, self.ROW_H), position=(-self.W / 2 - 0.004, 0, 0.25))
+            t = self._txt(title, size=1.05, col=WHITE, pos=(-0.77, 0))
+            d = self._txt(what, size=0.62, col=GREY_DIM, pos=(-0.77, 0))
             box = Entity(parent=self.root, model="quad", color=PANEL_HI,
-                         scale=(0.17, 0.044), position=(0.69, y, 0.2))
-            val = self._txt("", size=0.95, col=WHITE, pos=(0.69, y), origin=(0, 0))
+                         scale=(0.17, 0.044), position=(0.69, 0, 0.2))
+            val = self._txt("", size=0.95, col=WHITE, pos=(0.69, 0), origin=(0, 0))
             self.rows.append(dict(name=name, bg=bg, bar=bar, title=t, desc=d, box=box, val=val))
-        self._txt("W / S   SELECT          A / D   OFF · ON          ESC   SAVE AND BACK"
-                  "          (settings cannot be changed during a race)",
+        self.more = self._txt("", size=0.72, col=GREY, pos=(0.62, -0.482))
+        self._txt("W / S   SELECT          A / D   CHANGE          ESC   SAVE AND BACK"
+                  + ("          (dimmed rows are fixed once a race has started)"
+                     if in_race else ""),
                   size=0.72, col=GREY, pos=(-0.80, -0.482))
         self._refresh()
 
@@ -664,26 +684,49 @@ class SettingsMenu:
         return Text(s, parent=self.root, font=self.font, scale=size, color=col,
                     origin=origin, position=(pos[0], pos[1], z))
 
+    def _locked(self, r) -> bool:
+        return self.in_race and r["name"] not in settings.LIVE
+
     def _refresh(self):
+        n = len(self.rows)
+        self.first = max(0, min(self.first, n - self.VISIBLE))
+        if self.sel < self.first:
+            self.first = self.sel
+        elif self.sel >= self.first + self.VISIBLE:
+            self.first = self.sel - self.VISIBLE + 1
         for k, r in enumerate(self.rows):
+            shown = self.first <= k < self.first + self.VISIBLE
+            for key in ("bg", "bar", "title", "desc", "box", "val"):
+                r[key].enabled = shown
+            if not shown:
+                continue
+            y = self.TOP - (k - self.first) * self.PITCH - self.ROW_H / 2
+            r["bg"].y = r["bar"].y = r["box"].y = y
+            r["title"].y, r["desc"].y, r["val"].y = y + 0.014, y - 0.017, y
             val = getattr(settings.current, r["name"])
             on = bool(val)
             focus = k == self.sel
+            locked = self._locked(r)
             r["bg"].color = PANEL_HI if focus else PANEL
             r["bar"].enabled = focus
-            r["title"].color = WHITE if focus else GREY
-            r["desc"].color = GREY if focus else GREY_DIM
-            r["box"].color = RED if on else (PANEL if focus else PANEL_HI)
+            r["title"].color = GREY_DIM if locked else WHITE if focus else GREY
+            r["desc"].color = GREY_DIM if locked or not focus else GREY
+            r["box"].color = RED if on and not locked else (PANEL if focus else PANEL_HI)
             if isinstance(val, float):
-                r["box"].color = RED if focus else PANEL_HI
+                r["box"].color = RED if focus and not locked else PANEL_HI
                 r["val"].text = f"{val:.1f}x"
-                r["val"].color = WHITE
             else:
                 r["val"].text = "ON" if on else "OFF"
-                r["val"].color = WHITE if on else GREY
+            r["val"].color = GREY_DIM if locked else WHITE if on or isinstance(val, float) else GREY
+        above, below = self.first, n - self.first - self.VISIBLE
+        self.more.text = (("^ " if above else "") + (f"{self.sel + 1} / {n}")
+                          + (" v" if below > 0 else ""))
 
     def _flip(self, to=None):
-        name = self.rows[self.sel]["name"]
+        r = self.rows[self.sel]
+        if self._locked(r):
+            return
+        name = r["name"]
         cur = getattr(settings.current, name)
         if isinstance(cur, float):
             step = 0.1 if to else -0.1 if to is False else 0.0
